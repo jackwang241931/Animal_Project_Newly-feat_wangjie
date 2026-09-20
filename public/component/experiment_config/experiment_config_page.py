@@ -129,6 +129,7 @@ class ExperimentConfigPage(QWidget):
         self._camera_mapping_labels = {"deep": [], "infrared": []}
         self._serial_ports = []
         self._serial_action_error = None
+        self._restore_last_saved_configuration()
         self._build_ui()
         self._bind_auto_save()
         self._refresh_serial_ports()
@@ -1427,6 +1428,103 @@ class ExperimentConfigPage(QWidget):
             return
         QMessageBox.information(self, "保存配置", "配置保存成功。")
 
+    @staticmethod
+    def _startup_calibration_mode_for_save() -> str:
+        """Return the selected startup mode without reviving stale template values."""
+        if not global_setting.get_setting("device_config_calibration_selected", False):
+            return "none"
+        mode = global_setting.get_setting("startup_calibration_mode", "none")
+        if mode == "air_co2":
+            mode = "air"
+        return mode if mode in {"none", "air", "zero", "span", "full"} else "none"
+
+    @staticmethod
+    def _startup_calibration_label(mode: str) -> str:
+        return {
+            "air": "Air 空气校准",
+            "zero": "校零",
+            "span": "校量程",
+            "full": "校零+校span",
+        }.get(mode, "不校准")
+
+    @staticmethod
+    def _default_template_path() -> str:
+        """Return the user-local fallback used when no template was opened."""
+        return os.path.join(
+            os.path.expanduser("~"),
+            ".mouse_experiment_config",
+            "last_experiment_config.template",
+        )
+
+    @staticmethod
+    def _configured_template_path() -> str:
+        for key in ("experiment_setting_file", "experiment_setting_file_open"):
+            value = str(global_setting.get_setting(key, "") or "").strip()
+            if value:
+                return value
+        return ""
+
+    @staticmethod
+    def _has_experiment_content(setting) -> bool:
+        if setting is None:
+            return False
+        return any(
+            bool(getattr(setting, field, None))
+            for field in (
+                "groups",
+                "animals",
+                "animalGroupRecords",
+                "channel_modules",
+                "channel_data_config",
+                "channel_animal_info",
+                "experiment_id",
+                "experiment_title",
+            )
+        )
+
+    def _restore_last_saved_configuration(self) -> None:
+        """Restore the last saved P2 configuration when no template is open.
+
+        The old configuration page kept user edits locally.  The redesigned
+        page previously only wrote a file when an explicit template path had
+        already been opened, so a normal ``保存配置`` on a new experiment was
+        lost after restarting the application.
+        """
+        current = (
+            global_setting.get_setting("experiment_setting", None)
+            or global_setting.get_setting("experiment_setting_new", None)
+        )
+        configured_path = self._configured_template_path()
+        if self._has_experiment_content(current) or configured_path:
+            return
+        template_path = self._default_template_path()
+        if not os.path.isfile(template_path):
+            return
+
+        db_path = ""
+        handle = None
+        try:
+            db_path = custom_template_file_util.load_template_contents_from_custom_file(template_path)
+            handle = Experiment_Setting_DAO_Handle(
+                db_fold_path=os.path.dirname(db_path),
+                db_name=os.path.basename(db_path),
+            )
+            setting = handle.query_data_database_all()
+            if setting is None or not self._has_experiment_content(setting):
+                return
+            global_setting.set_setting("experiment_setting", setting)
+            global_setting.set_setting("experiment_setting_new", setting)
+            global_setting.set_setting("experiment_setting_file", template_path)
+            global_setting.set_setting("experiment_setting_file_open", template_path)
+            logger.info("已恢复上次保存的实验配置: {}", template_path)
+        except Exception as error:
+            logger.warning("恢复上次实验配置失败: {}", error)
+        finally:
+            if handle is not None:
+                handle.stop()
+            if db_path and os.path.isfile(db_path):
+                os.remove(db_path)
+
     def save_experiment_config(self) -> bool:
         """Write the edited P2 values into the live experiment setting object."""
         if self._loading_channel:
@@ -1453,9 +1551,10 @@ class ExperimentConfigPage(QWidget):
         setting.grouping_plan = self.grouping.currentText()
         setting.lighting_plan = "光照时间表"
         setting.lighting_schedule = self._collect_lighting_schedule()
-        # 启动校准仅由运行控制页上的显式操作触发。配置页不再保存这一选项，
-        # 同时清除旧模板中的残留值，保证普通“开始实验”默认直接启动。
-        setting.startup_calibration = "不校准"
+        # Keep the legacy behavior: saving a configuration must not erase an
+        # explicitly selected startup calibration mode.
+        startup_calibration_mode = self._startup_calibration_mode_for_save()
+        setting.startup_calibration = self._startup_calibration_label(startup_calibration_mode)
         setting.storage_path = self.storage_path.text().strip()
         setting.auto_backup = self.backup.currentText()
         self._capture_current_channel()
@@ -1481,16 +1580,25 @@ class ExperimentConfigPage(QWidget):
 
     @staticmethod
     def _persist_template(setting) -> None:
-        template_path = (
-            global_setting.get_setting("experiment_setting_file", "")
-            or global_setting.get_setting("experiment_setting_file_open", "")
-        )
-        if not template_path or not os.path.isfile(template_path):
+        """Persist the current setting to the opened template or local fallback."""
+        template_path = ExperimentConfigPage._configured_template_path()
+        if not template_path:
+            template_path = ExperimentConfigPage._default_template_path()
+
+        # ``保存配置`` must also work for a newly created experiment.  In that
+        # case there is no file-open path yet, so create the same user-local
+        # template that the next page/app opening can restore.
+        if not os.path.isfile(template_path):
+            if ExperimentConfigPage._write_template_file(setting, template_path):
+                global_setting.set_setting("experiment_setting_file", template_path)
+                global_setting.set_setting("experiment_setting_file_open", template_path)
             return
+
         db_path = custom_template_file_util.load_template_contents_from_custom_file(template_path)
         try:
             handle = Experiment_Setting_DAO_Handle(
-                db_fold_path=os.path.dirname(db_path), db_name=os.path.basename(db_path)
+                db_fold_path=os.path.dirname(db_path),
+                db_name=os.path.basename(db_path),
             )
             try:
                 handle.remove_data_database_all_not_include_metaDB()
@@ -1498,6 +1606,8 @@ class ExperimentConfigPage(QWidget):
             finally:
                 handle.stop()
             custom_template_file_util.save_template_contents_as_custom_file(db_path)
+            global_setting.set_setting("experiment_setting_file", template_path)
+            global_setting.set_setting("experiment_setting_file_open", template_path)
         finally:
             if os.path.isfile(db_path):
                 os.remove(db_path)
@@ -1533,8 +1643,8 @@ class ExperimentConfigPage(QWidget):
 
     @staticmethod
     def _broadcast_setting(setting) -> None:
-        calibration_mode = "none"
-        calibration_enabled = False
+        calibration_mode = ExperimentConfigPage._startup_calibration_mode_for_save()
+        calibration_enabled = calibration_mode != "none"
         global_setting.set_setting("startup_calibration_mode", calibration_mode)
         global_setting.set_setting("is_auto_calibration", calibration_enabled)
         payload = {
