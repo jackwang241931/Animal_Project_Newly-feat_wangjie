@@ -148,7 +148,7 @@ class StartupCompletionContractTests(unittest.TestCase):
             "当前实验尚未确认串口，请先在实验配置中确认并检测。"
         )
 
-    def test_failed_air_detection_skips_calibration_but_keeps_direct_start_available(self):
+    def test_selected_air_calibration_is_preserved_for_start(self):
         from index.MainWindow_index import MainWindow_Index
         from public.config_class.global_setting import global_setting
 
@@ -158,17 +158,15 @@ class StartupCompletionContractTests(unittest.TestCase):
             "air_modules_all_valid": False, "environment_module_only": False,
         }):
             mode = MainWindow_Index._resolve_startup_calibration_mode_for_start(fake)
-            self.assertEqual(mode, "none")
-            self.assertEqual(global_setting.get_setting("startup_calibration_mode"), "none")
-            self.assertFalse(global_setting.get_setting("is_auto_calibration"))
-        self.assertIn("继续直接启动实验", fake.workflow_runtime_log_buffer[0]["message"])
+            self.assertEqual(mode, "air")
+            self.assertEqual(global_setting.get_setting("startup_calibration_mode"), "air")
+            self.assertTrue(global_setting.get_setting("is_auto_calibration"))
+        self.assertEqual(fake.workflow_runtime_log_buffer, [])
 
         path = PROJECT_ROOT / "index" / "MainWindow_index.py"
         source = ast.get_source_segment(path.read_text(encoding="utf-8-sig"),
                                         _class_method(path, "MainWindow_Index", "start_experiment"))
         self.assertIn("_resolve_startup_calibration_mode_for_start", source)
-        self.assertNotIn("UFC、UGC、ZOS 尚未全部通过检测，不能执行启动前校准", source)
-
     def test_gui_timeout_does_not_report_a_confirmed_failure(self):
         path = PROJECT_ROOT / "index" / "MainWindow_index.py"
         method = _class_method(path, "MainWindow_Index", "_on_gas_path_final_timeout")

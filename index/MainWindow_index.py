@@ -2538,20 +2538,13 @@ class MainWindow_Index(ThemedWindow):
                                   title="set_experiment_basic_config", data=config, time=now))
 
     def _resolve_startup_calibration_mode_for_start(self):
-        """Keep hardware detection from blocking the legacy direct-start path."""
+        """Preserve the calibration mode selected after the device check."""
         mode = global_setting.get_setting("startup_calibration_mode", "none")
         if mode == "air_co2":
             mode = "air"
         if mode not in {"none", "air", "full"}:
             mode = "none"
         if global_setting.get_setting("environment_module_only", False):
-            mode = "none"
-        elif mode in {"air", "full"} and not global_setting.get_setting("air_modules_all_valid", False):
-            MainWindow_Index._append_workflow_runtime_log(
-                self,
-                "UFC、UGC、ZOS 未全部通过检测，已跳过启动前校准并继续直接启动实验。",
-                "启动",
-            )
             mode = "none"
         global_setting.set_setting("startup_calibration_mode", mode)
         global_setting.set_setting("is_auto_calibration", mode != "none")
