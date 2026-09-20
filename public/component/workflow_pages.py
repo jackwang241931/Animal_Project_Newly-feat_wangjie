@@ -65,8 +65,10 @@ from public.util.shared_video_frames import shared_video_frame_store
 from Module.mouse_trajectory.paths import EXPORT_DIR as TRAJECTORY_EXPORT_DIR
 from Module.mouse_trajectory_analysis.analysis_core import (
     find_matching_trajectory_export,
+    find_matching_monitor_workbook,
     load_monitor_workbook_bundle,
     load_trajectory_experiment,
+    parse_trajectory_export_time,
     parse_experiment_time,
     scan_experiment_files,
     scan_trajectory_experiments,
@@ -1542,7 +1544,7 @@ class TrajectoryCanvas(QWidget):
                 x = rect.left() + column * (cell_w + gap)
                 y = rect.top() + row * (cell_h + gap)
                 painter.setBrush(palette[index]); painter.setPen(Qt.PenStyle.NoPen)
-                painter.drawRoundedRect(x, y, cell_w, cell_h, 5, 5)
+                painter.drawRoundedRect(int(x), int(y), max(1, int(cell_w)), max(1, int(cell_h)), 5, 5)
 
 
 class ActivityLineChart(QWidget):
@@ -1576,9 +1578,12 @@ class ActivityLineChart(QWidget):
 
 
 class BehaviorCountChart(QWidget):
-    """Grouped behaviour counts, one set of bars for each selected cage."""
+    """Behaviour-count bars with action types on X and counts on Y."""
 
-    _COLORS = (QColor("#4f9bdb"), QColor("#df4d45"), QColor("#f0aa2b"))
+    _COLORS = (
+        QColor("#1677B8"), QColor("#D95F02"), QColor("#009E73"), QColor("#CC79A7"),
+        QColor("#E69F00"), QColor("#56B4E9"), QColor("#D62728"), QColor("#1A1A1A"),
+    )
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1603,34 +1608,56 @@ class BehaviorCountChart(QWidget):
         del event
         painter = QPainter(self)
         painter.fillRect(self.rect(), QColor("#fbfdff"))
-        # Leave a dedicated legend row below the card title and description;
-        # otherwise the first legend label can touch the chart heading.
-        rect = self.rect().adjusted(44, 48, -18, -38)
+        # Reserve space for the two axis labels.
+        rect = self.rect().adjusted(62, 34, -24, -58)
         painter.setPen(QPen(QColor("#d8e7f3"), 1)); painter.drawRect(rect)
         if not self.counts:
             painter.setPen(QColor("#7191b2")); painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, "暂无真实行为识别数据"); painter.end(); return
         category_order = ["自由活动", "蛰伏", "攀爬"]
         categories = [category for category in category_order if any(category in values for _label, values in self.counts)]
-        maximum = max([max(values.values(), default=0) for _label, values in self.counts] + [1])
-        legend_x = rect.left()
-        legend_y = 30
-        for index, category in enumerate(categories):
-            painter.setPen(QColor("#355775")); painter.drawText(legend_x + 18, legend_y, category)
-            painter.setBrush(self._COLORS[index % len(self._COLORS)]); painter.drawRect(legend_x, legend_y - 10, 12, 10)
-            legend_x += max(72, len(category) * 14 + 30)
-        group_width = rect.width() / max(len(self.counts), 1)
-        for index, (label, values) in enumerate(self.counts):
-            center = rect.left() + (index + 0.5) * group_width
-            bar_width = max(5.0, min(24.0, group_width * 0.7 / max(len(categories), 1)))
-            for category_index, category in enumerate(categories):
-                value = values.get(category, 0)
-                offset = (category_index - (len(categories) - 1) / 2.0) * bar_width
-                color = self._COLORS[category_index % len(self._COLORS)]
-                height = float(value) / maximum * max(rect.height() - 4, 1)
-                x = center + offset - bar_width / 2.0; y = rect.bottom() - height
-                painter.setBrush(color); painter.setPen(Qt.PenStyle.NoPen); painter.drawRect(int(x), int(y), int(bar_width), max(1, int(height)))
-                painter.setPen(QColor("#355775")); painter.drawText(int(x - 4), max(rect.top() + 12, int(y) - 4), str(value))
-            painter.setPen(QColor("#355775")); painter.drawText(int(center - group_width * 0.45), rect.bottom() + 20, int(group_width * 0.9), 18, Qt.AlignmentFlag.AlignHCenter, label)
+        if not categories:
+            painter.setPen(QColor("#7191b2")); painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, "暂无已选择的行为类别"); painter.end(); return
+        totals = {
+            category: sum(max(0, int(values.get(category, 0))) for _label, values in self.counts)
+            for category in categories
+        }
+        maximum = max([*totals.values(), 1])
+        # Counts are integers.  Do not draw five fractional ticks and round
+        # them back to integers, otherwise a maximum of 1 produces labels
+        # like 0, 0, 0, 1, 1, 1.  Use every integer for small totals and
+        # evenly spaced integer steps for larger totals.
+        if maximum <= 5:
+            tick_values = list(range(maximum + 1))
+        else:
+            tick_step = max(1, math.ceil(maximum / 5))
+            tick_values = list(range(0, maximum + 1, tick_step))
+            if tick_values[-1] != maximum:
+                tick_values.append(maximum)
+        for tick_value in tick_values:
+            ratio = tick_value / maximum
+            y = rect.bottom() - ratio * rect.height()
+            painter.setPen(QPen(QColor("#e8f0f7"), 1)); painter.drawLine(rect.left(), int(y), rect.right(), int(y))
+            painter.setPen(QColor("#7191b2")); painter.drawText(8, int(y - 8), 48, 18, Qt.AlignmentFlag.AlignRight, str(tick_value))
+
+        category_width = rect.width() / max(len(categories), 1)
+        for category_index, category in enumerate(categories):
+            center = rect.left() + (category_index + 0.5) * category_width
+            value = totals[category]
+            bar_width = max(16.0, min(90.0, category_width * 0.52))
+            height = float(value) / maximum * max(rect.height() - 2, 1)
+            x = center - bar_width / 2.0
+            y = rect.bottom() - height
+            painter.setBrush(self._COLORS[category_index % len(self._COLORS)])
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawRect(int(x), int(y), max(1, int(bar_width)), max(1, int(height)))
+            painter.setPen(QColor("#355775"))
+            painter.drawText(int(x - 8), max(rect.top() + 12, int(y) - 4), int(bar_width + 16), 18, Qt.AlignmentFlag.AlignHCenter, str(value))
+            painter.setPen(QColor("#355775"))
+            painter.drawText(int(center - category_width * 0.45), rect.bottom() + 10, int(category_width * 0.9), 24, Qt.AlignmentFlag.AlignHCenter, category)
+
+        painter.setPen(QColor("#7191b2"))
+        painter.drawText(rect.left(), rect.bottom() + 36, rect.width(), 18, Qt.AlignmentFlag.AlignHCenter, "动作类型")
+        painter.drawText(8, rect.top() - 18, 48, 18, Qt.AlignmentFlag.AlignRight, "次数")
         painter.end()
 
 
@@ -1645,7 +1672,10 @@ class TrajectoryComparisonPlot(QWidget):
     ``openpyxl``).
     """
 
-    _COLORS = ("#287fd3", "#40a8d8", "#4f9bdb", "#6a78c9", "#2b5ca8", "#75b6e2", "#3f70b3", "#8bc6e8")
+    # Keep the old analysis window's channel palette so the comparison plots
+    # remain visually compatible with the legacy charts.
+    _COLORS = ("#1677B8", "#D95F02", "#009E73", "#CC79A7", "#E69F00", "#56B4E9", "#D62728", "#1A1A1A")
+    _INFRARED_COLORS = ("#ff6b35", "#ff814f", "#f59e0b", "#e76f51", "#d95d39", "#f4a261", "#e85d04", "#c7511f")
     _SLEEP_COLORS = (QColor("#f4f7fb"), QColor("#e0584f"))
 
     def __init__(self, mode: str, parent=None):
@@ -1729,11 +1759,18 @@ class TrajectoryComparisonPlot(QWidget):
         """Show both the channel and its physical cage number."""
         text = str(label)
         match = re.search(r"(\d+)$", text)
-        return f"{text} / 笼{match.group(1)}" if match else text
+        return f"笼子 {int(match.group(1))}" if match else text
 
     def _empty(self, painter: QPainter, rect) -> None:
         painter.setPen(QColor("#7191b2"))
-        message = "暂无所选通道的真实红外温度数据" if self.mode == "infrared" else "暂无所选通道的真实轨迹数据"
+        if self.mode == "infrared":
+            message = "暂无所选通道的真实红外温度数据"
+        elif self.mode == "height":
+            message = "暂无所选通道的真实高度数据"
+        elif self.mode == "dwell":
+            message = "暂无所选通道的真实停留数据"
+        else:
+            message = "暂无所选通道的真实轨迹数据"
         painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, message)
 
     @staticmethod
@@ -1745,8 +1782,9 @@ class TrajectoryComparisonPlot(QWidget):
         # Keep up to three wrapped legend rows inside the reserved header
         # band, never on top of the plot itself.
         y = rect.top() - 44
+        palette = self._INFRARED_COLORS if self.mode == "infrared" else self._COLORS
         for index, (label, _values) in enumerate(self.series):
-            color = QColor(self._COLORS[index % len(self._COLORS)])
+            color = QColor(palette[index % len(palette)])
             painter.setPen(QPen(color, 3)); painter.drawLine(x, y - 4, x + 13, y - 4)
             display = self._display_label(label)
             painter.setPen(QColor("#355775")); painter.drawText(x + 18, y, display)
@@ -1765,8 +1803,8 @@ class TrajectoryComparisonPlot(QWidget):
     def _paint_per_cage_trajectory(self, painter: QPainter, rect) -> None:
         """Draw one adaptive subplot per selected cage for 3D/XY/height."""
         tiles = self._tile_rects(rect, len(self.series))
-        for (label, values), tile in zip(self.series, tiles):
-            self._draw_tile_label(painter, tile, f"{label}  /  笼{label[-2:]}")
+        for series_index, ((label, values), tile) in enumerate(zip(self.series, tiles)):
+            self._draw_tile_label(painter, tile, self._display_label(label))
             plot_rect = tile.adjusted(9, 27, -9, -9)
             valid = [point for point in values if len(point) >= 3 and all(_number(v) is not None for v in point)]
             if not valid:
@@ -1812,7 +1850,11 @@ class TrajectoryComparisonPlot(QWidget):
             path = QPainterPath(); path.moveTo(mapped[0])
             for point in mapped[1:]:
                 path.lineTo(point)
-            painter.setPen(QPen(QColor(self._COLORS[0]), 2)); painter.drawPath(path)
+            color = QColor(self._COLORS[series_index % len(self._COLORS)])
+            painter.setPen(QPen(color, 2)); painter.drawPath(path)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor("#1B9E77")); painter.drawEllipse(mapped[0], 3, 3)
+            painter.setBrush(QColor("#D95F02")); painter.drawEllipse(mapped[-1], 3, 3)
             painter.setPen(QColor("#7191b2")); painter.drawText(plot_rect.adjusted(4, 0, -4, -3), Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignLeft, axis_label)
 
     def _paint_dwell(self, painter: QPainter, rect) -> None:
@@ -1820,7 +1862,7 @@ class TrajectoryComparisonPlot(QWidget):
         tiles = self._tile_rects(rect, len(self.series))
         palette = (QColor("#edf4fb"), QColor("#b9d5ef"), QColor("#6fa4df"), QColor("#f2b233"), QColor("#df4438"))
         for (label, values), tile in zip(self.series, tiles):
-            self._draw_tile_label(painter, tile, f"{label}  /  笼{label[-2:]}")
+            self._draw_tile_label(painter, tile, self._display_label(label))
             plot_rect = tile.adjusted(9, 27, -9, -9)
             if not values:
                 self._empty(painter, plot_rect); continue
@@ -1835,7 +1877,7 @@ class TrajectoryComparisonPlot(QWidget):
                     value = cells.get((column, row), 0.0)
                     index = 0 if not value else min(len(palette) - 1, int(value / maximum * (len(palette) - 1)) + 1)
                     x = plot_rect.left() + column * (cell_w + gap); y = plot_rect.top() + row * (cell_h + gap)
-                    painter.setBrush(palette[index]); painter.setPen(Qt.PenStyle.NoPen); painter.drawRoundedRect(x, y, cell_w, cell_h, 4, 4)
+                    painter.setBrush(palette[index]); painter.setPen(Qt.PenStyle.NoPen); painter.drawRoundedRect(int(x), int(y), max(1, int(cell_w)), max(1, int(cell_h)), 4, 4)
 
     def _paint_trajectory_2d(self, painter: QPainter, rect) -> None:
         self._draw_axes(painter, rect, "X（mm）", "Y（mm）")
@@ -1889,8 +1931,7 @@ class TrajectoryComparisonPlot(QWidget):
         if not any_data: self._empty(painter, rect)
 
     def _paint_infrared(self, painter: QPainter, rect) -> None:
-        """Plot persisted infrared temperatures on shared real-time axes."""
-        self._draw_axes(painter, rect, "采集时间", "红外最高温度（°C）")
+        """Draw the full Excel temperature series in the legacy right-panel style."""
         values = [
             (float(stamp), float(temperature))
             for _label, samples in self.series
@@ -1905,7 +1946,48 @@ class TrajectoryComparisonPlot(QWidget):
         min_temp = min(temperature for _stamp, temperature in values)
         max_temp = max(temperature for _stamp, temperature in values)
         padding = max((max_temp - min_temp) * 0.1, 0.5)
+        if min_temp == max_temp:
+            padding = max(padding, 1.0)
         low, high = min_temp - padding, max_temp + padding
+
+        # QDateTimeAxis/QValueAxis in the legacy TemperatureTrendWidget both
+        # used six ticks, a HH:mm:ss time format, and a two-decimal °C axis.
+        painter.setPen(QPen(QColor("#d8e7f3"), 1))
+        painter.drawRect(rect)
+        tick_count = 6
+        for index in range(tick_count):
+            ratio = index / (tick_count - 1)
+            x = rect.left() + ratio * rect.width()
+            y = rect.bottom() - ratio * rect.height()
+            painter.setPen(QPen(QColor("#e8f0f7"), 1))
+            painter.drawLine(QPointF(x, rect.top()), QPointF(x, rect.bottom()))
+            painter.drawLine(QPointF(rect.left(), y), QPointF(rect.right(), y))
+            stamp = min_time + (max_time - min_time) * ratio
+            time_text = datetime.fromtimestamp(stamp).strftime("%H:%M:%S")
+            painter.setPen(QColor("#7191b2"))
+            painter.drawText(
+                QRect(int(x - 42), rect.bottom() + 5, 84, 18),
+                Qt.AlignmentFlag.AlignHCenter,
+                time_text,
+            )
+            temperature = low + (high - low) * ratio
+            painter.drawText(
+                QRect(rect.left() - 58, int(y - 9), 52, 18),
+                Qt.AlignmentFlag.AlignRight,
+                f"{temperature:.2f}",
+            )
+        painter.setPen(QColor("#7191b2"))
+        painter.drawText(
+            QRect(rect.left() - 70, rect.top() - 28, 130, 18),
+            Qt.AlignmentFlag.AlignLeft,
+            "温度 (°C)",
+        )
+        painter.drawText(
+            QRect(rect.left(), rect.bottom() + 25, rect.width(), 18),
+            Qt.AlignmentFlag.AlignHCenter,
+            "时间",
+        )
+
         for index, (_label, samples) in enumerate(self.series):
             numeric = [
                 (float(stamp), float(temperature))
@@ -1914,27 +1996,15 @@ class TrajectoryComparisonPlot(QWidget):
             ]
             if not numeric:
                 continue
-            path = QPainterPath()
-            for point_index, (stamp, temperature) in enumerate(numeric):
+            color = QColor(self._INFRARED_COLORS[index % len(self._INFRARED_COLORS)])
+            painter.setPen(QPen(color, 1))
+            painter.setBrush(color)
+            for stamp, temperature in numeric:
                 point = QPointF(
                     rect.left() + (stamp - min_time) / max(max_time - min_time, 1.0) * rect.width(),
-                    rect.bottom() - (temperature - low) / (high - low) * rect.height(),
+                    rect.bottom() - (temperature - low) / max(high - low, 1.0) * rect.height(),
                 )
-                if point_index == 0:
-                    path.moveTo(point)
-                else:
-                    path.lineTo(point)
-            painter.setPen(QPen(QColor(self._COLORS[index % len(self._COLORS)]), 2))
-            painter.drawPath(path)
-            if len(numeric) == 1:
-                painter.setBrush(QColor(self._COLORS[index % len(self._COLORS)]))
-                painter.drawEllipse(point, 3, 3)
-        painter.setPen(QColor("#7191b2"))
-        painter.drawText(rect.left() + 3, rect.top() + 14, f"{high:.1f} °C")
-        painter.drawText(rect.left() + 3, rect.bottom() - 5, f"{low:.1f} °C")
-        painter.drawText(rect.left(), rect.bottom() + 34, datetime.fromtimestamp(min_time).strftime("%m-%d %H:%M:%S"))
-        if max_time > min_time:
-            painter.drawText(rect.right() - 110, rect.bottom() + 34, datetime.fromtimestamp(max_time).strftime("%m-%d %H:%M:%S"))
+                painter.drawEllipse(point, 4, 4)
 
     def _paint_totals(self, painter: QPainter, rect) -> None:
         self._draw_axes(painter, rect, "通道", "二维总路程（mm）")
@@ -1961,11 +2031,12 @@ class TrajectoryComparisonPlot(QWidget):
     def paintEvent(self, event) -> None:
         del event
         painter = QPainter(self); painter.fillRect(self.rect(), QColor("#fbfdff")); painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        left_margin = 96 if self.mode == "sleep" else 58
+        left_margin = 96 if self.mode == "sleep" else (82 if self.mode == "infrared" else 58)
         # Reserve a clear header band for the per-channel legend.  The card
         # title is outside this widget, so keeping the legend below it avoids
         # the title/legend collision seen with long channel names.
-        rect = self.rect().adjusted(left_margin, 68, -18, -36)
+        bottom_margin = -58 if self.mode == "infrared" else -36
+        rect = self.rect().adjusted(left_margin, 68, -18, bottom_margin)
         if not self.series:
             self._empty(painter, rect); painter.end(); return
         if self.mode in self._PER_CAGE_MODES:
@@ -2274,35 +2345,147 @@ class MachineVisionPage(_BaseWorkflowPage):
         self._cage_calibration_points: list[tuple[float, float]] = []
         self._infrared_last_refresh = 0.0
         self._infrared_channel = None
+        self._infrared_loader_thread = None
+        self._infrared_image_paths: dict[int, str] = {}
+        self._infrared_display_path = ""
+        self._infrared_display_size = QSize(0, 0)
         self._recognition_records: list[dict[str, Any]] = []
         super().__init__(context_provider, health_source, parent)
         self._build_ui()
         self._load_cage_calibration_overlay()
         self._frame_timer = QTimer(self); self._frame_timer.setInterval(250); self._frame_timer.timeout.connect(self.refresh); self._frame_timer.start(); self.refresh()
 
-    def _latest_infrared_image(self) -> Optional[str]:
-        """Resolve the newest real infrared image using the active config."""
-        config = global_setting.get_setting("camera_config", {}) or {}
-        storage = config.get("STORAGE", {}) if isinstance(config, Mapping) else {}
-        infrared = config.get("INFRARED_CAMERA", {}) if isinstance(config, Mapping) else {}
-        base = str(storage.get("fold_path", "./data/") or "./data/")
-        path = str(infrared.get("path", "infrared_camera/") or "infrared_camera/")
-        prefix = str(infrared.get("mouse_cage_prefix", "mouse_cage_") or "mouse_cage_")
-        pic_dir = str(infrared.get("pic_dir", "pic") or "pic")
-        candidates = [os.path.join(base, path, f"{prefix}{self.selected_channel}", pic_dir)]
-        context = _provider_value(self._context_provider)
-        root = context.get("experiment_root_path")
-        if root:
-            candidates.append(os.path.join(str(root), path, f"{prefix}{self.selected_channel}", pic_dir))
-        latest = None
-        for folder in candidates:
-            if not os.path.isdir(folder):
+    def start_refresh(self) -> None:
+        """Start the page refresh and the legacy infrared image loader.
+
+        The old monitor-camera page deliberately kept filesystem polling out of
+        the GUI thread.  The workflow page used to scan the infrared folder
+        directly from ``refresh`` instead, which made the display stale and
+        caused it to disagree with the old page's ``data_delay`` behaviour.
+        Keep the new page layout, but use the old loader lifecycle and payload
+        format exactly.
+        """
+        super().start_refresh()
+        if hasattr(self, "_frame_timer") and not self._frame_timer.isActive():
+            self._frame_timer.start()
+        self._start_legacy_infrared_loader()
+        self.refresh()
+
+    def stop_refresh(self) -> None:
+        super().stop_refresh()
+        if hasattr(self, "_frame_timer"):
+            self._frame_timer.stop()
+        self._stop_legacy_infrared_loader()
+
+    def _start_legacy_infrared_loader(self) -> None:
+        loader = self._infrared_loader_thread
+        if loader is not None and loader.isRunning():
+            return
+        camera_config = global_setting.get_setting("camera_config", {}) or {}
+        if not isinstance(camera_config, Mapping) or not isinstance(
+            camera_config.get("INFRARED_CAMERA"), Mapping
+        ):
+            self._clear_infrared_display("红外相机未提供新图像")
+            return
+        try:
+            # Import lazily so pages that do not use machine vision do not
+            # load the optional legacy camera UI during application startup.
+            from Module.monitor_camera.index.tab_4 import ImageLoaderThread
+
+            loader = ImageLoaderThread(display_mode="infrared")
+            loader.image_loaded.connect(self._on_legacy_infrared_images)
+            self._infrared_loader_thread = loader
+            loader.start()
+        except Exception as exc:  # pragma: no cover - hardware/config dependent
+            self._infrared_loader_thread = None
+            logger.exception("启动旧版红外图像加载线程失败: %s", exc)
+            self._clear_infrared_display("红外相机未提供新图像")
+
+    def _stop_legacy_infrared_loader(self) -> None:
+        loader = self._infrared_loader_thread
+        self._infrared_loader_thread = None
+        if loader is None:
+            return
+        try:
+            if loader.isRunning():
+                loader.stop()
+                loader.requestInterruption()
+                loader.wait(3000)
+        except Exception as exc:  # pragma: no cover - shutdown dependent
+            logger.warning("停止旧版红外图像加载线程失败: %s", exc)
+
+    @staticmethod
+    def _legacy_infrared_image_map(image_paths: Any, prefix: Any) -> dict[int, str]:
+        """Build the same cage-to-image map as the legacy Tab4 page."""
+        result: dict[int, str] = {}
+        if not isinstance(image_paths, (list, tuple)):
+            return result
+        prefix_text = str(prefix or "mouse_cage_")
+        for image_path in image_paths:
+            if not image_path:
                 continue
-            for name in os.listdir(folder):
-                candidate = os.path.join(folder, name)
-                if os.path.isfile(candidate) and (latest is None or os.path.getmtime(candidate) > os.path.getmtime(latest)):
-                    latest = candidate
-        return latest
+            match = re.search(rf"{re.escape(prefix_text)}(\d+)", str(image_path))
+            if match is None:
+                continue
+            try:
+                result[int(match.group(1))] = str(image_path)
+            except (TypeError, ValueError):
+                continue
+        return result
+
+    def _on_legacy_infrared_images(self, payload: Any) -> None:
+        """Accept the old ImageLoaderThread payload without blocking the UI."""
+        if not isinstance(payload, Mapping):
+            return
+        image_paths = payload.get("infrared_camera", [])
+        config = global_setting.get_setting("camera_config", {}) or {}
+        infrared = config.get("INFRARED_CAMERA", {}) if isinstance(config, Mapping) else {}
+        prefix = infrared.get("mouse_cage_prefix", "mouse_cage_") if isinstance(infrared, Mapping) else "mouse_cage_"
+        self._infrared_image_paths = self._legacy_infrared_image_map(image_paths, prefix)
+        self._infrared_last_refresh = time.time()
+        self._render_infrared_image(force=True)
+
+    def _clear_infrared_display(self, text: str) -> None:
+        if not hasattr(self, "infrared_label"):
+            return
+        self._infrared_display_path = ""
+        self._infrared_display_size = QSize(0, 0)
+        self.infrared_label.setPixmap(QPixmap())
+        self.infrared_label.setText(text)
+
+    def _render_infrared_image(self, force: bool = False) -> None:
+        if not hasattr(self, "infrared_label"):
+            return
+        image_path = self._infrared_image_paths.get(int(self.selected_channel), "")
+        label_size = self.infrared_label.size()
+        if (
+            not force
+            and image_path == self._infrared_display_path
+            and label_size == self._infrared_display_size
+        ):
+            return
+        if not image_path or not os.path.isfile(image_path):
+            self._clear_infrared_display("红外相机未提供新图像")
+            return
+        pixmap = QPixmap(image_path)
+        if pixmap.isNull():
+            self._clear_infrared_display("红外图像读取失败")
+            return
+        self._infrared_display_path = image_path
+        self._infrared_display_size = QSize(label_size)
+        self.infrared_label.setText("")
+        target_size = label_size if label_size.width() > 0 and label_size.height() > 0 else QSize(360, 280)
+        self.infrared_label.setPixmap(
+            pixmap.scaled(
+                target_size,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
+
+    def _latest_infrared_image(self) -> Optional[str]:
+        """Return the image selected by the legacy loader for this cage."""
+        return self._infrared_image_paths.get(int(self.selected_channel))
 
     def _build_ui(self) -> None:
         _scroll, layout = self._canvas()
@@ -2728,13 +2911,14 @@ class MachineVisionPage(_BaseWorkflowPage):
                     numeric = None
             if numeric is not None:
                 timestamps.append(numeric)
-        # sleep_state_matrix requires four consecutive 10-second segments;
-        # never turn four video frames into a sleep event.
-        if len(timestamps) == 4 and max(timestamps) - min(timestamps) < 30.0:
-            return UNKNOWN
+        # Four consecutive video frames are not enough evidence for sleep,
+        # but they are still enough to count ordinary free movement.  The old
+        # early return incorrectly discarded every action in a high-FPS
+        # trajectory, which made the statistics chart stay at zero.
+        sleep_window_ready = len(timestamps) < 4 or max(timestamps) - min(timestamps) >= 30.0
         center = tuple(sum(point[index] for point in physical) / len(physical) for index in range(3))
         radius = max(math.dist(point, center) for point in physical)
-        if "蛰伏" in enabled and radius <= 5.0:
+        if "蛰伏" in enabled and sleep_window_ready and radius <= 5.0:
             return "蛰伏"
         if "自由活动" in enabled:
             return "自由活动"
@@ -2744,7 +2928,10 @@ class MachineVisionPage(_BaseWorkflowPage):
     def _classify_sequence(cls, records: list[dict[str, Any]], categories: Any = None) -> list[dict[str, Any]]:
         classified: list[dict[str, Any]] = []
         for index in range(len(records)):
-            behavior = cls._classify(records[: index + 1], categories)
+            # _classify only inspects the latest four samples.  Limiting the
+            # window keeps long experiments linear instead of repeatedly
+            # copying and rescanning the complete history.
+            behavior = cls._classify(records[max(0, index - 3): index + 1], categories)
             if behavior == UNKNOWN:
                 continue
             source = records[index]
@@ -2775,21 +2962,7 @@ class MachineVisionPage(_BaseWorkflowPage):
         # requests the complete history for comparison and export.
         records = self._trajectory_records(limit=500); points = [item["point"] for item in records]
         self.trajectory_canvas.set_points(points)
-        now = time.time()
-        infrared_path = None
-        if self._infrared_channel != self.selected_channel or now - self._infrared_last_refresh >= 60.0:
-            self._infrared_channel = self.selected_channel
-            self._infrared_last_refresh = now
-            infrared_path = self._latest_infrared_image()
-        if infrared_path:
-            pixmap = QPixmap(infrared_path)
-            if not pixmap.isNull():
-                self.infrared_label.setText("")
-                self.infrared_label.setPixmap(pixmap.scaled(self.infrared_label.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
-            else:
-                self.infrared_label.setPixmap(QPixmap()); self.infrared_label.setText("红外图像读取失败")
-        elif self._infrared_last_refresh == now:
-            self.infrared_label.setPixmap(QPixmap()); self.infrared_label.setText("红外相机未提供新图像")
+        self._render_infrared_image()
         behavior_categories = self._configured_behavior_categories(self.selected_channel)
         behavior = self._classify(records, behavior_categories)
         status = "在线" if frame_available else UNKNOWN
@@ -2831,6 +3004,10 @@ class DataAnalysisPage(_BaseWorkflowPage):
         self._trajectory_selection_user_set = False
         self.selected_channel = 1; self._history_points: list[tuple[float, float, float]] = []; self._animation_index = 0
         self._trajectory_animation_active = False; self._trajectory_animation_index = 1
+        self._trajectory_animation_states: dict[str, dict[str, Any]] = {
+            module: {"active": False, "index": 1, "finished": False}
+            for module in ("3d", "xy", "height")
+        }
         self._trajectory_channels: set[int] = {1}
         self._trajectory_modules: set[str] = {"3d"}
         self._trajectory_records_cache: dict[int, list[dict[str, Any]]] = {}
@@ -2966,7 +3143,7 @@ class DataAnalysisPage(_BaseWorkflowPage):
         self.trajectory_module_group = QButtonGroup(self); self.trajectory_module_group.setExclusive(True)
         module_definitions = (
             ("3d", "三维轨迹图对比"), ("xy", "二维轨迹平面对比"), ("height", "高度平面对比"),
-            ("sleep", "蛰伏热力图对比"), ("cumulative", "累计二维轨迹距离对比"),
+            ("sleep", "睡眠热力图对比"), ("cumulative", "累计二维轨迹距离对比"),
             ("total", "二维总路程对比"), ("minute", "每分钟运动量对比"),
             ("dwell", "笼子停留时间热力图"), ("recognition", "行为识别统计"),
             ("infrared", "红外温度折线图对比"),
@@ -3154,9 +3331,47 @@ class DataAnalysisPage(_BaseWorkflowPage):
         self._trajectory_selection_user_set = True
         selected = str(self.trajectory_experiment_combo.currentData() or "")
         self._selected_trajectory_export_path = selected if selected and os.path.isdir(selected) else None
+        if self._selected_trajectory_export_path:
+            self._activate_monitor_workbook(
+                self._matching_monitor_workbook_for_trajectory(
+                    self._selected_trajectory_export_path
+                )
+            )
         self._legacy_trajectory_cache_key = None
         self._legacy_trajectory_cache = None
+        self._reset_trajectory_animation_states()
         self.refresh()
+
+    def _matching_monitor_workbook_for_trajectory(self, export_path: str) -> Optional[str]:
+        """Return the data/monitor_data workbook belonging to a trajectory run."""
+        started = parse_trajectory_export_time(export_path)
+        if started is None:
+            return None
+        matched = find_matching_monitor_workbook(self._experiment_storage_root(), started)
+        return str(matched) if matched is not None else None
+
+    def _activate_monitor_workbook(self, workbook_path: Optional[str]) -> None:
+        """Make a matched monitor Excel file the active historical source."""
+        if not workbook_path:
+            return
+        workbook_path = os.path.abspath(str(workbook_path))
+        current = self._selected_experiment_excel_path
+        if current and os.path.normcase(os.path.abspath(current)) == os.path.normcase(workbook_path):
+            return
+        self._selected_experiment_excel_path = workbook_path
+        self._selected_experiment_selection_path = workbook_path
+        candidate = os.path.join(
+            self._experiment_storage_root(),
+            Path(workbook_path).stem,
+            "data",
+            "data.db",
+        )
+        self._selected_experiment_db_path = os.path.abspath(candidate) if os.path.isfile(candidate) else ""
+        self._legacy_comparison_cache_key = None
+        self._legacy_comparison_cache = {}
+        self._historical_latest_rows = {}
+        self._historical_start_timestamp = 0.0
+        self._start_historical_workbook_load(workbook_path)
 
     def _matching_monitor_db(self, export_path: str) -> Optional[str]:
         """Attach monitor data to a selected legacy trajectory run by time."""
@@ -3415,6 +3630,7 @@ class DataAnalysisPage(_BaseWorkflowPage):
             self._trajectory_channels.add(int(channel))
             button = self.trajectory_channel_buttons[int(channel) - 1]
             button.blockSignals(True); button.setChecked(True); button.blockSignals(False)
+        self._reset_trajectory_animation_states()
         self._refresh_trajectory_comparison()
         self._refresh_analysis_recognition()
 
@@ -3423,6 +3639,14 @@ class DataAnalysisPage(_BaseWorkflowPage):
             # QButtonGroup keeps one module selected; ignore the uncheck event
             # emitted for the previously selected button.
             return
+        previous = next(iter(self._trajectory_modules), "3d")
+        if previous != str(module):
+            previous_state = self._trajectory_animation_states.get(previous)
+            if previous_state is not None:
+                previous_state["active"] = False
+            if hasattr(self, "_animation_timer"):
+                self._animation_timer.stop()
+            self._trajectory_animation_active = False
         self._trajectory_modules = {str(module)}
         infrared = module == "infrared"
         self.export_trajectory_csv_button.setText("导出红外温度数据" if infrared else "导出轨迹对比数据")
@@ -3436,7 +3660,34 @@ class DataAnalysisPage(_BaseWorkflowPage):
         if not hasattr(self, "trajectory_play_button"):
             return
         selected = next(iter(self._trajectory_modules), "3d")
-        self.trajectory_play_button.setVisible(selected in {"3d", "xy", "height"})
+        visible = selected in self._trajectory_animation_states
+        self.trajectory_play_button.setVisible(visible)
+        if not visible:
+            return
+        state = self._trajectory_animation_states[selected]
+        if state["active"]:
+            text = "暂停轨迹动画"
+        elif state["finished"]:
+            text = "重新播放轨迹动画"
+        elif state["index"] > 1:
+            text = "继续播放轨迹动画"
+        else:
+            text = "播放轨迹动画"
+        self.trajectory_play_button.setText(text)
+
+    def _reset_trajectory_animation_states(self) -> None:
+        """Reset playback independently for each trajectory view after data changes."""
+        if hasattr(self, "_animation_timer"):
+            self._animation_timer.stop()
+        for state in self._trajectory_animation_states.values():
+            state.update(active=False, index=1, finished=False)
+        self._trajectory_animation_active = False
+        self._trajectory_animation_index = 1
+        self._update_trajectory_play_visibility()
+
+    def _selected_trajectory_animation_state(self) -> Optional[dict[str, Any]]:
+        selected = next(iter(self._trajectory_modules), "3d")
+        return self._trajectory_animation_states.get(selected)
 
     @staticmethod
     def _trajectory_time_seconds(value: Any) -> Optional[float]:
@@ -3527,6 +3778,11 @@ class DataAnalysisPage(_BaseWorkflowPage):
             else None
         )
         for channel in sorted(requested_channels):
+            if self._trajectory_modules == {"height"} and historical_selection:
+                # The legacy analysis object intentionally exposes only X/Y.
+                # Keep the persisted Z column for the calculated height chart.
+                records[channel] = self._height_records_from_export(channel)
+                continue
             channel_data = legacy.channels.get(channel) if legacy is not None else None
             if channel_data is not None and channel_data.valid_rows:
                 records[channel] = [
@@ -3568,7 +3824,9 @@ class DataAnalysisPage(_BaseWorkflowPage):
                 if not self._selected_trajectory_export_path:
                     return None
                 export_path = Path(self._selected_trajectory_export_path)
-                paths = sorted(export_path.glob("cage_*/data/trajectory.csv"))
+                # Accept both layouts produced by the old and new trajectory
+                # workers: cage_1/... and cage1/....
+                paths = sorted(export_path.glob("cage*/data/trajectory.csv"))
                 signature = tuple((str(path), path.stat().st_size, path.stat().st_mtime_ns) for path in paths)
                 key = ("trajectory-csv-explicit", str(export_path), signature)
                 if key != self._legacy_trajectory_cache_key:
@@ -3585,7 +3843,7 @@ class DataAnalysisPage(_BaseWorkflowPage):
                 workbook_stat = workbook.stat()
                 started = parse_experiment_time(workbook)
                 export = find_matching_trajectory_export(TRAJECTORY_EXPORT_DIR, started) if started else None
-                paths = sorted(export.glob("cage_*/data/trajectory.csv")) if export else []
+                paths = sorted(export.glob("cage*/data/trajectory.csv")) if export else []
                 signature = tuple((str(path), path.stat().st_size, path.stat().st_mtime_ns) for path in paths)
                 key = ("trajectory-csv", str(workbook), workbook_stat.st_size, workbook_stat.st_mtime_ns, str(export or ""), signature)
                 if key != self._legacy_trajectory_cache_key:
@@ -3641,48 +3899,31 @@ class DataAnalysisPage(_BaseWorkflowPage):
             return 0.0, {}
 
     def _infrared_temperature_records_for_channels(self) -> dict[int, list[tuple[str, float, float]]]:
-        """Read real maximum temperatures and timestamps from each cage table."""
+        """Read the infrared-temperature column from the selected monitor Excel."""
         records: dict[int, list[tuple[str, float, float]]] = {
             channel: [] for channel in sorted(self._trajectory_channels)
         }
-        db_path = _provider_value(self._context_provider).get("experiment_db_path")
-        if not db_path or not os.path.isfile(str(db_path)):
-            return records
-        try:
-            with sqlite3.connect(str(db_path)) as connection:
-                for channel in records:
-                    table = f"MouseInfrared_data_cage_{channel}"
-                    if connection.execute(
-                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
-                    ).fetchone() is None:
+        if not self._selected_experiment_excel_path and self._selected_trajectory_export_path:
+            self._activate_monitor_workbook(
+                self._matching_monitor_workbook_for_trajectory(
+                    self._selected_trajectory_export_path
+                )
+            )
+        origin, comparison = self._legacy_comparison_series()
+        for channel in records:
+            series = comparison.get(channel, {}).get("temperature")
+            if series is None:
+                continue
+            for elapsed, value in zip(series.elapsed_seconds, series.values):
+                try:
+                    timestamp = float(origin) + float(elapsed)
+                    temperature = float(value)
+                    if not math.isfinite(timestamp) or not math.isfinite(temperature):
                         continue
-                    columns = {str(row[1]) for row in connection.execute(f'PRAGMA table_info("{table}")')}
-                    temperature_column = next((name for name in ("tmp_hs_max", "tmp_hs_mean") if name in columns), None)
-                    time_columns = [name for name in ("time", "recognize_time") if name in columns]
-                    if temperature_column is None or not time_columns:
-                        continue
-                    selected_columns = ", ".join(f'"{name}"' for name in (*time_columns, temperature_column))
-                    for row in connection.execute(
-                        f'SELECT {selected_columns} FROM "{table}" ORDER BY rowid ASC'
-                    ):
-                        value = _number(row[-1])
-                        stamp, timestamp = None, None
-                        for column_name, raw_stamp in zip(time_columns, row[:-1]):
-                            if column_name == "recognize_time" and raw_stamp:
-                                try:
-                                    parsed = datetime.strptime(str(raw_stamp), "%Y_%m_%d_%H_%M_%S_%f").timestamp()
-                                except (TypeError, ValueError):
-                                    parsed = self._trajectory_time_seconds(raw_stamp)
-                            else:
-                                parsed = self._trajectory_time_seconds(raw_stamp)
-                            if parsed is not None:
-                                stamp, timestamp = raw_stamp, parsed
-                                break
-                        if value is not None and timestamp is not None:
-                            records[channel].append((str(stamp), timestamp, value))
-                    records[channel].sort(key=lambda sample: sample[1])
-        except (OSError, sqlite3.Error):
-            return {channel: [] for channel in records}
+                    stamp = datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                    records[channel].append((stamp, timestamp, temperature))
+                except (TypeError, ValueError, OverflowError):
+                    continue
         return records
 
     def _configured_behavior_categories(self, channel: int) -> tuple[str, ...]:
@@ -3693,12 +3934,24 @@ class DataAnalysisPage(_BaseWorkflowPage):
         a hard-coded category list in the chart.
         """
         context = _provider_value(self._context_provider)
-        data = context.get("channel_data_config")
-        info = data.get(str(int(channel)), {}) if isinstance(data, Mapping) else {}
-        if not isinstance(info, Mapping):
-            info = {}
-        selected = MachineVisionPage._normalize_behavior_categories(info.get("behavior_category"))
-        return selected or ("自由活动",)
+        sources = []
+        # P2 writes the live selection to global_setting.  Prefer it over a
+        # context snapshot because the workflow shell may have been created
+        # before the user changed the behaviour chips.
+        for setting_key in ("experiment_setting", "experiment_setting_new"):
+            setting = global_setting.get_setting(setting_key, None)
+            sources.append(getattr(setting, "channel_data_config", None) if setting is not None else None)
+        sources.append(context.get("channel_data_config"))
+        for data in sources:
+            if not isinstance(data, Mapping):
+                continue
+            info = data.get(str(int(channel)), data.get(int(channel), {}))
+            if not isinstance(info, Mapping):
+                continue
+            selected = MachineVisionPage._normalize_behavior_categories(info.get("behavior_category"))
+            if selected:
+                return selected
+        return ("自由活动",)
 
     @staticmethod
     def _dwell_cells(points: list[tuple[float, float, float]], columns: int = 12, rows: int = 10) -> list[tuple[int, int, int]]:
@@ -3713,6 +3966,65 @@ class DataAnalysisPage(_BaseWorkflowPage):
             row = min(rows - 1, max(0, int(y / length * rows)))
             cells[(column, row)] = cells.get((column, row), 0) + 1
         return [(column, row, count) for (column, row), count in cells.items()]
+
+    def _height_records_from_export(self, channel: int) -> list[dict[str, Any]]:
+        """Read physical XYZ samples for the calculated height comparison.
+
+        The old analysis loader keeps only X/Y.  Height therefore reads the
+        selected experiment's CSV directly so the persisted Z values are not
+        replaced by a synthetic zero.
+        """
+        export_path = Path(self._selected_trajectory_export_path or "")
+        if not export_path.is_dir():
+            return []
+        csv_path = next(
+            (
+                export_path / cage_name / "data" / "trajectory.csv"
+                for cage_name in (f"cage_{int(channel)}", f"cage{int(channel)}")
+                if (export_path / cage_name / "data" / "trajectory.csv").is_file()
+            ),
+            None,
+        )
+        if csv_path is None:
+            return []
+        records: list[dict[str, Any]] = []
+        allowed_statuses = {"ok", "detected", "true", "1", "有效", "已检测", "检测到"}
+        try:
+            with csv_path.open("r", encoding="utf-8-sig", newline="") as stream:
+                reader = csv.DictReader(stream)
+                for row_index, row in enumerate(reader):
+                    status = str(row.get("status") or "").strip().lower()
+                    if status and status not in allowed_statuses:
+                        continue
+                    values = {}
+                    for key, names in {
+                        "x": ("X", "x", "rawX"),
+                        "y": ("Y", "y", "rawY"),
+                        "z": ("Z", "z", "mouseHeight", "rawZ"),
+                    }.items():
+                        values[key] = next(
+                            (_number(row.get(name)) for name in names if _number(row.get(name)) is not None),
+                            None,
+                        )
+                    if any(value is None for value in values.values()):
+                        continue
+                    stamp = next(
+                        (
+                            parsed
+                            for name in ("captureTimestamp", "timestamp", "datetime", "frameName")
+                            for parsed in (self._trajectory_time_seconds(row.get(name)),)
+                            if parsed is not None
+                        ),
+                        float(row_index) * 0.1,
+                    )
+                    records.append({
+                        "point": _PhysicalMillimeterPoint(values["x"], values["y"], values["z"]),
+                        "time": stamp,
+                        "source": "trajectory_csv_xyz",
+                    })
+        except (OSError, csv.Error):
+            return []
+        return records
 
     def _trajectory_payload(self, records_by_channel: dict[int, list[dict[str, Any]]]) -> dict[str, Any]:
         trajectories: list[tuple[str, list[tuple[float, float, float]]]] = []
@@ -3754,6 +4066,14 @@ class DataAnalysisPage(_BaseWorkflowPage):
             return
         records_by_channel = self._trajectory_records_for_channels()
         payloads = self._trajectory_payload(records_by_channel)
+        selected = next(iter(self._trajectory_modules), "3d")
+        state = self._trajectory_animation_states.get(selected)
+        if state is not None and 1 < state["index"] and not state["finished"]:
+            partial_records = {
+                channel: records[: state["index"]]
+                for channel, records in records_by_channel.items()
+            }
+            payloads = self._trajectory_payload(partial_records)
         for key, plot in self.trajectory_compare_plots.items():
             if key == "recognition":
                 continue
@@ -4140,56 +4460,85 @@ class DataAnalysisPage(_BaseWorkflowPage):
 
     def _advance_animation(self) -> None:
         if self._trajectory_animation_active:
+            selected = next(iter(self._trajectory_modules), "3d")
+            state = self._trajectory_animation_states.get(selected)
+            if state is None:
+                self._trajectory_animation_active = False
+                self._animation_timer.stop()
+                return
             records_by_channel = self._trajectory_records_cache or self._trajectory_records_for_channels()
             if not any(records_by_channel.values()):
-                self._trajectory_animation_active = False; self._animation_timer.stop(); self.trajectory_play_button.setText("播放轨迹动画"); return
+                state.update(active=False, index=1, finished=False)
+                self._trajectory_animation_active = False
+                self._animation_timer.stop()
+                self._update_trajectory_play_visibility()
+                return
             maximum = max((len(records) for records in records_by_channel.values()), default=0)
-            index = max(1, self._trajectory_animation_index)
+            index = max(1, state["index"])
             animated = {channel: records[:index] for channel, records in records_by_channel.items()}
             payloads = self._trajectory_payload(animated)
-            for key, plot in self.trajectory_compare_plots.items():
-                if key == "recognition":
-                    continue
-                plot.set_series(payloads.get(key, []))
+            plot = self.trajectory_compare_plots.get(selected)
+            if plot is not None:
+                plot.set_series(payloads.get(selected, []))
             if index >= maximum:
-                self._trajectory_animation_active = False; self._animation_timer.stop(); self.trajectory_play_button.setText("重新播放轨迹动画")
+                state.update(active=False, index=maximum, finished=True)
+                self._trajectory_animation_active = False
+                self._animation_timer.stop()
             else:
-                self._trajectory_animation_index += 1
+                state["index"] = index + 1
+            self._trajectory_animation_index = state["index"]
+            self._update_trajectory_play_visibility()
             return
         if self._animation_index >= len(self._history_points): self._animation_timer.stop(); return
         self.history_canvas.set_points(self._history_points[: self._animation_index]); self._animation_index += 1
 
     def _toggle_trajectory_animation(self) -> None:
-        if self._trajectory_animation_active:
+        state = self._selected_trajectory_animation_state()
+        if state is None:
+            return
+        if state["active"]:
+            state["active"] = False
             self._trajectory_animation_active = False
             self._animation_timer.stop()
-            self.trajectory_play_button.setText("继续播放轨迹动画")
-            self._refresh_trajectory_comparison()
+            self._update_trajectory_play_visibility()
             return
         records_by_channel = self._trajectory_records_for_channels()
         if not any(records_by_channel.values()):
             self.compare_export_status.setText("当前没有可播放的真实轨迹数据")
             return
+        maximum = max((len(records) for records in records_by_channel.values()), default=0)
+        if state["finished"] or state["index"] >= maximum:
+            state.update(index=1, finished=False)
+        state["active"] = True
         self._trajectory_animation_active = True
-        self._trajectory_animation_index = 1
-        self.trajectory_play_button.setText("暂停轨迹动画")
+        self._trajectory_animation_index = state["index"]
+        self._update_trajectory_play_visibility()
         self._animation_timer.start()
 
     def _refresh_analysis_recognition(self) -> None:
-        """Refresh the migrated behaviour summary for the selected channel."""
+        """Count how many selected channels enabled each behaviour type.
+
+        This chart is a configuration summary, not a frame-level trajectory
+        classifier: one channel selecting a behaviour contributes exactly one
+        count, and another channel selecting the same behaviour contributes
+        one more.
+        """
         if not hasattr(self, "analysis_recognition_count_label"):
             return
-        records_by_channel = self._trajectory_records_for_channels()
         chart_counts: list[tuple[str, dict[str, int]]] = []
-        for selected, records in records_by_channel.items():
-            tagged_records = [dict(item, channel=selected) for item in records[-500:]]
+        for selected in sorted(self._trajectory_channels):
             categories = self._configured_behavior_categories(selected)
-            recognition_records = MachineVisionPage._classify_sequence(tagged_records, categories)
-            values = {category: sum(item.get("behavior") == category for item in recognition_records) for category in categories}
+            values = {category: 1 for category in categories}
             chart_counts.append((f"CH{selected:02d}", values))
         labels = ", ".join(label for label, _values in chart_counts) if chart_counts else "无通道"
         self.analysis_recognition_channel_label.setText(f"当前选择：{labels}")
-        self.analysis_recognition_count_label.setText("行为类别：自由活动、蛰伏、攀爬；每个笼子对应一组柱状图")
+        categories = []
+        for _label, values in chart_counts:
+            for category in values:
+                if category not in categories:
+                    categories.append(category)
+        category_text = "、".join(categories) if categories else "无"
+        self.analysis_recognition_count_label.setText(f"统计类别：{category_text}；每个通道勾选一次计 1 次")
         self.analysis_behavior_chart.set_counts(chart_counts)
 
     def refresh(self) -> None:
