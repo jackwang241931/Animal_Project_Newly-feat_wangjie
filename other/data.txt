@@ -1,0 +1,254 @@
+ENM 类型（环境监测模块）
+{
+    'table_name': 'monitor_data',
+    'module_name': 'ENM',
+    'mouse_cage_number': 1,
+    'data': [
+        {'desc': '温度测量值(℃)', 'value': -85.9},
+        {'desc': '湿度测量值(%RH)', 'value': 93.9},
+        {'desc': '噪声测量值(dB)', 'value': 190.1},
+        {'desc': '大气压测量值(KPa)', 'value': 2275.6},
+        {'desc': '当前计量周期内跑轮圈数测量值', 'value': 8501.028},
+        {'desc': '备注', 'value': None}
+    ],
+    'slave_id': '11',
+    'function_code': 4,
+    'time': '2025-10-16 19:42:08.824'
+}
+
+EM 类型（食物重量监测模块）
+{
+    'table_name': 'monitor_data',
+    'module_name': 'EM',
+    'mouse_cage_number': 1,
+    'data': [
+        {'desc': '重量测量值(g)', 'value': 1.89},
+        {'desc': '备注', 'value': None}
+    ],
+    'slave_id': '13',
+    'function_code': 4,
+    'time': '2025-10-16 19:42:11.867'
+}
+UGC 类型（上游气体控制模块）
+{
+    'table_name': 'monitor_data',
+    'module_name': 'UGC',
+    'mouse_cage_number': 0,
+    'data': [
+        {'desc': '流量计1', 'value': 287},
+        {'desc': 'CO2(%)', 'value': 4.4129},
+        {'desc': '保留', 'value': 194.65},
+        {'desc': '备注', 'value': None}
+    ],
+    'slave_id': '3',
+    'function_code': 4,
+    'time': '2025-10-16 19:42:12.878'
+}
+DWM 类型（饮水重量监测模块）
+{
+    'table_name': 'monitor_data',
+    'module_name': 'DWM',
+    'mouse_cage_number': 1,
+    'data': [
+        {'desc': '重量测量值(g)', 'value': 1.72},
+        {'desc': '备注', 'value': None}
+    ],
+    'slave_id': '12',
+    'function_code': 4,
+    'time': '2025-10-16 19:42:14.904'
+}
+ZOS 类型（氧气传感器模块）
+{
+    'table_name': 'monitor_data',
+    'module_name': 'ZOS',
+    'mouse_cage_number': 0,
+    'data': [
+        {'desc': '氧传感器测量值(%)', 'value': 45.31},
+        {'desc': '备注', 'value': None}
+    ],
+    'slave_id': '4',
+    'function_code': 4,
+    'time': '2025-10-16 19:42:15.923'
+}
+
+
+WM 类型（体重监测模块）
+{
+    'table_name': 'monitor_data',
+    'module_name': 'WM',
+    'mouse_cage_number': 1,
+    'data': [
+        {'desc': '重量测量值(g)', 'value': 2.06},
+        {'desc': '备注', 'value': None}
+    ],
+    'slave_id': '14',
+    'function_code': 4,
+    'time': '2025-10-16 19:42:17.937'
+}
+UFC 类型（上游流量控制模块）
+{
+    'table_name': 'monitor_data',
+    'module_name': 'UFC',
+    'mouse_cage_number': 0,
+    'data': [
+        {'desc': '鼠笼号', 'value': 1},
+        {'desc': '流量计测量值(sccm)', 'value': 0.0},
+        {'desc': '备用1高字节', 'value': '0X3a'},
+        {'desc': '备用1低字节', 'value': '0X01'},
+        {'desc': '备用2高字节', 'value': '0X2d'},
+        {'desc': '备用2低字节', 'value': '0X05'},
+        {'desc': '备注', 'value': None},
+        {'desc': '参考气路流量计测量值(sccm)', 'value': 0.0}
+    ],
+    'slave_id': '2',
+    'function_code': 4,
+    'time': '2025-10-16 19:42:28.286'
+}
+
+{
+    'table_name': 'monitor_data',
+    'module_name': 'UFC',
+    'mouse_cage_number': 0,
+    'data': [
+        {'desc': '鼠笼号', 'value': 2},
+        {'desc': '流量计测量值(sccm)', 'value': 0.0},
+        {'desc': '备用1高字节', 'value': '0X2f'},
+        {'desc': '备用1低字节', 'value': '0X07'},
+        {'desc': '备用2高字节', 'value': '0X2d'},
+        {'desc': '备用2低字节', 'value': '0X06'},
+        {'desc': '备注', 'value': None},
+        {'desc': '参考气路流量计测量值(sccm)', 'value': 0.0}
+    ],
+    'slave_id': '2',
+    'function_code': 4,
+    'time': '2025-10-16 19:42:40.436'
+}
+
+{
+    'table_name': 'monitor_data',
+    'module_name': 'UFC',
+    'mouse_cage_number': 0,
+    'data': [
+        {'desc': '鼠笼号', 'value': 3},
+        {'desc': '流量计测量值(sccm)', 'value': 0.0},
+        {'desc': '备用1高字节', 'value': '0X1f'},
+        {'desc': '备用1低字节', 'value': '0X04'},
+        {'desc': '备用2高字节', 'value': '0X1a'},
+        {'desc': '备用2低字节', 'value': '0X01'},
+        {'desc': '备注', 'value': None},
+        {'desc': '参考气路流量计测量值(sccm)', 'value': 0.0}
+    ],
+    'slave_id': '2',
+    'function_code': 4,
+    'time': '2025-10-16 19:42:52.613'
+}
+
+{
+    'table_name': 'monitor_data',
+    'module_name': 'UFC',
+    'mouse_cage_number': 0,
+    'data': [
+        {'desc': '鼠笼号', 'value': 4},
+        {'desc': '流量计测量值(sccm)', 'value': 0.0},
+        {'desc': '备用1高字节', 'value': '0X2f'},
+        {'desc': '备用1低字节', 'value': '0X07'},
+        {'desc': '备用2高字节', 'value': '0X2d'},
+        {'desc': '备用2低字节', 'value': '0X06'},
+        {'desc': '备注', 'value': None},
+        {'desc': '参考气路流量计测量值(sccm)', 'value': 0.0}
+    ],
+    'slave_id': '2',
+    'function_code': 4,
+    'time': '2025-10-16 19:43:04.771'
+}
+
+{
+    'table_name': 'monitor_data',
+    'module_name': 'UFC',
+    'mouse_cage_number': 0,
+    'data': [
+        {'desc': '鼠笼号', 'value': 5},
+        {'desc': '流量计测量值(sccm)', 'value': 0.0},
+        {'desc': '备用1高字节', 'value': '0X2f'},
+        {'desc': '备用1低字节', 'value': '0X07'},
+        {'desc': '备用2高字节', 'value': '0X2d'},
+        {'desc': '备用2低字节', 'value': '0X06'},
+        {'desc': '备注', 'value': None},
+        {'desc': '参考气路流量计测量值(sccm)', 'value': 0.0}
+    ],
+    'slave_id': '2',
+    'function_code': 4,
+    'time': '2025-10-16 19:43:18.976'
+}
+
+{
+    'table_name': 'monitor_data',
+    'module_name': 'UFC',
+    'mouse_cage_number': 0,
+    'data': [
+        {'desc': '鼠笼号', 'value': 6},
+        {'desc': '流量计测量值(sccm)', 'value': 0.0},
+        {'desc': '备用1高字节', 'value': '0X1f'},
+        {'desc': '备用1低字节', 'value': '0X04'},
+        {'desc': '备用2高字节', 'value': '0X1a'},
+        {'desc': '备用2低字节', 'value': '0X01'},
+        {'desc': '备注', 'value': None},
+        {'desc': '参考气路流量计测量值(sccm)', 'value': 0.0}
+    ],
+    'slave_id': '2',
+    'function_code': 4,
+    'time': '2025-10-16 19:43:27.477'
+}
+Epoch 类型（周期数据）
+{
+    'module_name': 'Epoch',
+    'table_name': 'data',
+    'mouse_cage_number': 0,
+    'data': [
+        {'desc': '鼠笼号', 'value': 1},
+        {'desc': '氧浓度0点校准值', 'value': None},
+        {'desc': '氧浓传感器span数值', 'value': None},
+        {'desc': 'ufc_流量计测量值(sccm)', 'value': None},
+        {'desc': 'ufc_参考气路流量计测量值(sccm)', 'value': None},
+        {'desc': 'ugc_流量计1', 'value': None},
+        {'desc': 'CO2(%)', 'value': None},
+        {'desc': '氧气传感器测量值(%)', 'value': None},
+        {'desc': '温度测量值(°C)', 'value': None},
+        {'desc': '湿度测量值(%RH)', 'value': None},
+        {'desc': '噪声测量值(dB)', 'value': None},
+        {'desc': '大气压测量值(KPa)', 'value': None},
+        {'desc': '当前计量周期内跑轮圈数测量值', 'value': None},
+        {'desc': '饮水重量测量值(g)', 'value': None},
+        {'desc': '食物重量测量值(g)', 'value': None},
+        {'desc': '称重重量测量值(g)', 'value': None},
+        {'desc': '轮次开始时间', 'value': '2025-10-16 19:42:07.733'},
+        {'desc': '轮次结束时间', 'value': '2025-10-16 19:42:28.578'}
+    ],
+    'slave_id': 0,
+    'time': '2025-10-16 19:42:28.599',
+    'function_code': 0
+}
+ZeroCalibration 类型（零点校准）
+{
+    'module_name': 'ZeroCalibration',
+    'time': '2025-10-16 19:42:38.418',
+    'table_name': 'data',
+    'mouse_cage_number': 0,
+    'data': [
+        {'desc': '氧浓度0点校准值', 'value': 45.31}
+    ],
+    'slave_id': 0,
+    'function_code': 0
+}
+SpanCalibration 类型（量程校准）
+{
+    'module_name': 'SpanCalibration',
+    'time': '2025-10-16 19:43:05.786',
+    'table_name': 'data',
+    'mouse_cage_number': 0,
+    'data': [
+        {'desc': '氧浓传感器span数值', 'value': 45.31}
+    ],
+    'slave_id': 0,
+    'function_code': 0
+}

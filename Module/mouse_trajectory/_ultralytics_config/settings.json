@@ -1,0 +1,21 @@
+{
+  "settings_version": "0.0.6",
+  "datasets_dir": "C:\\WorkSpace\\datasets",
+  "weights_dir": "C:\\WorkSpace\\Animal_Project_Newly\\weights",
+  "runs_dir": "C:\\WorkSpace\\Animal_Project_Newly\\runs",
+  "uuid": "85419843eee2964d9a4a584a09be5153385e2b15d0e8517faae86692d512fb62",
+  "sync": true,
+  "api_key": "",
+  "openai_api_key": "",
+  "clearml": true,
+  "comet": true,
+  "dvc": true,
+  "hub": true,
+  "mlflow": true,
+  "neptune": true,
+  "raytune": true,
+  "tensorboard": false,
+  "wandb": false,
+  "vscode_msg": true,
+  "openvino_msg": true
+}

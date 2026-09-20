@@ -1,0 +1,44 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+
+# IDE and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local secrets and machine-specific overrides
+.env
+.env.*
+*.local
+
+# Runtime-generated experiment artifacts
+data/
+log/
+crash_dumps/
+exports/
+
+# Temporary and generated files
+*.tmp
+*.temp
+*.bak
+*.log
+*.pid
+*.lock
+~$*
+
+# Build/package output
+build/
+dist/
+*.egg-info/
+

@@ -1,0 +1,49 @@
+2025-05-20
+1.将3d和红外集成到项目里
+2.每个半个小时删除一次照片 ，删除之前把照片大小记录一次 记录坐标处理的运行时间
+
+.\Scripts\activate
+.\.venv\Scripts\activate
+pyinstaller ./other/main.spec
+pyinstaller -d main.py --hidden-import=pyqt6-plugin
+
+2025-05-27
+控制是否丢帧
+
+pipreqs --encoding=utf8  ./communication,./config,./dao,./entity,./enu,./equipment,./index,./Modbus,./resource_py,./smart_device,./theme,./ui,./util,main.py,main_comm.py,main_deep_camera.py,main_gui.py,main_infrared_camera.py,main_smart_device.py --force
+pipreqs . --encoding=utf8 --ignore ./build,./dist,./entity,./log,./model,./resource,./ui_backup,./venv --force
+
+
+2025-07-15
+1.将获取监测数据存储，然后在读取
+135条消息 一共用时271.5814492702484秒 而且每条消息要休息1秒 271-135=136秒 136/134 = 1.02秒
+35条消息  一共用时70.04秒 而且每条消息要休息1秒 70-35 =35     0.5秒
+2.更新3d和红外的视频显示为opencv的video
+3.监测数据显示图表
+
+2025-07-24
+1.响应式界面
+2.实验配置读取各传感器配置信息
+3.数据处理
+
+2025-8-15
+1.开始实验时 配置文件experiment..db 有两个点 done
+2.跑轮数据 小数部分除以36  done
+3.04 04 最后两个字节也是氧传感器 done
+
+2025-08-20
+1.当deep_camera_to_mouse_cage_number_file_name.json和另一个相机配置文件存在相机SN号时但是相机没插上，就会无响应！ done
+2.开始实验的时候需要实验配置一下串口，不然串口默认第一个 done
+
+2025-9-15
+location.csv tmp.csv
+就卡顿定位问题 首先是线程问题，其次是窗口变换大小的遍历问题
+实验室版本 1.3.3.4.4
+
+
+2025-09-26
+1.首先标定和检测ufc状态未启动 完成
+2.查看一轮周期
+3.更改数据库查询方式
+4.更改数据监控页面的scroll
+

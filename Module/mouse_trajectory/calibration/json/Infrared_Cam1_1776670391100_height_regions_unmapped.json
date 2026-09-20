@@ -1,0 +1,68 @@
+{
+  "format": "Height_Constraint_Regions",
+  "unit": "mm",
+  "regions": [
+    {
+      "id": 1778071711801680100,
+      "name": "体重秤",
+      "height_z": 20.0,
+      "fixed_y": 300.0,
+      "polygon_points": [
+        [
+          734.918,
+          548.577
+        ],
+        [
+          748.895,
+          784.075
+        ],
+        [
+          887.705,
+          778.314
+        ],
+        [
+          889.172,
+          541.982
+        ]
+      ],
+      "source_polygon_points": [
+        [
+          802.52,
+          529.21
+        ],
+        [
+          808.99,
+          762.2
+        ],
+        [
+          944.9,
+          762.2
+        ],
+        [
+          953.53,
+          527.06
+        ]
+      ]
+    }
+  ],
+  "sourceCoordinate": "testImage",
+  "targetCoordinate": "referenceImage",
+  "mappingDirection": "test_to_ref",
+  "matrixSource": "H_test_to_ref",
+  "sourceHeightRegionsJson": "D:\\boshi\\工程-动物箱\\底片&&json\\Infrared_Cam1_1776670391100_height_regions.json",
+  "imageRegistrationJson": "D:\\boshi\\工程-动物箱\\底片&&json\\WIN_20260419_15_45_44_Pro_image_registration.json",
+  "referenceImage": {
+    "fileName": "WIN_20260419_15_45_44_Pro.jpg",
+    "width": 1920,
+    "height": 1080
+  },
+  "testImage": {
+    "fileName": "Infrared_Cam1_1776594961465.jpg",
+    "width": 1920,
+    "height": 1080
+  },
+  "roundTripErrorPx": {
+    "mean": 0.00037789238431378414,
+    "max": 0.0006058112857942599
+  }
+}
