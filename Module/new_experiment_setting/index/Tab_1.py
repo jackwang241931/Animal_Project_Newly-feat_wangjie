@@ -881,13 +881,13 @@ class Tab_1(ThemedWindow, metaclass=SafeSingletonMeta):
 
     @staticmethod
     def normalize_startup_calibration_mode(mode):
-        if mode in {"none", "air", "air_co2", "full"}:
+        if mode in {"none", "air", "air_co2", "zero", "span", "full"}:
             return mode
         return "none"
 
     def get_startup_calibration_mode(self):
         mode = global_setting.get_setting("startup_calibration_mode", None)
-        if mode not in {"none", "air", "air_co2", "full"}:
+        if mode not in {"none", "air", "air_co2", "zero", "span", "full"}:
             mode = "none"
         return mode
 

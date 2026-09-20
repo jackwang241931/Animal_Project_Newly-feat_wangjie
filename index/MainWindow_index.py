@@ -2549,7 +2549,7 @@ class MainWindow_Index(ThemedWindow):
         mode = global_setting.get_setting("startup_calibration_mode", None)
         if mode == "air_co2":
             mode = "air"
-        if mode not in {"none", "air", "full"}:
+        if mode not in {"none", "air", "zero", "span", "full"}:
             mode = "none"
         if global_setting.get_setting("environment_module_only", False):
             mode = "none"
@@ -2571,7 +2571,7 @@ class MainWindow_Index(ThemedWindow):
         mode = global_setting.get_setting("startup_calibration_mode", "none")
         if mode == "air_co2":
             mode = "air"
-        if mode not in {"none", "air", "full"}:
+        if mode not in {"none", "air", "zero", "span", "full"}:
             mode = "none"
         if global_setting.get_setting("environment_module_only", False):
             mode = "none"
@@ -2754,7 +2754,7 @@ class MainWindow_Index(ThemedWindow):
             startup_calibration_mode = "none"
         if startup_calibration_mode == "air_co2":
             startup_calibration_mode = "air"
-        if startup_calibration_mode not in {"none", "air", "full"}:
+        if startup_calibration_mode not in {"none", "air", "zero", "span", "full"}:
             startup_calibration_mode = "none"
 
         calibration_config = global_setting.get_setting('UFC_UGC_ZOS_config', {}).get('Calibration', {})
@@ -2770,6 +2770,14 @@ class MainWindow_Index(ThemedWindow):
             if self.start_dialog is not None:
                 self.start_dialog.countdown_seconds = start_wait_times
                 self.start_dialog.current_seconds = start_wait_times
+        elif startup_calibration_mode in {"zero", "span"}:
+            try:
+                calibration_timeout = max(float(calibration_config.get('calibration_max_timeout', 300)), 0)
+            except (TypeError, ValueError):
+                calibration_timeout = 300
+            start_wait_times += calibration_timeout
+            self.start_dialog.countdown_seconds = start_wait_times
+            self.start_dialog.current_seconds = start_wait_times
         elif startup_calibration_mode == "full":
             try:
                 # Zero and span each have their own bounded calibration window.
@@ -2780,7 +2788,7 @@ class MainWindow_Index(ThemedWindow):
             self.start_dialog.countdown_seconds = start_wait_times
             self.start_dialog.current_seconds = start_wait_times
 
-        if startup_calibration_mode in {"air", "full"}:
+        if startup_calibration_mode in {"air", "zero", "span", "full"}:
             self.init__calibration_windows()
             self.start_dialog.insert_calibration_dialog(self.calibration_details_windows)
 
@@ -2854,7 +2862,7 @@ class MainWindow_Index(ThemedWindow):
         self.calibration_detail_zero_end_time = None
         self.calibration_detail_span_start_time = None
         self.calibration_detail_span_end_time = None
-        self._experiment_calibration_mode = mode if mode in {"air", "full"} else "none"
+        self._experiment_calibration_mode = mode if mode in {"air", "zero", "span", "full"} else "none"
 
     def _is_uncalibrated_stop_housekeeping(self, message):
         """Return True for legacy zero/span shutdown chatter on a direct run."""
@@ -3720,7 +3728,7 @@ class MainWindow_Index(ThemedWindow):
 # 监听是否自动校准气路模块的框选
     def calibration_gas_state_change(self, state=None):
         current_mode = global_setting.get_setting("startup_calibration_mode", None)
-        if current_mode not in {"none", "air", "full"}:
+        if current_mode not in {"none", "air", "zero", "span", "full"}:
             current_mode = "full" if global_setting.get_setting("is_auto_calibration", False) else "none"
 
         msg_box = QMessageBox(self)
@@ -3782,7 +3790,7 @@ def _patched_calibration_gas_state_change(self, state=None):
     current_mode = global_setting.get_setting("startup_calibration_mode", None)
     if current_mode == "air_co2":
         current_mode = "air"
-    if current_mode not in {"none", "air", "full"}:
+    if current_mode not in {"none", "air", "zero", "span", "full"}:
         current_mode = "full" if global_setting.get_setting("is_auto_calibration", False) else "none"
 
     msg_box = QMessageBox(self)
@@ -3842,7 +3850,7 @@ def _patched_calibration_gas_state_change_v2(self, state=None):
     current_mode = global_setting.get_setting("startup_calibration_mode", None)
     if current_mode == "air_co2":
         current_mode = "air"
-    if current_mode not in {"none", "air", "full"}:
+    if current_mode not in {"none", "air", "zero", "span", "full"}:
         current_mode = "full" if global_setting.get_setting("is_auto_calibration", False) else "none"
 
     msg_box = QMessageBox(self)

@@ -345,6 +345,25 @@ class UFC_UGC_ZOS_index(MyQThread):
 
         return p
 
+    def start_btn_handle_with_single_calibration(self, calibration):
+        """执行选定的单项校准后，再按正常流程启动气路。"""
+        global stop_flag
+        stop_flag = False
+        calibration_handler = (
+            self.zero_carlibration_obj_calibrate_wrapped
+            if calibration == "zero"
+            else self.span_carlibration_obj_calibrate_wrapped
+        )
+        return AsyPromise(calibration_handler).then(
+            lambda _: AsyPromise(self.ZOS_gas_path_system_obj.start).then(
+                lambda _: AsyPromise(self.UFC_gas_path_system_obj.start).then(
+                    lambda _: AsyPromise(self.UGC_gas_path_system_obj.start).then(
+                        lambda _: AsyPromise(self.finish_start)
+                    ).catch(lambda e: logger.error(f"{e}"))
+                ).catch(lambda e: logger.error(f"{e}"))
+            ).catch(lambda e: logger.error(f"{e}"))
+        ).catch(lambda e: logger.error(f"{e}"))
+
     def start_btn_handle_with_air_calibration(self):
         """启动气路，并在进入正常实验前执行 Air 空气校准。"""
         global stop_flag
@@ -711,7 +730,7 @@ class UFC_UGC_ZOS_index(MyQThread):
         logger.critical(f"{self.name}<UNK>is_auto_calibration：{is_auto_calibration}")
         if startup_calibration_mode == "air_co2":
             startup_calibration_mode = "air"
-        if startup_calibration_mode not in {"none", "air", "full"}:
+        if startup_calibration_mode not in {"none", "air", "zero", "span", "full"}:
             # Only an explicitly selected startup mode may enter calibration.
             startup_calibration_mode = "none"
         global_setting.set_setting("startup_calibration_mode", startup_calibration_mode)
@@ -723,6 +742,18 @@ class UFC_UGC_ZOS_index(MyQThread):
                     lambda __: self.gas_state_check_handle().then(
                         self.stop()
                     ).catch(lambda e: logger.error(f"{e}"))
+                ).catch(lambda e: logger.error(f"{e}"))
+            ).catch(lambda e: logger.error(f"{e}"))
+        elif startup_calibration_mode == "zero":
+            self.start_btn_handle_with_single_calibration("zero").then(
+                lambda _: self.run_btn_handle().then(
+                    lambda _: self.gas_state_check_handle().then(self.stop)
+                ).catch(lambda e: logger.error(f"{e}"))
+            ).catch(lambda e: logger.error(f"{e}"))
+        elif startup_calibration_mode == "span":
+            self.start_btn_handle_with_single_calibration("span").then(
+                lambda _: self.run_btn_handle().then(
+                    lambda _: self.gas_state_check_handle().then(self.stop)
                 ).catch(lambda e: logger.error(f"{e}"))
             ).catch(lambda e: logger.error(f"{e}"))
         elif startup_calibration_mode == "air":

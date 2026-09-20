@@ -828,6 +828,11 @@ class ExperimentControlPage(_BaseWorkflowPage):
         return True
 
     def _start_calibration(self, key: str) -> None:
+        # Before the experiment starts, these buttons select the startup workflow.
+        # The backend performs the selected calibration in the normal start chain.
+        if self._last_run_status not in {"running", "monitoring"}:
+            self._select_startup_calibration(key)
+            return
         if not self._calibration_ready():
             return
         details_type, command, label, channels = {
@@ -835,6 +840,10 @@ class ExperimentControlPage(_BaseWorkflowPage):
             "span": ("span_calibration", "start_span_calibration", "校量程", {"span"}),
             "all": ("all_calibration", "start_calibration", "校零且量程", {"zero", "span"}),
         }[key]
+        if self._active_calibrations:
+            active_labels = "、".join("校零" if channel == "zero" else "校量程" for channel in sorted(self._active_calibrations))
+            self.operation_hint.setText(f"{active_labels}正在进行，请等待完成后再操作。")
+            return
         if not self._open_calibration_details(details_type):
             return
         if not self._send_monitor_command(command):
@@ -847,6 +856,37 @@ class ExperimentControlPage(_BaseWorkflowPage):
         self.set_operation_progress(0, f"{label}请求已发送")
         self.operation_hint.setText(f"{label}已发送到气路服务，等待实际校准事件。")
 
+    def _select_startup_calibration(self, key: str):
+        if self._last_run_status in {"starting", "running", "monitoring", "stopping"} or getattr(self, "_last_can_stop", False):
+            self.operation_hint.setText("校准方式仅支持在开始实验前选择。")
+            return
+        if global_setting.get_setting("environment_module_only", False):
+            self.operation_hint.setText("仅环境模块模式不运行气路，无法选择气体校准。")
+            return
+        if not global_setting.get_setting("air_modules_all_valid", False):
+            self.operation_hint.setText("请先确认串口并完成检测，UFC、UGC、ZOS 全部通过后才能选择校准方式。")
+            return
+        mode, label = {
+            "zero": ("zero", "校零"),
+            "span": ("span", "校量程"),
+            "all": ("full", "校零且量程"),
+        }[key]
+        current_mode = global_setting.get_setting("startup_calibration_mode", "none")
+        if current_mode == mode:
+            self.calibration_status.setText(f"已选择{label}")
+            self.operation_hint.setText(f"已选择{label}，请点击“开始实验”进行校准。")
+            return
+        global_setting.set_setting("startup_calibration_mode", mode)
+        global_setting.set_setting("is_auto_calibration", True)
+        global_setting.set_setting("device_config_calibration_selected", True)
+        selection_signal = getattr(self.main_window, "calibration_selection_changed_signal", None)
+        if selection_signal is not None:
+            selection_signal.emit(True, mode)
+        self.calibration_status.setText(f"已选择{label}")
+        self.operation_hint.setText(f"已选择{label}，请点击“开始实验”进行校准。")
+        self._update_calibration_buttons()
+        QMessageBox.information(self, "选择校准方式", f"已选择{label}，请点击“开始实验”进行校准。")
+
     def _stop_calibration(self, key: str) -> None:
         if not self._active_calibrations or not self._calibration_ready(for_stop=True):
             return
@@ -855,6 +895,9 @@ class ExperimentControlPage(_BaseWorkflowPage):
             "stop_span": ("stop_span_calibration", "停止校量程", {"span"}),
             "stop_all": ("stop_calibration", "停止校零且量程", {"zero", "span"}),
         }[key]
+        if channels & self._stopping_calibrations:
+            self.operation_hint.setText(f"{label}停止请求已发送，请等待完成。")
+            return
         if not self._send_monitor_command(command):
             return
         self._stopping_calibrations.update(channels & self._active_calibrations)
@@ -866,16 +909,23 @@ class ExperimentControlPage(_BaseWorkflowPage):
         gas_enabled = not global_setting.get_setting("environment_module_only", False)
         gas_valid = bool(global_setting.get_setting("air_modules_all_valid", False))
         ready = gas_enabled and gas_valid and self._last_run_status in {"running", "monitoring"}
+        startup_ready = (
+            gas_enabled and gas_valid
+            and self._last_run_status not in {"starting", "running", "monitoring", "stopping"}
+            and not getattr(self, "_last_can_stop", False)
+        )
         can_stop = gas_enabled and (self._last_run_status in {"running", "monitoring"} or getattr(self, "_last_can_stop", False))
         active = self._active_calibrations
         stopping = self._stopping_calibrations
         for channel, title in (("zero", "校零"), ("span", "校量程")):
-            self.calibration_buttons[channel].setEnabled(ready and channel not in active)
+            self.calibration_buttons[channel].setEnabled(
+                (ready and not active) or (startup_ready and not active)
+            )
             self.calibration_buttons[channel].setText(f"正在{title}中" if channel in active else title)
             stop_button = self.calibration_buttons[f"stop_{channel}"]
             stop_button.setEnabled(can_stop and channel in active and channel not in stopping)
             stop_button.setText(f"正在停止{title}中" if channel in stopping else f"停止{title}")
-        self.calibration_buttons["all"].setEnabled(ready and not active)
+        self.calibration_buttons["all"].setEnabled((ready or startup_ready) and not active)
         self.calibration_buttons["all"].setText("正在校零且量程中" if self._combined_calibration else "校零且量程")
         self.calibration_buttons["stop_all"].setEnabled(can_stop and bool(active) and not stopping)
         self.calibration_buttons["stop_all"].setText("正在停止校零且量程中" if stopping == {"zero", "span"} else "停止校零且量程")
