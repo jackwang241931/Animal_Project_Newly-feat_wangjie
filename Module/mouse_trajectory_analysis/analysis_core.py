@@ -377,21 +377,24 @@ def _find_columns(header_map: dict[str, int], aliases: Iterable[str]) -> list[in
     return indexes
 
 
-def load_monitor_comparison_workbook(
+def load_monitor_workbook_bundle(
     path: str | Path,
     start_timestamp: float,
     interruption_requested: Callable[[], bool] | None = None,
-) -> dict[int, dict[str, ComparisonSeries]]:
-    """Load the five fixed comparison fields from the monitor Excel export.
+) -> tuple[dict[int, dict[str, ComparisonSeries]], dict[int, dict[str, object]]]:
+    """Load comparison curves and each channel's final persisted Excel row.
 
     The monitor workbook stores one sheet per channel and uses ``获取时间`` as
     the sample time.  A metric may have more than one legacy header in older
     workbooks, so the first alias containing a numeric value is used per row.
+    Returning both results from one pass keeps large historical files from
+    being scanned twice by the UI.
     """
 
     source_path = Path(path).expanduser().resolve()
     workbook = load_workbook(source_path, read_only=True, data_only=True)
     raw_series: dict[int, dict[str, list[tuple[float, float]]]] = {}
+    latest_rows: dict[int, dict[str, object]] = {}
 
     try:
         for sheet_name in workbook.sheetnames:
@@ -406,6 +409,7 @@ def load_monitor_comparison_workbook(
             header = next(iterator, None)
             if header is None:
                 continue
+            header_names = [str(value) if value is not None else "" for value in header]
             header_map = {
                 _normalize_header(value): index
                 for index, value in enumerate(header)
@@ -419,13 +423,19 @@ def load_monitor_comparison_workbook(
                 key: _find_columns(header_map, aliases)
                 for key, aliases in COMPARISON_FIELD_ALIASES.items()
             }
-            if time_index is None or not any(field_indexes.values()):
-                continue
-
-            channel_series = raw_series.setdefault(channel, {})
+            has_comparison_fields = time_index is not None and any(field_indexes.values())
+            channel_series = raw_series.setdefault(channel, {}) if has_comparison_fields else {}
             for row_number, row in enumerate(iterator, start=2):
                 if row_number % 500 == 0 and interruption_requested is not None and interruption_requested():
                     raise InterruptedError("Excel对比数据读取已取消")
+                if any(value is not None and value != "" for value in row):
+                    latest_rows[channel] = {
+                        name: _cell(row, index)
+                        for index, name in enumerate(header_names)
+                        if name
+                    }
+                if not has_comparison_fields:
+                    continue
                 timestamp = _parse_timestamp(_cell(row, time_index))
                 if timestamp is None:
                     continue
@@ -456,6 +466,20 @@ def load_monitor_comparison_workbook(
                 elapsed_seconds=values[:, 0] - float(start_timestamp),
                 values=values[:, 1],
             )
+    return comparison_series, latest_rows
+
+
+def load_monitor_comparison_workbook(
+    path: str | Path,
+    start_timestamp: float,
+    interruption_requested: Callable[[], bool] | None = None,
+) -> dict[int, dict[str, ComparisonSeries]]:
+    """Load the five fixed comparison fields from the monitor Excel export."""
+    comparison_series, _latest_rows = load_monitor_workbook_bundle(
+        path,
+        start_timestamp,
+        interruption_requested,
+    )
     return comparison_series
 
 

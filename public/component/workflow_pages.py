@@ -18,7 +18,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional
 
-from PyQt6.QtCore import QPointF, QRect, QSize, QTimer, Qt, pyqtSignal
+from PyQt6.QtCore import QPointF, QRect, QSize, QThread, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QBrush, QColor, QImage, QPainter, QPainterPath, QPen, QPixmap
 from PyQt6.QtSvg import QSvgGenerator
 from PyQt6.QtWidgets import (
@@ -65,7 +65,7 @@ from public.util.shared_video_frames import shared_video_frame_store
 from Module.mouse_trajectory.paths import EXPORT_DIR as TRAJECTORY_EXPORT_DIR
 from Module.mouse_trajectory_analysis.analysis_core import (
     find_matching_trajectory_export,
-    load_monitor_comparison_workbook,
+    load_monitor_workbook_bundle,
     load_trajectory_experiment,
     parse_experiment_time,
     scan_experiment_files,
@@ -162,6 +162,44 @@ def _table_matches_channel(table_name: Any, channel: int) -> bool:
 def _health_items(provider: Any) -> list[Mapping[str, Any]]:
     health = _provider_value(provider)
     return [item for item in (health.get("components") or []) if isinstance(item, Mapping)]
+
+
+class _HistoricalWorkbookLoader(QThread):
+    """Read a potentially large historical monitor workbook off the UI thread."""
+
+    loaded = pyqtSignal(int, object, float, object, object)
+    failed = pyqtSignal(int, object, str)
+
+    def __init__(self, generation: int, cache_key: tuple[Any, ...], path: str):
+        super().__init__()
+        self.generation = int(generation)
+        self.cache_key = cache_key
+        self.path = str(path)
+
+    def run(self) -> None:  # pragma: no cover - exercised through Qt signals
+        try:
+            source = Path(self.path)
+            stat = source.stat()
+            started = parse_experiment_time(source) or datetime.fromtimestamp(stat.st_mtime)
+            comparison, latest_rows = load_monitor_workbook_bundle(
+                source,
+                started.timestamp(),
+                self.isInterruptionRequested,
+            )
+        except InterruptedError:
+            return
+        except Exception as error:
+            if not self.isInterruptionRequested():
+                self.failed.emit(self.generation, self.cache_key, str(error))
+            return
+        if not self.isInterruptionRequested():
+            self.loaded.emit(
+                self.generation,
+                self.cache_key,
+                started.timestamp(),
+                comparison,
+                latest_rows,
+            )
 
 
 class _BaseWorkflowPage(QWidget):
@@ -2800,6 +2838,10 @@ class DataAnalysisPage(_BaseWorkflowPage):
         self._legacy_trajectory_cache: Any = None
         self._legacy_comparison_cache_key: Optional[tuple[Any, ...]] = None
         self._legacy_comparison_cache: dict[int, Any] = {}
+        self._historical_latest_rows: dict[int, dict[str, Any]] = {}
+        self._historical_start_timestamp = 0.0
+        self._historical_load_generation = 0
+        self._historical_workers: set[_HistoricalWorkbookLoader] = set()
         self._left_channels: set[int] = {1}; self._right_channels: set[int] = {1}
         self._compare_left_series: list[tuple[str, float]] = []
         self._compare_right_series: list[tuple[str, float]] = []
@@ -2810,6 +2852,13 @@ class DataAnalysisPage(_BaseWorkflowPage):
         self.refresh_experiment_times()
         self.refresh_trajectory_experiments()
         self.start_refresh()
+
+    def stop_refresh(self) -> None:
+        super().stop_refresh()
+        self._cancel_historical_workbook_loads()
+        for worker in tuple(self._historical_workers):
+            if worker.isRunning():
+                worker.wait(3000)
 
     def _build_ui(self) -> None:
         _scroll, layout = self._canvas()
@@ -2822,6 +2871,11 @@ class DataAnalysisPage(_BaseWorkflowPage):
         experiment_row.addWidget(self.experiment_time_combo, 1)
         self.refresh_experiment_times_button = QPushButton("刷新")
         self.refresh_experiment_times_button.clicked.connect(self.refresh_experiment_times)
+        self.analysis_loading_label = QLabel("加载中…")
+        self.analysis_loading_label.setProperty("chip", True)
+        self.analysis_loading_label.setProperty("tone", "info")
+        self.analysis_loading_label.setVisible(False)
+        experiment_row.addWidget(self.analysis_loading_label)
         experiment_row.addWidget(self.refresh_experiment_times_button)
         layout.addLayout(experiment_row)
         self._header(layout, "DATA ANALYSIS", "数据分析 · 高级统计", "历史实验优先读取导出 Excel；二维轨迹读取对应的 Excel / 逐笼 CSV，三维与红外读取真实数据库记录。")
@@ -3178,6 +3232,80 @@ class DataAnalysisPage(_BaseWorkflowPage):
             # an unrelated historical workbook.
             self.refresh()
 
+    @staticmethod
+    def _workbook_cache_key(path: str) -> tuple[Any, ...]:
+        source = Path(path)
+        stat = source.stat()
+        return (str(source.resolve()), stat.st_size, stat.st_mtime_ns)
+
+    def _set_historical_loading(self, loading: bool, text: str = "加载中…", tone: str = "info") -> None:
+        self._set_chip(self.analysis_loading_label, text, tone)
+        self.analysis_loading_label.setVisible(bool(loading))
+
+    def _cancel_historical_workbook_loads(self) -> None:
+        self._historical_load_generation += 1
+        for worker in tuple(self._historical_workers):
+            if worker.isRunning():
+                worker.requestInterruption()
+
+    def _start_historical_workbook_load(self, path: str) -> None:
+        try:
+            cache_key = self._workbook_cache_key(path)
+        except OSError as error:
+            self._set_historical_loading(True, f"加载失败：{error}", "fault")
+            return
+        if cache_key == self._legacy_comparison_cache_key:
+            self._set_historical_loading(False)
+            return
+        if any(worker.isRunning() and worker.cache_key == cache_key for worker in self._historical_workers):
+            self._set_historical_loading(True)
+            return
+
+        self._cancel_historical_workbook_loads()
+        generation = self._historical_load_generation
+        worker = _HistoricalWorkbookLoader(generation, cache_key, path)
+        self._historical_workers.add(worker)
+        worker.loaded.connect(self._historical_workbook_loaded)
+        worker.failed.connect(self._historical_workbook_failed)
+        worker.finished.connect(lambda current=worker: self._historical_worker_finished(current))
+        self._set_historical_loading(True)
+        worker.start()
+
+    def _historical_worker_finished(self, worker: _HistoricalWorkbookLoader) -> None:
+        self._historical_workers.discard(worker)
+        worker.deleteLater()
+
+    def _historical_workbook_loaded(
+        self,
+        generation: int,
+        cache_key: tuple[Any, ...],
+        start_timestamp: float,
+        comparison: Mapping[int, Any],
+        latest_rows: Mapping[int, Mapping[str, Any]],
+    ) -> None:
+        if generation != self._historical_load_generation:
+            return
+        try:
+            current_key = self._workbook_cache_key(self._selected_experiment_excel_path or "")
+        except OSError:
+            return
+        if cache_key != current_key:
+            return
+        self._legacy_comparison_cache_key = cache_key
+        self._legacy_comparison_cache = dict(comparison)
+        self._historical_latest_rows = {
+            int(channel): dict(values) for channel, values in latest_rows.items()
+        }
+        self._historical_start_timestamp = float(start_timestamp)
+        self._set_historical_loading(False)
+        self.refresh()
+
+    def _historical_workbook_failed(self, generation: int, _cache_key: tuple[Any, ...], error: str) -> None:
+        if generation != self._historical_load_generation:
+            return
+        logger.warning(f"读取实验 Excel 失败：{error}")
+        self._set_historical_loading(True, "加载失败", "fault")
+
     def _experiment_time_changed(self, _index: int) -> None:
         selected = str(self.experiment_time_combo.currentData() or "")
         self._selected_experiment_selection_path = selected or None
@@ -3194,6 +3322,15 @@ class DataAnalysisPage(_BaseWorkflowPage):
             self._selected_experiment_db_path = self._matching_monitor_db(selected) or ""
         else:
             self._selected_experiment_db_path = selected if selected.lower().endswith(".db") else ""
+        self._legacy_comparison_cache_key = None
+        self._legacy_comparison_cache = {}
+        self._historical_latest_rows = {}
+        self._historical_start_timestamp = 0.0
+        if self._selected_experiment_excel_path:
+            self._start_historical_workbook_load(self._selected_experiment_excel_path)
+        else:
+            self._cancel_historical_workbook_loads()
+            self._set_historical_loading(False)
         self.refresh()
 
     def _enhance_bio_card(self) -> None:
@@ -3494,16 +3631,12 @@ class DataAnalysisPage(_BaseWorkflowPage):
         if not workbook_path:
             return 0.0, {}
         try:
-            workbook = Path(workbook_path)
-            stat = workbook.stat()
-            key = (str(workbook), stat.st_size, stat.st_mtime_ns)
+            key = self._workbook_cache_key(workbook_path)
             if key != self._legacy_comparison_cache_key:
-                started = parse_experiment_time(workbook) or datetime.fromtimestamp(stat.st_mtime)
-                self._legacy_comparison_cache = load_monitor_comparison_workbook(workbook, started.timestamp())
-                self._legacy_comparison_cache_key = key
-            started = parse_experiment_time(workbook) or datetime.fromtimestamp(stat.st_mtime)
-            return started.timestamp(), self._legacy_comparison_cache
-        except (OSError, ValueError) as error:
+                self._start_historical_workbook_load(workbook_path)
+                return 0.0, {}
+            return self._historical_start_timestamp, self._legacy_comparison_cache
+        except OSError as error:
             logger.warning(f"读取实验 Excel 失败：{error}")
             return 0.0, {}
 
@@ -3727,6 +3860,8 @@ class DataAnalysisPage(_BaseWorkflowPage):
 
     def _latest_channel_measurements(self) -> dict[str, Any]:
         """Return exactly the selected cage's last persisted Epoch row."""
+        if self._selected_experiment_excel_path:
+            return dict(self._historical_latest_rows.get(self.selected_channel, {}))
         measurements: dict[str, Any] = {}
         context = _provider_value(self._context_provider)
         db_path = context.get("experiment_db_path")
