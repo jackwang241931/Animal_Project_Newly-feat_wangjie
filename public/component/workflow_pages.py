@@ -53,7 +53,6 @@ from public.component.system_status.system_status_page import (
 from public.entity.queue.ObjectQueueItem import ObjectQueueItem
 from public.dao.SQLite.Monitor_Datas_Handle import Monitor_Datas_Handle
 from public.function.Modbus.Modbus_Type import Others_Tables
-from public.function.Monitor_data_storage.metabolism import METABOLISM_COLUMNS, calculate_epoch_metabolism
 from public.function.weight.weight_postprocessor import (
     EPOCH_WEIGHT_COLUMN_KEY,
     fit_epoch_weight_rows,
@@ -1091,7 +1090,7 @@ class DataViewPage(_BaseWorkflowPage):
 
     def _build_ui(self) -> None:
         _scroll, layout = self._canvas()
-        self._header(layout, "LOCAL DATA", "本地实验数据监控", "自动读取当前实验 SQLite 轮次汇总表；没有真实记录时保持空白。")
+        self._header(layout, "LOCAL DATA", "本地实验数据监控", "自动读取当前实验 SQLite 监测记录；没有真实记录时保持空白。")
         filter_card = QFrame(); filter_card.setProperty("card", True)
         filter_box = QHBoxLayout(filter_card); filter_box.setContentsMargins(12, 10, 12, 10)
         filter_box.addWidget(QLabel("通道"))
@@ -1282,27 +1281,19 @@ class DataViewPage(_BaseWorkflowPage):
                 records.append((str(cage_number), record))
         if not records:
             return [], []
-        for column, description in METABOLISM_COLUMNS:
-            descriptions[column] = description
-            if column not in column_names:
-                column_names.append(column)
         if len(tables) > 1:
             records.sort(key=lambda item: str(item[1].get("time") or ""), reverse=True)
             records = records[:200]
-        headers = ["通道", *(descriptions.get(column, column) for column in column_names)]
+        headers = [descriptions.get(column, column) for column in column_names]
         rows = []
-        for cage_number, record in records:
-            derived = calculate_epoch_metabolism(record)
-            for column, _description in METABOLISM_COLUMNS:
-                if record.get(column) is None:
-                    record[column] = derived[column]
+        for _cage_number, record in records:
             values = (
                 DataViewPage._cage_display_name(record.get(column))
                 if column == "mouse_cage_number"
                 else record.get(column)
                 for column in column_names
             )
-            rows.append((DataViewPage._cage_display_name(cage_number), *values))
+            rows.append(tuple(values))
         return headers, rows
 
     @staticmethod
@@ -1332,25 +1323,16 @@ class DataViewPage(_BaseWorkflowPage):
                     key = weight_row_key(record, fallback_cage=gid if gid != -1 else None)
                     if key in fitted:
                         record[EPOCH_WEIGHT_COLUMN_KEY] = fitted[key]
-            for column, title in METABOLISM_COLUMNS:
-                if column not in columns:
-                    columns.append(column)
-                    titles.append(title)
             rows = []
             for record in records:
-                derived = calculate_epoch_metabolism(record)
-                for column, _title in METABOLISM_COLUMNS:
-                    if record.get(column) is None:
-                        record[column] = derived[column]
-                cage = record.get("mouse_cage_number") if gid == -1 else gid
                 values = (
                     DataViewPage._cage_display_name(record.get(column))
                     if column == "mouse_cage_number"
                     else record.get(column)
                     for column in columns
                 )
-                rows.append((DataViewPage._cage_display_name(cage), *values))
-            return ["通道", *titles], rows
+                rows.append(tuple(values))
+            return titles, rows
         finally:
             handle.stop()
 
@@ -1385,13 +1367,16 @@ class DataViewPage(_BaseWorkflowPage):
                 for r, row in enumerate(rows):
                     highlight_error = self._row_has_remark_error(headers, row)
                     for c, value in enumerate(row):
-                        item = QTableWidgetItem(_text(value, "None"))
+                        header = str(headers[c] if c < len(headers) else "").strip().lower()
+                        is_remarks = header in {"remarks", "备注"} or "备注" in header
+                        display_value = "" if is_remarks and value is None else _text(value, "None")
+                        item = QTableWidgetItem(display_value)
                         if highlight_error:
                             item.setForeground(QBrush(QColor(255, 0, 0)))
                         self.table.setItem(r, c, item)
                 self.table.resizeColumnsToContents(); self.table.setSortingEnabled(True)
                 selected_label = "全部" if selected in (None, -1) else f"CH{int(selected):02d}"
-                self.status_label.setText(f"当前筛选：{selected_label}；读取 {len(rows)} 条轮次汇总记录，数据源：{db_path}")
+                self.status_label.setText(f"当前筛选：{selected_label}；读取 {len(rows)} 条监测记录，数据源：{db_path}")
         except (OSError, sqlite3.Error) as error:
             self.status_label.setText(f"数据库读取失败：{error}")
         self.refreshed.emit()
