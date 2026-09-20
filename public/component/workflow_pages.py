@@ -46,7 +46,6 @@ from loguru import logger
 from public.config_class.global_setting import global_setting
 from public.component.system_status.system_status_page import (
     calculate_ee,
-    calculate_rer,
     derive_channel_status_issues,
     format_duration,
     health_summary_text,
@@ -1959,17 +1958,33 @@ class TrajectoryComparisonPlot(QWidget):
 
 
 class DualAxisChart(QWidget):
-    """Draw multiple real channel series on two contrasting axes."""
+    """Draw persisted comparison data as a readable dual-axis chart."""
 
-    _LEFT_COLORS = ("#1f78c8", "#2f8fd8", "#4aa4e0", "#5b7fc4", "#2460a9", "#74b8e5", "#3b73b7", "#8cc7ed")
-    _RIGHT_COLORS = ("#e8751a", "#f29e2e", "#d94a24", "#c23b50", "#ef6c44", "#c76f14", "#f4b544", "#a82f2f")
+    _LEFT_COLORS = ("#1769aa", "#268bd2", "#4aa8df", "#0f4c81", "#68b7e3", "#3478b7", "#78c1ea", "#245d8f")
+    _RIGHT_COLORS = ("#c7530c", "#e88318", "#f2a340", "#9f3f05", "#f5b461", "#d96813", "#ffc778", "#b94b0a")
+    _GRID_COLOR = QColor("#e5eef6")
+    _LEFT_AXIS_COLOR = QColor("#2f86ca")
+    _RIGHT_AXIS_COLOR = QColor("#df7418")
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.left: list[float] = []; self.right: list[float] = []
         self.left_series: list[tuple[str, list[float]]] = []
         self.right_series: list[tuple[str, list[float]]] = []
-        self.setMinimumHeight(220)
+        self._left_points: list[tuple[str, list[tuple[float, float]]]] = []
+        self._right_points: list[tuple[str, list[tuple[float, float]]]] = []
+        self._left_axis_label = "左轴"
+        self._right_axis_label = "右轴"
+        self._uses_elapsed_time = False
+        self.setMinimumHeight(360)
+
+    def sizeHint(self) -> QSize:
+        return QSize(1200, 420)
+
+    def set_axis_labels(self, left: str, right: str) -> None:
+        self._left_axis_label = str(left or "左轴")
+        self._right_axis_label = str(right or "右轴")
+        self.update()
 
     def set_series(self, left: Iterable[float], right: Iterable[float]) -> None:
         """Backward-compatible setter for one series on each axis."""
@@ -1993,47 +2008,219 @@ class DualAxisChart(QWidget):
         self.right_series = [(str(label), self._clean_series(values)) for label, values in right]
         self.left = [value for _label, values in self.left_series for value in values]
         self.right = [value for _label, values in self.right_series for value in values]
+        self._left_points = [(label, [(float(index), value) for index, value in enumerate(values)]) for label, values in self.left_series]
+        self._right_points = [(label, [(float(index), value) for index, value in enumerate(values)]) for label, values in self.right_series]
+        self._uses_elapsed_time = False
         self.update()
 
+    @staticmethod
+    def _time_number(value: Any) -> Optional[float]:
+        numeric = _number(value)
+        if numeric is not None:
+            numeric = float(numeric)
+            return numeric / 1000.0 if abs(numeric) > 100_000_000_000 else numeric
+        text = str(value or "").strip()
+        if not text:
+            return None
+        candidates = (text, text.replace("Z", "+00:00"), text.replace("_", "-"))
+        for candidate in candidates:
+            try:
+                return datetime.fromisoformat(candidate).timestamp()
+            except ValueError:
+                continue
+        for pattern in ("%Y-%m-%d-%H-%M-%S-%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d-%H-%M-%S"):
+            try:
+                return datetime.strptime(text.replace("_", "-"), pattern).timestamp()
+            except ValueError:
+                continue
+        return None
+
+    @classmethod
+    def _clean_timed_series(cls, values: Iterable[tuple[Any, Any]]) -> tuple[list[float], list[tuple[float, float]], bool]:
+        numeric_values: list[float] = []
+        timed_values: list[tuple[float, float]] = []
+        has_clock_time = False
+        for index, item in enumerate(values):
+            try:
+                raw_time, raw_value = item
+            except (TypeError, ValueError):
+                continue
+            numeric = _number(raw_value)
+            if numeric is None:
+                continue
+            timestamp = cls._time_number(raw_time)
+            if timestamp is None:
+                timestamp = float(index)
+            elif abs(timestamp) > 100_000_000:
+                has_clock_time = True
+            numeric_values.append(float(numeric))
+            timed_values.append((float(timestamp), float(numeric)))
+        timed_values.sort(key=lambda point: point[0])
+        return numeric_values, timed_values, has_clock_time
+
+    def set_timed_channel_series(
+        self,
+        left: Iterable[tuple[str, Iterable[tuple[Any, Any]]]],
+        right: Iterable[tuple[str, Iterable[tuple[Any, Any]]]],
+    ) -> None:
+        left_cleaned = [(str(label), *self._clean_timed_series(values)) for label, values in left]
+        right_cleaned = [(str(label), *self._clean_timed_series(values)) for label, values in right]
+        self.left_series = [(label, numeric) for label, numeric, _points, _clock in left_cleaned]
+        self.right_series = [(label, numeric) for label, numeric, _points, _clock in right_cleaned]
+        self._left_points = [(label, points) for label, _numeric, points, _clock in left_cleaned]
+        self._right_points = [(label, points) for label, _numeric, points, _clock in right_cleaned]
+        self.left = [value for _label, values in self.left_series for value in values]
+        self.right = [value for _label, values in self.right_series for value in values]
+        self._uses_elapsed_time = any(clock for *_rest, clock in left_cleaned + right_cleaned)
+        self.update()
+
+    @staticmethod
+    def _axis_bounds(values: list[float]) -> tuple[float, float, float]:
+        if not values:
+            return 0.0, 1.0, 0.2
+        low, high = min(values), max(values)
+        if math.isclose(low, high):
+            padding = max(abs(low) * 0.02, 0.5)
+            low -= padding
+            high += padding
+        raw_step = max((high - low) / 5.0, 1e-12)
+        magnitude = 10 ** math.floor(math.log10(raw_step))
+        scaled = raw_step / magnitude
+        nice = 1.0 if scaled <= 1 else 2.0 if scaled <= 2 else 2.5 if scaled <= 2.5 else 5.0 if scaled <= 5 else 10.0
+        step = nice * magnitude
+        return math.floor(low / step) * step, math.ceil(high / step) * step, step
+
+    @staticmethod
+    def _tick_text(value: float, step: float) -> str:
+        if abs(value) >= 10000:
+            return f"{value:.1e}"
+        decimals = max(0, min(5, -math.floor(math.log10(abs(step))) if 0 < abs(step) < 1 else 0))
+        return f"{value:.{decimals}f}"
+
+    @staticmethod
+    def _metric_short_name(label: str) -> str:
+        text = re.sub(r"（[^）]*）|\([^)]*\)", "", str(label)).strip()
+        return text or str(label)
+
+    @staticmethod
+    def _decimate(points: list[tuple[float, float]], limit: int) -> list[tuple[float, float]]:
+        if len(points) <= limit:
+            return points
+        stride = max(1, math.ceil(len(points) / limit))
+        sampled = points[::stride]
+        if sampled[-1] != points[-1]:
+            sampled.append(points[-1])
+        return sampled
+
+    def _legend_items(self) -> list[tuple[str, str]]:
+        left_metric = self._metric_short_name(self._left_axis_label)
+        right_metric = self._metric_short_name(self._right_axis_label)
+        items = [(f"{label} · {left_metric}", self._LEFT_COLORS[index % len(self._LEFT_COLORS)]) for index, (label, values) in enumerate(self.left_series) if values]
+        items.extend((f"{label} · {right_metric}", self._RIGHT_COLORS[index % len(self._RIGHT_COLORS)]) for index, (label, values) in enumerate(self.right_series) if values)
+        return items
+
     def paintEvent(self, event) -> None:
-        painter = QPainter(self); painter.fillRect(self.rect(), QColor("#fbfdff"))
-        rect = self.rect().adjusted(42, 32, 42, 34)
-        painter.setPen(QPen(QColor("#d8e7f3"), 1)); painter.drawRect(rect)
-        if not self.left and not self.right:
-            painter.setPen(QColor("#7191b2")); painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, "请选择左右轴采集模块并勾选通道")
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.fillRect(self.rect(), QColor("#ffffff"))
+        legend_items = self._legend_items()
+        metrics = painter.fontMetrics()
+        usable_legend_width = max(200, self.width() - 96)
+        legend_rows = 1
+        row_width = 0
+        for label, _color in legend_items:
+            item_width = metrics.horizontalAdvance(label) + 42
+            if row_width and row_width + item_width > usable_legend_width:
+                legend_rows += 1
+                row_width = 0
+            row_width += item_width
+        bottom_margin = 48 + (legend_rows * 24 if legend_items else 0)
+        rect = self.rect().adjusted(72, 38, -72, -bottom_margin)
+        if rect.width() < 40 or rect.height() < 40:
             painter.end()
             return
-        max_len = max([len(values) for _label, values in self.left_series + self.right_series] + [2])
-        left_max = max([max(values) for _label, values in self.left_series if values] + [1.0])
-        right_max = max([max(values) for _label, values in self.right_series if values] + [1.0])
-        for series, colors, maximum in (
-            (self.left_series, self._LEFT_COLORS, left_max),
-            (self.right_series, self._RIGHT_COLORS, right_max),
+        painter.setPen(QPen(QColor("#d6e4ef"), 1))
+        painter.setBrush(QColor("#fbfdff"))
+        painter.drawRoundedRect(rect, 9, 9)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        if not self.left and not self.right:
+            painter.setPen(QColor("#7191b2"))
+            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, "请选择左右轴采集模块并勾选通道")
+            painter.end()
+            return
+
+        left_low, left_high, left_step = self._axis_bounds(self.left)
+        right_low, right_high, right_step = self._axis_bounds(self.right)
+        horizontal_ticks = 5
+        for tick in range(horizontal_ticks + 1):
+            ratio = tick / horizontal_ticks
+            y = rect.bottom() - ratio * rect.height()
+            painter.setPen(QPen(self._GRID_COLOR, 1))
+            painter.drawLine(QPointF(rect.left(), y), QPointF(rect.right(), y))
+            left_value = left_low + ratio * (left_high - left_low)
+            right_value = right_low + ratio * (right_high - right_low)
+            painter.setPen(self._LEFT_AXIS_COLOR)
+            painter.drawText(QRect(rect.left() - 65, int(y - 9), 56, 18), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, self._tick_text(left_value, left_step))
+            painter.setPen(self._RIGHT_AXIS_COLOR)
+            painter.drawText(QRect(rect.right() + 9, int(y - 9), 56, 18), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, self._tick_text(right_value, right_step))
+
+        all_points = [point for _label, values in self._left_points + self._right_points for point in values]
+        x_values = [point[0] for point in all_points]
+        x_low, x_high = (min(x_values), max(x_values)) if x_values else (0.0, 1.0)
+        if math.isclose(x_low, x_high):
+            x_high = x_low + 1.0
+        x_ticks = 6
+        for tick in range(x_ticks + 1):
+            ratio = tick / x_ticks
+            x = rect.left() + ratio * rect.width()
+            painter.setPen(QPen(self._GRID_COLOR, 1))
+            painter.drawLine(QPointF(x, rect.top()), QPointF(x, rect.bottom()))
+            if self._uses_elapsed_time:
+                elapsed = (x_low + ratio * (x_high - x_low)) - x_low
+                label = f"{elapsed / 3600:.1f}h" if elapsed >= 7200 else f"{elapsed / 60:.0f}′"
+            else:
+                label = str(int(round(x_low + ratio * (x_high - x_low))))
+            painter.setPen(QColor("#7892aa"))
+            painter.drawText(QRect(int(x - 30), rect.bottom() + 7, 60, 18), Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop, label)
+
+        painter.setPen(self._LEFT_AXIS_COLOR)
+        painter.drawText(QRect(rect.left() - 52, 8, rect.width() // 2, 24), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, f"左 · {self._left_axis_label}")
+        painter.setPen(self._RIGHT_AXIS_COLOR)
+        painter.drawText(QRect(rect.center().x(), 8, rect.width() // 2 + 52, 24), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, f"右 · {self._right_axis_label}")
+
+        for series, colors, axis_low, axis_high in (
+            (self._left_points, self._LEFT_COLORS, left_low, left_high),
+            (self._right_points, self._RIGHT_COLORS, right_low, right_high),
         ):
-            for series_index, (_label, values) in enumerate(series):
-                if not values:
+            axis_span = max(axis_high - axis_low, 1e-12)
+            for series_index, (_label, points) in enumerate(series):
+                points = self._decimate(points, max(300, rect.width() * 2))
+                if not points:
                     continue
                 path = QPainterPath()
-                for index, value in enumerate(values):
-                    x = rect.left() + index / (max_len - 1) * rect.width()
-                    y = rect.bottom() - value / maximum * rect.height()
+                for index, (timestamp, value) in enumerate(points):
+                    x = rect.left() + (timestamp - x_low) / (x_high - x_low) * rect.width()
+                    y = rect.bottom() - (value - axis_low) / axis_span * rect.height()
                     point = QPointF(x, y)
                     if index == 0:
                         path.moveTo(point)
                     else:
                         path.lineTo(point)
-                painter.setPen(QPen(QColor(colors[series_index % len(colors)]), 2)); painter.drawPath(path)
+                painter.setPen(QPen(QColor(colors[series_index % len(colors)]), 2.2))
+                painter.drawPath(path)
 
-        legend_items = [(f"左·{label}", self._LEFT_COLORS[index % len(self._LEFT_COLORS)]) for index, (label, values) in enumerate(self.left_series) if values]
-        legend_items.extend((f"右·{label}", self._RIGHT_COLORS[index % len(self._RIGHT_COLORS)]) for index, (label, values) in enumerate(self.right_series) if values)
-        legend_x = rect.left() + 8
-        legend_y = 21
+        legend_x = rect.left()
+        legend_y = rect.bottom() + 48
         for label, color in legend_items:
-            painter.setPen(QPen(QColor(color), 3)); painter.drawLine(legend_x, legend_y - 4, legend_x + 13, legend_y - 4)
-            painter.setPen(QColor("#355775")); painter.drawText(legend_x + 18, legend_y, label)
-            legend_x += max(70, len(label) * 12 + 34)
-            if legend_x > rect.right() - 90:
-                legend_x = rect.left() + 8; legend_y += 18
+            item_width = metrics.horizontalAdvance(label) + 42
+            if legend_x > rect.left() and legend_x + item_width > rect.right():
+                legend_x = rect.left()
+                legend_y += 24
+            painter.setPen(QPen(QColor(color), 4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            painter.drawLine(legend_x, legend_y - 5, legend_x + 16, legend_y - 5)
+            painter.setPen(QColor("#476985"))
+            painter.drawText(legend_x + 23, legend_y, label)
+            legend_x += item_width
         painter.end()
 
 
@@ -3015,7 +3202,7 @@ class DataAnalysisPage(_BaseWorkflowPage):
         card_layout = card.layout() if card is not None else None
         if card_layout is None:
             return
-        self.bio_status_label = QLabel(UNKNOWN)
+        self.bio_status_label = QLabel("None")
         self.bio_status_label.setProperty("chip", True)
         self.bio_status_label.setProperty("tone", "neutral")
         card_layout.addWidget(self.bio_status_label, 0, Qt.AlignmentFlag.AlignLeft)
@@ -3030,7 +3217,7 @@ class DataAnalysisPage(_BaseWorkflowPage):
             tile.setStyleSheet("QFrame { background:#f1f7fd; border:0; border-radius:10px; }")
             tile_layout = QVBoxLayout(tile); tile_layout.setContentsMargins(12, 9, 12, 9); tile_layout.setSpacing(2)
             title_label = QLabel(title); title_label.setProperty("label", True); tile_layout.addWidget(title_label)
-            value_label = QLabel(UNKNOWN); value_label.setProperty("value", True); tile_layout.addWidget(value_label)
+            value_label = QLabel("None"); value_label.setProperty("value", True); tile_layout.addWidget(value_label)
             self.bio_metric_labels[key] = value_label
             metrics.addWidget(tile, 0, index)
         # Keep the old internal key as a compatibility alias for integrations
@@ -3539,41 +3726,8 @@ class DataAnalysisPage(_BaseWorkflowPage):
         return None
 
     def _latest_channel_measurements(self) -> dict[str, Any]:
-        """Read the selected cage's newest real measurements.
-
-        Health snapshots are preferred because they are the low-frequency
-        real-time channel.  The latest persisted Epoch row is used as a
-        fallback for fields that are not present in the snapshot.  No sample
-        or formula value is fabricated when both sources are empty.
-        """
-        channel = f"CH{self.selected_channel:02d}"
-        observations = _provider_value(self._health_source)
-        items = list(observations.get("components") or []) + list(observations.get("alerts") or [])
+        """Return exactly the selected cage's last persisted Epoch row."""
         measurements: dict[str, Any] = {}
-        newest: dict[str, float] = {}
-        for item in items:
-            if not isinstance(item, Mapping):
-                continue
-            scope = str(item.get("scope", "")).upper()
-            if scope and scope not in {channel, str(self.selected_channel), f"CH{self.selected_channel}"}:
-                continue
-            metrics = item.get("metrics") or {}
-            if not isinstance(metrics, Mapping):
-                continue
-            observed_at = _number(item.get("observed_at")) or 0.0
-            sources = [metrics]
-            nested = metrics.get("measurements")
-            if isinstance(nested, Mapping):
-                sources.append(nested)
-            for source in sources:
-                for key, value in source.items():
-                    if key in {"measurements", "environment"} or value is None:
-                        continue
-                    key_text = str(key)
-                    if observed_at >= newest.get(key_text, float("-inf")):
-                        measurements[key_text] = value
-                        newest[key_text] = observed_at
-
         context = _provider_value(self._context_provider)
         db_path = context.get("experiment_db_path")
         if db_path and os.path.isfile(str(db_path)):
@@ -3586,14 +3740,11 @@ class DataAnalysisPage(_BaseWorkflowPage):
                     if exists:
                         columns = [str(row[1]) for row in connection.execute(f'PRAGMA table_info("{table}")')]
                         if columns:
-                            order_column = "id" if "id" in columns else "rowid"
                             row = connection.execute(
-                                f'SELECT * FROM "{table}" ORDER BY "{order_column}" DESC LIMIT 1'
+                                f'SELECT * FROM "{table}" ORDER BY rowid DESC LIMIT 1'
                             ).fetchone()
                             if row:
-                                for column, value in zip(columns, row):
-                                    if value is not None and self._latest_measurement_from_mapping(measurements, column) is None:
-                                        measurements[column] = value
+                                measurements.update(zip(columns, row))
             except (OSError, sqlite3.Error):
                 pass
         return measurements
@@ -3608,7 +3759,7 @@ class DataAnalysisPage(_BaseWorkflowPage):
 
     def _bio_value_text(self, value: Any, unit: str = "") -> str:
         if value is None or value == "":
-            return UNKNOWN
+            return "None"
         numbers = _numbers(value)
         if numbers:
             number = numbers[-1]
@@ -3626,30 +3777,25 @@ class DataAnalysisPage(_BaseWorkflowPage):
             "temperature": ("body_temperature", "core_body_temperature", "tmp_hs_max", "红外", "体温"),
             "behavior": ("behavior", "behavior_label", "action", "行为"),
         }
-        rer_value = calculate_rer(measurements)
+        rer_value = self._latest_measurement_from_mapping(
+            measurements, "rer_rq", "RER", "RQ", "respiratory_exchange_ratio"
+        )
         values = {
             "weight": self._bio_value_text(self._latest_measurement_from_mapping(measurements, *aliases["weight"]), " g"),
             "food": self._bio_value_text(self._latest_measurement_from_mapping(measurements, *aliases["food"]), " g"),
             "water": self._bio_value_text(self._latest_measurement_from_mapping(measurements, *aliases["water"]), " mL"),
-            # RER is a defined metric, so an absent sample is simply None;
-            # do not expose the old "公式待定" placeholder in P6.
-            "rer": "None" if rer_value is None else self._bio_value_text(rer_value),
+            "rer": self._bio_value_text(rer_value),
             "movement": self._bio_value_text(self._latest_measurement_from_mapping(measurements, *aliases["movement"]), " 计数"),
-            "behavior": _text(self._latest_measurement_from_mapping(measurements, *aliases["behavior"]), UNKNOWN),
+            "behavior": _text(self._latest_measurement_from_mapping(measurements, *aliases["behavior"]), "None"),
             "temperature": self._bio_value_text(self._latest_measurement_from_mapping(measurements, *aliases["temperature"]), " °C"),
         }
-        # If the health snapshot carries no explicit behavior but real
-        # trajectory points exist, apply the same two-class classifier used by
-        # P5/P6.  With no points the value remains unknown by design.
-        if values["behavior"] == UNKNOWN and points:
-            values["behavior"] = MachineVisionPage._classify([{"point": point} for point in points])
         for key, value in values.items():
             label = self.bio_metric_labels.get(key)
             if label is not None:
                 label.setText(value)
-        individual_id = _text(metadata.get("id"))
-        sex = _text(metadata.get("sex"))
-        group = _text(metadata.get("group"))
+        individual_id = _text(metadata.get("id"), "None")
+        sex = _text(metadata.get("sex"), "None")
+        group = _text(metadata.get("group"), "None")
         self.bio_label.setText(
             f"CH{self.selected_channel:02d}    个体 {individual_id}    性别 {sex}    分组 {group}"
         )
@@ -3675,7 +3821,7 @@ class DataAnalysisPage(_BaseWorkflowPage):
         elif "normal" in states:
             text, tone = "在线", "normal"
         else:
-            text, tone = UNKNOWN, "neutral"
+            text, tone = "None", "neutral"
         self._set_chip(self.bio_status_label, text, tone)
 
     def _load_points(self) -> list[tuple[float, float, float]]:
@@ -3792,9 +3938,10 @@ class DataAnalysisPage(_BaseWorkflowPage):
         self._compare_right_channel_series = self._metric_channel_series(self._right_channels, right_index)
         self._compare_left_series = [point for _channel, series in self._compare_left_channel_series for point in series]
         self._compare_right_series = [point for _channel, series in self._compare_right_channel_series for point in series]
-        self.compare_canvas.set_channel_series(
-            [(channel, [value for _timestamp, value in series]) for channel, series in self._compare_left_channel_series],
-            [(channel, [value for _timestamp, value in series]) for channel, series in self._compare_right_channel_series],
+        self.compare_canvas.set_axis_labels(self.left_metric.currentText(), self.right_metric.currentText())
+        self.compare_canvas.set_timed_channel_series(
+            self._compare_left_channel_series,
+            self._compare_right_channel_series,
         )
 
     def _comparison_export_rows(self) -> tuple[list[tuple[str, list[tuple[str, float]]]], list[tuple[str, list[tuple[str, float]]]], str, str]:
@@ -3839,10 +3986,8 @@ class DataAnalysisPage(_BaseWorkflowPage):
         try:
             chart = DualAxisChart()
             chart.resize(1600, 720)
-            chart.set_channel_series(
-                [(channel, [value for _timestamp, value in series]) for channel, series in left],
-                [(channel, [value for _timestamp, value in series]) for channel, series in right],
-            )
+            chart.set_axis_labels(left_metric, right_metric)
+            chart.set_timed_channel_series(left, right)
             generator = QSvgGenerator()
             generator.setFileName(file_path)
             generator.setSize(chart.size())
