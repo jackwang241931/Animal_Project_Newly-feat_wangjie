@@ -1499,6 +1499,11 @@ class MainWindow_Index(ThemedWindow):
 
     def _hide_legacy_module_windows(self):
         """Hide orphaned legacy windows without touching named dialogs."""
+        # Some legacy module frames are top-level QMainWindow instances even
+        # though they are owned by a module. Keep their identities so the
+        # orphan sweep below does not close a live device-detection window
+        # when the user navigates to another workflow page mid-detection.
+        protected_legacy_widget_ids = set()
         for module in getattr(self, "modules", []) or []:
             interface = getattr(module, "interface_widget", None)
             if interface is None:
@@ -1511,6 +1516,7 @@ class MainWindow_Index(ThemedWindow):
                 widget = getattr(interface, attr, None)
                 if widget is None:
                     continue
+                protected_legacy_widget_ids.add(id(widget))
                 try:
                     widget.hide()
                 except Exception as error:
@@ -1521,6 +1527,8 @@ class MainWindow_Index(ThemedWindow):
             return
         for widget in list(app.topLevelWidgets()):
             if widget is self:
+                continue
+            if id(widget) in protected_legacy_widget_ids:
                 continue
             try:
                 title = str(widget.windowTitle() or "").strip().lower()
