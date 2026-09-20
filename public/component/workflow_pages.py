@@ -576,7 +576,7 @@ class ExperimentControlPage(_BaseWorkflowPage):
         self.calibration_status = QLabel("待校准"); self.calibration_status.setProperty("value", True)
         calibration_box.addWidget(self.calibration_status)
         self.calibration_buttons: dict[str, QPushButton] = {}
-        air_button = QPushButton("开始空气校准")
+        air_button = QPushButton("空气校准")
         air_button.clicked.connect(self._start_air_calibration)
         self.calibration_buttons["air"] = air_button
         calibration_box.addWidget(air_button)
@@ -900,30 +900,30 @@ class ExperimentControlPage(_BaseWorkflowPage):
         self._update_calibration_buttons()
 
     def _start_air_calibration(self) -> None:
-        """Use the legacy startup Air path; it is not a runtime zero/span command."""
+        """Select startup Air calibration; execute it when the experiment starts."""
         if self._last_run_status in {"starting", "running", "monitoring", "stopping"} or getattr(self, "_last_can_stop", False):
-            self.operation_hint.setText("空气校准仅支持在开始实验前执行，运行中不能单独启动。")
+            self.operation_hint.setText("空气校准仅支持在开始实验前选择。")
             return
         if global_setting.get_setting("environment_module_only", False):
-            self.operation_hint.setText("仅环境模块模式不运行气路，无法执行空气校准。")
+            self.operation_hint.setText("仅环境模块模式不运行气路，无法选择空气校准。")
             return
         if not global_setting.get_setting("air_modules_all_valid", False):
-            self.operation_hint.setText("请先确认串口并完成检测，UFC、UGC、ZOS 全部通过后才能空气校准。")
+            self.operation_hint.setText("请先确认串口并完成检测，UFC、UGC、ZOS 全部通过后才能选择空气校准。")
             return
-        if not callable(getattr(self.main_window, "start_experiment", None)):
-            self.operation_hint.setText("主窗口启动入口不可用。")
-            return
-        if QMessageBox.question(
-            self, "确认空气校准",
-            "将按旧项目流程先进行空气校准，再进入实验运行。是否继续？",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        ) != QMessageBox.StandardButton.Yes:
-            return
+
         global_setting.set_setting("startup_calibration_mode", "air")
         global_setting.set_setting("is_auto_calibration", True)
-        self._start_experiment()
-
+        selection_signal = getattr(self.main_window, "calibration_selection_changed_signal", None)
+        if selection_signal is not None:
+            selection_signal.emit(True, "air")
+        self.calibration_status.setText("已选择空气校准")
+        self.operation_hint.setText("已选择空气校准，请点击“开始实验”进行校准。")
+        self._update_calibration_buttons()
+        QMessageBox.information(
+            self,
+            "选择空气校准",
+            "已选择空气校准，请点击“开始实验”进行校准。",
+        )
     def _start_experiment(self) -> None:
         if callable(getattr(self.main_window, "start_experiment", None)):
             self.set_operation_progress(0, "正在检查启动条件")

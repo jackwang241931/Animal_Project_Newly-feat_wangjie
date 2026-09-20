@@ -11,10 +11,10 @@ from json import JSONDecodeError
 
 from PyQt6.QtGui import QFont
 from PyQt6 import QtCore
-from PyQt6.QtCore import QTimer, QObject, QThread, pyqtSignal
+from PyQt6.QtCore import QEvent, QTimer, QObject, QThread, pyqtSignal
 from PyQt6.QtGui import QAction
 from PyQt6.QtWidgets import QMessageBox, QVBoxLayout, QToolBar, QTabWidget, QDialog, QMenu, QMenuBar, QWidget, \
-    QApplication, QCheckBox, QFileDialog, QProgressDialog
+    QApplication, QAbstractSpinBox, QCheckBox, QComboBox, QDial, QFileDialog, QProgressDialog, QRadioButton, QSlider
 from loguru import logger
 
 from PyQt6.QtCore import Qt
@@ -609,6 +609,7 @@ class MainWindow_Index(ThemedWindow):
                                f"Tips：\n如果还不会操作，可再次单击该按钮查看教程。")
     def __init__(self):
         super().__init__()
+        self._install_wheel_guard()
         # 开始实验dialog
         self.start_dialog:AnimatedLoadingDialog=None
         # 停止实验dialog
@@ -810,6 +811,22 @@ class MainWindow_Index(ThemedWindow):
         self.status_bar.hide()
         super()._init_customize_ui()
         pass
+    def _install_wheel_guard(self):
+        """Prevent accidental value changes when scrolling over form controls."""
+        application = QApplication.instance()
+        if application is None or getattr(self, "_wheel_guard_installed", False):
+            return
+        application.installEventFilter(self)
+        self._wheel_guard_installed = True
+
+    def eventFilter(self, watched, event):
+        if event.type() == QEvent.Type.Wheel and isinstance(
+            watched,
+            (QAbstractSpinBox, QComboBox, QDial, QSlider, QCheckBox, QRadioButton),
+        ):
+            event.ignore()
+            return True
+        return super().eventFilter(watched, event)
     def _init_function(self):
         # 改变组件是否被点击
         self.change_enable_component_app_state()
@@ -1077,6 +1094,10 @@ class MainWindow_Index(ThemedWindow):
             if buffer:
                 previous = buffer[-1]
                 previous_base = previous.get("base_message", previous.get("message", ""))
+                if previous_base == display_line and previous.get("time") == stamp and previous.get("type") != kind:
+                    if kind == "校准":
+                        previous["type"] = kind
+                    continue
                 if previous.get("type") == kind and previous_base == display_line:
                     repeat_count = int(previous.get("repeat_count", 1)) + 1
                     previous["repeat_count"] = repeat_count
@@ -3697,10 +3718,10 @@ class MainWindow_Index(ThemedWindow):
         msg_box = QMessageBox(self)
         msg_box.setIcon(QMessageBox.Icon.Question)
         msg_box.setWindowTitle("启动前校准模式")
-        msg_box.setText("请选择开始实验前的校准模式：")
+        msg_box.setText("请选择校准方式，选择后请点击“开始实验”进行校准。")
 
-        air_button = msg_box.addButton("Air 空气校准后开启实验", QMessageBox.ButtonRole.ActionRole)
-        full_button = msg_box.addButton("调零+调span后开启实验", QMessageBox.ButtonRole.ActionRole)
+        air_button = msg_box.addButton("空气校准", QMessageBox.ButtonRole.ActionRole)
+        full_button = msg_box.addButton("校零+校span", QMessageBox.ButtonRole.ActionRole)
         msg_box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
         msg_box.setDefaultButton({
             "air": air_button,
@@ -3759,11 +3780,11 @@ def _patched_calibration_gas_state_change(self, state=None):
     msg_box = QMessageBox(self)
     msg_box.setIcon(QMessageBox.Icon.Question)
     msg_box.setWindowTitle("启动前校准模式")
-    msg_box.setText("请选择开始实验前的校准模式：")
+    msg_box.setText("请选择校准方式，选择后请点击“开始实验”进行校准。")
 
-    air_button = msg_box.addButton("Air空气校准O2后开启实验", QMessageBox.ButtonRole.ActionRole)
-    air_co2_button = msg_box.addButton("Air空气校准CO2后开启实验", QMessageBox.ButtonRole.ActionRole)
-    full_button = msg_box.addButton("调零+调span后开启实验", QMessageBox.ButtonRole.ActionRole)
+    air_button = msg_box.addButton("空气校准O2", QMessageBox.ButtonRole.ActionRole)
+    air_co2_button = msg_box.addButton("空气校准CO2", QMessageBox.ButtonRole.ActionRole)
+    full_button = msg_box.addButton("校零+校span", QMessageBox.ButtonRole.ActionRole)
     msg_box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
     msg_box.setDefaultButton({
         "air": air_button,
@@ -3819,10 +3840,10 @@ def _patched_calibration_gas_state_change_v2(self, state=None):
     msg_box = QMessageBox(self)
     msg_box.setIcon(QMessageBox.Icon.Question)
     msg_box.setWindowTitle("启动前校准模式")
-    msg_box.setText("请选择开始实验前的校准模式：")
+    msg_box.setText("请选择校准方式，选择后请点击“开始实验”进行校准。")
 
-    air_button = msg_box.addButton("Air空气校准后开启实验", QMessageBox.ButtonRole.ActionRole)
-    full_button = msg_box.addButton("调零+调span后开启实验", QMessageBox.ButtonRole.ActionRole)
+    air_button = msg_box.addButton("空气校准", QMessageBox.ButtonRole.ActionRole)
+    full_button = msg_box.addButton("校零+校span", QMessageBox.ButtonRole.ActionRole)
     msg_box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
     msg_box.setDefaultButton({
         "air": air_button,
@@ -3860,6 +3881,11 @@ def _patched_calibration_gas_state_change_v2(self, state=None):
         )
 
     self.calibration_selection_changed_signal.emit(True, mode)
+    selected_label = "空气校准" if mode == "air" else "校零+校span"
+    QMessageBox.information(
+        self, "校准方式已选择",
+        f"已选择{selected_label}，请点击“开始实验”进行校准。",
+    )
 
 
 MainWindow_Index.calibration_gas_state_change = _patched_calibration_gas_state_change_v2
