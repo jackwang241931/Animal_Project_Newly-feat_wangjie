@@ -83,4 +83,7 @@ def build_cage_control_command(cage_number, control, value, port):
         "timeout": 0,
         "mouse_cage_number": cage_number,
         "no_response": True,
+        # Keep this command out of the sensor-data pipeline while still routing
+        # the real Modbus acknowledgement back to the P3 control page.
+        "cage_control": True,
     }

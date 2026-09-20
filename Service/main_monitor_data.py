@@ -598,6 +598,26 @@ def _send_main_window_status(title, data):
         )
 
 
+
+def _send_cage_control_response(send_message, send_state, response_hex=None, detail=None):
+    """Publish the real device result for a P3 cage-control command."""
+    if not isinstance(send_message, dict) or not send_message.get("cage_control"):
+        return
+    response_text = str(response_hex or "").replace(" ", "").upper()
+    message = "设备已成功响应" if send_state else str(detail or "设备未返回有效响应")
+    _send_main_window_status(
+        "cage_control_response",
+        {
+            "success": bool(send_state),
+            "cage_number": send_message.get("mouse_cage_number"),
+            "control": send_message.get("cage_control_name"),
+            "value": send_message.get("cage_control_value"),
+            "request_id": send_message.get("cage_control_request_id"),
+            "message": message,
+            "response_hex": response_text,
+        },
+    )
+
 def _notify_food_trough_current_off_success(response_hex=None, cage_number=None):
     """Show the success notice after the current-off command is acknowledged."""
     frame_hex = str(response_hex or "未返回报文").replace(" ", "").upper()
@@ -1010,9 +1030,12 @@ class read_queue_data_Thread(MyQThread):
                             lighting_schedule_thread.set_schedule(schedule, apply_now=True)
                     case 'cage_control':
                         request = message.data if isinstance(message.data, dict) else {}
+                        cage_number = request.get("cage_number")
+                        control = request.get("control")
+                        request_id = request.get("request_id")
                         try:
-                            cage_number = int(request.get("cage_number"))
-                            control = str(request.get("control", ""))
+                            cage_number = int(cage_number)
+                            control = str(control or "")
                             if not _cage_control_allowed(cage_number, control):
                                 raise ValueError("笼子未启用，或对应测量模块未启用")
                             if self.send_thread is None or not self.send_thread.isRunning():
@@ -1021,13 +1044,29 @@ class read_queue_data_Thread(MyQThread):
                                 cage_number, control, request.get("value"),
                                 global_setting.get_setting("port", None),
                             )
+                            command.update({
+                                "cage_control_name": control,
+                                "cage_control_value": request.get("value"),
+                                "cage_control_request_id": request_id,
+                            })
                             self.send_thread.add_message(
                                 message={"message": command}, urgent=True,
-                                origin="ExperimentControlPage",
+                                origin="MainWindow_index",
                             )
                             logger.info(f"笼子{cage_number}硬件操作已排队: {control}={request.get('value')}")
                         except (TypeError, ValueError, RuntimeError, KeyError) as error:
                             logger.warning(f"笼内硬件操作未发送: {error}")
+                            _send_main_window_status(
+                                "cage_control_response",
+                                {
+                                    "success": False,
+                                    "cage_number": cage_number,
+                                    "control": control,
+                                    "value": request.get("value"),
+                                    "request_id": request_id,
+                                    "message": f"指令未发送：{error}",
+                                },
+                            )
                     case 'start':
                         data = message.data
                         if data is not None:
@@ -1748,6 +1787,13 @@ class Send_thread(MyQThread):
                             if 'detection_session_id' in send_message:
                                 final_return_data['detection_session_id'] = send_message.get('detection_session_id')
 
+                            if send_message.get("cage_control"):
+                                _send_cage_control_response(
+                                    send_message,
+                                    send_state,
+                                    response_hex,
+                                    parser_message if not send_state else None,
+                                )
                             # 把返回数据返回给源头
                             message_struct = None
 
@@ -1794,6 +1840,14 @@ class Send_thread(MyQThread):
                         except queue.Empty:
                             self.priority_queue_empty=True
                             pass
+                        except Exception as error:
+                            if isinstance(send_message, dict) and send_message.get("cage_control"):
+                                _send_cage_control_response(
+                                    send_message,
+                                    False,
+                                    detail=f"发送异常：{error}",
+                                )
+                            logger.exception(f"优先级控制指令处理失败: {error}")
                         send_message=None
                         # 处理普通消息
                         try:

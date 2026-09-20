@@ -105,6 +105,7 @@ class read_queue_data_Thread(MyQThread):
     stop_backend_completed_signal = pyqtSignal()
     stop_backend_issue_signal = pyqtSignal(str)
     stop_progress_signal = pyqtSignal(str)
+    cage_control_response_signal = pyqtSignal(object)
 
     def __init__(self, name,window=None):
         super().__init__(name)
@@ -189,6 +190,9 @@ class read_queue_data_Thread(MyQThread):
 
 
                         pass
+                    case "cage_control_response":
+                        if self.window:
+                            self.cage_control_response_signal.emit(message.data if isinstance(message.data, dict) else {})
                     case "mouse_cage_inner_module_running_state":
                         #鼠笼环境内部模块运行情况
                         if message.data and self.window:
@@ -639,6 +643,9 @@ class MainWindow_Index(ThemedWindow):
         read_queue_data_thread.calibration_event_signal.connect(
             self._on_calibration_event
         )
+        read_queue_data_thread.cage_control_response_signal.connect(
+            self._on_cage_control_response
+        )
         read_queue_data_thread.stop_backend_completed_signal.connect(
             self._on_stop_backend_complete
         )
@@ -1047,6 +1054,12 @@ class MainWindow_Index(ThemedWindow):
             ExperimentRunState.STOP_FAILED,
         }:
             page.on_calibration_event(event)
+
+    def _on_cage_control_response(self, response) -> None:
+        """Forward the real device acknowledgement to the visible P3 page."""
+        page = getattr(self, "experiment_control_page", None)
+        if page is not None:
+            page.on_cage_control_response(response)
 
     def _on_start_experiment_failed(self, reason: str) -> None:
         if self._gas_path_timeout_timer is not None:

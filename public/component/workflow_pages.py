@@ -13,6 +13,7 @@ import os
 import re
 import sqlite3
 import time
+import uuid
 import csv
 from datetime import datetime
 from pathlib import Path
@@ -623,6 +624,7 @@ class ExperimentControlPage(_BaseWorkflowPage):
         self.cage_control_rows = {}
         self.cage_control_buttons = {}
         self.cage_control_sliders = {}
+        self._pending_cage_controls: dict[str, tuple[int, str, Any]] = {}
         for cage in range(1, 9):
             row = QFrame()
             row.setStyleSheet("QFrame { background:#f8fbff; border:1px solid #dcebf7; border-radius:8px; }")
@@ -789,16 +791,77 @@ class ExperimentControlPage(_BaseWorkflowPage):
         if queue is None:
             self.cage_control_feedback.setText("操作未发送：后台采集服务未连接。")
             return
+
+        request_id = uuid.uuid4().hex
+        self._pending_cage_controls[request_id] = (cage, control, value)
         try:
             queue.put(ObjectQueueItem(
                 origin="ExperimentControlPage", to="main_monitor_data", title="cage_control",
-                data={"cage_number": cage, "control": control, "value": value},
+                data={
+                    "cage_number": cage,
+                    "control": control,
+                    "value": value,
+                    "request_id": request_id,
+                },
                 time=time.strftime("%Y-%m-%d %H:%M:%S"),
             ))
         except Exception as error:
+            self._pending_cage_controls.pop(request_id, None)
             self.cage_control_feedback.setText(f"操作未发送：{error}")
             return
-        self.cage_control_feedback.setText(f"CH{cage:02d} 操作请求已发送，等待设备处理。")
+        self.cage_control_feedback.setStyleSheet("color:#956000;")
+        self.cage_control_feedback.setText(f"CH{cage:02d} 操作请求已发送，等待设备响应。")
+
+    def on_cage_control_response(self, response: Mapping[str, Any] | None) -> None:
+        """Show the device acknowledgement instead of leaving the UI pending."""
+        payload = dict(response) if isinstance(response, Mapping) else {}
+        request_id = str(payload.get("request_id") or "")
+        pending = self._pending_cage_controls.pop(request_id, None) if request_id else None
+        # Ignore a late acknowledgement for a request that has already been
+        # superseded/cleared, so an old response cannot overwrite a newer one.
+        if request_id and pending is None:
+            return
+
+        pending_cage, pending_control, pending_value = pending or (None, None, None)
+        try:
+            cage = int(payload.get("cage_number") or pending_cage)
+        except (TypeError, ValueError):
+            return
+        control = str(payload.get("control") or pending_control or "")
+        value = payload.get("value", pending_value)
+        success = bool(payload.get("success", False))
+        action_labels = {
+            ("wheel_brake", "enable"): "启用跑轮刹车",
+            ("wheel_brake", "release"): "解除跑轮刹车",
+            ("light", "on"): "开灯",
+            ("light", "off"): "关灯",
+            ("food_door", "open"): "开食槽门",
+            ("food_door", "close"): "关食槽门",
+            ("light_color", None): "设置光照色温",
+            ("light_brightness", None): "设置光照亮度",
+        }
+        action = action_labels.get((control, value)) or action_labels.get((control, None)) or control
+        if success:
+            text = f"CH{cage:02d} {action}完成，设备已成功响应。"
+            self.cage_control_feedback.setStyleSheet("color:#16803c;")
+        else:
+            detail = str(payload.get("message") or "设备未返回有效响应")
+            text = f"CH{cage:02d} {action}失败：{detail}"
+            self.cage_control_feedback.setStyleSheet("color:#b42318;")
+        self.cage_control_feedback.setText(text)
+
+        button = self.cage_control_buttons.get((cage, control, value))
+        if button is not None:
+            button.setToolTip(text)
+        slider = self.cage_control_sliders.get((cage, control))
+        if success and slider is not None:
+            try:
+                slider.blockSignals(True)
+                slider.setValue(int(value))
+            except (TypeError, ValueError):
+                pass
+            finally:
+                slider.blockSignals(False)
 
     def _open_calibration_details(self, calibration_type: str | None) -> bool:
         show_details = getattr(self.main_window, "show_calibration_windows", None)
