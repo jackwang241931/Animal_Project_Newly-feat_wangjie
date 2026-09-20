@@ -62,7 +62,6 @@ from public.util.lighting_schedule import normalize_lighting_schedule, resolve_l
 MESSAGE_BATCH_SIZE = 0
 total_messages_processed = 1
 lock = threading.Lock()
-COLLECTION_BATCH_TIMEOUT_SECONDS = 20.0
 COLLECTION_BARRIER_TIMEOUT_SECONDS = 45.0
 COLLECTION_SENSOR_MAX_ATTEMPTS = 3
 COLLECTION_SENSOR_RETRY_DELAY_SECONDS = 0.1
@@ -736,7 +735,7 @@ def _notify_skipped_gas_stop_complete():
         _send_main_window_status(title, text)
 
 
-batch_complete_event = threading.Semaphore(0)
+batch_complete_event = threading.Event()
 #等待气路启动之后在一起运行发送
 wait_UFC_UGC_ZOS_start_event = threading.Event()
 global_setting.set_setting("wait_UFC_UGC_ZOS_start_event",wait_UFC_UGC_ZOS_start_event)
@@ -757,7 +756,7 @@ def _reset_collection_sync_signals():
     global batch_complete_event
     global wait_UFC_run_finish_event, wait_UGC_run_finish_event, wait_ZOS_run_finish_event
 
-    batch_complete_event = threading.Semaphore(0)
+    batch_complete_event = threading.Event()
     wait_UFC_run_finish_event = threading.Semaphore(0)
     wait_UGC_run_finish_event = threading.Semaphore(0)
     wait_ZOS_run_finish_event = threading.Semaphore(0)
@@ -768,7 +767,7 @@ def _reset_collection_sync_signals():
 
 def _release_collection_sync_waiters():
     """Wake collection workers promptly while an experiment is stopping."""
-    batch_complete_event.release()
+    batch_complete_event.set()
     for signal_name in (
         "wait_UFC_run_finish_event",
         "wait_UGC_run_finish_event",
@@ -1939,7 +1938,7 @@ class Send_thread(MyQThread):
                                     total_messages_processed = 1
                                     MESSAGE_BATCH_SIZE = 0
 
-                                    batch_complete_event.release()
+                                    batch_complete_event.set()
                                 else:
                                     total_messages_processed += 1
                         else:
@@ -1955,7 +1954,7 @@ class Send_thread(MyQThread):
 
                                     total_messages_processed = 1
                                     MESSAGE_BATCH_SIZE = 0
-                                    batch_complete_event.release()
+                                    batch_complete_event.set()
                                 else:
                                     total_messages_processed += 1
 
@@ -1999,6 +1998,14 @@ class Add_message_thread(MyQThread):
             if self._paused:
                 self.condition.wait(self.mutex)  # 等待条件变量
             self.mutex.unlock()
+
+            if not self._running:
+                break
+
+            # Clear the previous notification before enqueueing the next batch.
+            # The response worker sets it for both successful and failed
+            # requests, so the collector can wait without an artificial timeout.
+            batch_complete_event.clear()
 
             barrier = global_setting.get_setting("barrier")
             #拿到气路启动是否启动的状态
@@ -2115,17 +2122,10 @@ class Add_message_thread(MyQThread):
             # 当前为参考气 则下一个为第一个鼠笼
                 self.mouse_cage_index = 0
                 pass
-            batch_completed = batch_complete_event.acquire(
-                timeout=COLLECTION_BATCH_TIMEOUT_SECONDS
-            )
-            if not batch_completed:
-                logger.critical(
-                    "collection batch timeout: "
-                    f"cage_index={current_mouse_cage_index}, "
-                    f"expected_messages={len(send_messages)}, "
-                    f"timeout={COLLECTION_BATCH_TIMEOUT_SECONDS:.1f}s"
-                )
-
+            if send_messages:
+                batch_complete_event.wait()
+                # Keep the Event reusable for the next batch.
+                batch_complete_event.clear()
             # 在这里手动触发 barrier（只有自己一个线程，立刻触发 barrier_action）
             try:
                 barrier = global_setting.get_setting("barrier")
