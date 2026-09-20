@@ -44,6 +44,7 @@ from Module.mouse_trajectory.service.auto_mouse_trajectory import (
     extract_box_corners,
     map_topdown_polygon_to_physical,
     mean_corner_distance,
+    order_corners,
     parse_grid_json,
     parse_image_registration_json,
     parse_topdown_instrument_polygons,
@@ -355,6 +356,10 @@ class MouseTrajectoryThread(MyQThread):
                 corners.append({"x": x * width, "y": y * height})
         except (TypeError, ValueError):
             return None
+        try:
+            corners = order_corners([[point["x"], point["y"]] for point in corners])
+        except (TypeError, ValueError):
+            return None
         return BoxCorners(corners, 1.0, source)
 
     def _load_manual_cage_calibrations(self) -> None:
@@ -385,8 +390,11 @@ class MouseTrajectoryThread(MyQThread):
                 continue
             if len(parsed) == 4:
                 try:
+                    ordered = order_corners(parsed)
                     self.manual_cage_calibrations[int(channel)] = {
-                        "points_normalized": parsed,
+                        "points_normalized": [
+                            [point["x"], point["y"]] for point in ordered
+                        ],
                         "source": str(calibration.get("source", "manual_visible_light")),
                     }
                 except (TypeError, ValueError):
@@ -411,14 +419,18 @@ class MouseTrajectoryThread(MyQThread):
             width, height = int(frame_size[0]), int(frame_size[1])
             if width <= 0 or height <= 0 or len(points) != 4:
                 return False
-            normalized = [[float(point[0]) / width, float(point[1]) / height] for point in points]
+            ordered = order_corners(points)
+            normalized = [
+                [float(point["x"]) / width, float(point["y"]) / height]
+                for point in ordered
+            ]
         except (TypeError, ValueError, IndexError):
             return False
         calibration = {"points_normalized": normalized, "source": str(source)}
         with self.pending_lock:
             self.manual_cage_calibrations[cage_number] = calibration
             corners = BoxCorners(
-                [{"x": float(point[0]), "y": float(point[1])} for point in points],
+                [dict(point) for point in ordered],
                 1.0,
                 str(source),
             )

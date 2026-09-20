@@ -339,6 +339,7 @@ class CageCalibrationImage(QLabel):
         self._source_pixmap = QPixmap()
         self._frame_size = (0, 0)
         self._points: list[tuple[float, float]] = []
+        self._detected_points: list[tuple[float, float]] = []
         self._calibration_mode = False
 
     def set_frame_image(self, pixmap: QPixmap, frame_size: tuple[int, int]) -> None:
@@ -372,6 +373,21 @@ class CageCalibrationImage(QLabel):
 
     def calibration_points(self) -> list[tuple[float, float]]:
         return list(self._points)
+
+    def set_detected_cage_points(self, points: Iterable[Any]) -> None:
+        """Show the cage corners produced by the legacy trajectory service."""
+        parsed: list[tuple[float, float]] = []
+        for point in points or []:
+            try:
+                if isinstance(point, Mapping):
+                    x, y = point.get("x"), point.get("y")
+                else:
+                    x, y = point
+                parsed.append((float(x), float(y)))
+            except (TypeError, ValueError):
+                continue
+        self._detected_points = parsed[:4]
+        self.update()
 
     def _display_rect(self) -> QRect:
         pixmap = self.pixmap()
@@ -419,7 +435,7 @@ class CageCalibrationImage(QLabel):
 
     def paintEvent(self, event) -> None:  # pragma: no cover - Qt callback
         super().paintEvent(event)
-        if not self._points:
+        if not self._points and not self._detected_points:
             return
         frame_width, frame_height = self._frame_size
         display = self._display_rect()
@@ -427,6 +443,19 @@ class CageCalibrationImage(QLabel):
             return
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        detected = [
+            QPointF(
+                display.left() + x * display.width() / frame_width,
+                display.top() + y * display.height() / frame_height,
+            )
+            for x, y in self._detected_points
+        ]
+        if len(detected) == 4:
+            painter.setPen(QPen(QColor("#f4b400"), 2))
+            for first, second in zip(detected, detected[1:] + detected[:1]):
+                painter.drawLine(first, second)
+
         pen = QPen(QColor("#ff4d5a" if self._calibration_mode else "#28b779"), 3)
         painter.setPen(pen)
         mapped: list[QPointF] = []
@@ -1426,10 +1455,40 @@ class TrajectoryCanvas(QWidget):
     VIEW_ELEVATION_DEG = 28.0
 
     def __init__(self, parent=None):
-        super().__init__(parent); self.points: list[tuple[float, float, float]] = []; self.heatmap: list[tuple[float, float, int]] = []; self.mode = "trajectory"; self.setMinimumHeight(260)
+        super().__init__(parent); self.points: list[tuple[float, float, float]] = []; self.segments: list[list[tuple[float, float, float]]] = []; self.heatmap: list[tuple[float, float, int]] = []; self.mode = "trajectory"; self.setMinimumHeight(260)
 
     def set_points(self, points: Iterable[tuple[float, float, float]]) -> None:
-        self.points = list(points); self.mode = "trajectory"; self.update()
+        self.points = list(points); self.segments = [list(self.points)] if self.points else []; self.mode = "trajectory"; self.update()
+
+    def set_segmented_points(self, samples: Iterable[Any]) -> None:
+        """Build continuous trajectory pieces; ``None`` means a data gap."""
+        segments: list[list[tuple[float, float, float]]] = []
+        current: list[tuple[float, float, float]] = []
+        for sample in samples:
+            if sample is None:
+                if current:
+                    segments.append(current)
+                    current = []
+                continue
+            point = sample.get("point") if isinstance(sample, Mapping) else sample
+            break_before = bool(sample.get("break_before")) if isinstance(sample, Mapping) else False
+            if break_before and current:
+                segments.append(current)
+                current = []
+            try:
+                parsed = (float(point[0]), float(point[1]), float(point[2]))
+            except (TypeError, ValueError, IndexError):
+                if current:
+                    segments.append(current)
+                    current = []
+                continue
+            current.append(parsed)
+        if current:
+            segments.append(current)
+        self.segments = segments
+        self.points = [point for segment in segments for point in segment]
+        self.mode = "trajectory"
+        self.update()
 
     def set_heatmap(self, cells: Iterable[tuple[float, float, int]]) -> None:
         self.heatmap = list(cells); self.mode = "heatmap"; self.update()
@@ -1517,13 +1576,22 @@ class TrajectoryCanvas(QWidget):
             painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, "暂无轨迹数据")
             painter.end()
             return
-        trail = [self._project(point, rect) for point in self.points]
         painter.setPen(QPen(QColor("#47bd8d"), 2))
-        for first, second in zip(trail, trail[1:]):
-            painter.drawLine(first, second)
+        projected_segments = [
+            [self._project(point, rect) for point in segment]
+            for segment in (self.segments or [self.points])
+            if segment
+        ]
+        for trail in projected_segments:
+            for first, second in zip(trail, trail[1:]):
+                painter.drawLine(first, second)
+            if len(trail) == 1:
+                painter.drawEllipse(trail[0], 1.5, 1.5)
+        first_point = projected_segments[0][0]
+        last_point = projected_segments[-1][-1]
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor("#e69536")); painter.drawEllipse(trail[0], 4, 4)
-        painter.setBrush(QColor("#288ee0")); painter.drawEllipse(trail[-1], 4, 4)
+        painter.setBrush(QColor("#e69536")); painter.drawEllipse(first_point, 4, 4)
+        painter.setBrush(QColor("#288ee0")); painter.drawEllipse(last_point, 4, 4)
         painter.end()
 
     def _paint_heatmap(self, painter, rect) -> None:
@@ -2341,8 +2409,17 @@ class MachineVisionPage(_BaseWorkflowPage):
         self._coord3d_config_window = None
         self._last_frame_id = None
         self._last_frame_size: tuple[int, int] = (0, 0)
+        self._last_good_video_frames: dict[int, dict[str, Any]] = {}
+        self._display_max_age_seconds = 2.0
         self._cage_calibration_mode = False
         self._cage_calibration_points: list[tuple[float, float]] = []
+        self._detected_cage_points: dict[int, list[dict[str, float]]] = {}
+        self._live_trajectory_samples: dict[int, list[Optional[tuple[float, float, float]]]] = {}
+        self._live_trajectory_frame_ids: dict[int, int] = {}
+        self.trajectory_thread = None
+        self.trajectory_submitter_thread = None
+        self._trajectory_module_loader = None
+        self._connected_trajectory_signal_thread = None
         self._infrared_last_refresh = 0.0
         self._infrared_channel = None
         self._infrared_loader_thread = None
@@ -2352,8 +2429,10 @@ class MachineVisionPage(_BaseWorkflowPage):
         self._recognition_records: list[dict[str, Any]] = []
         super().__init__(context_provider, health_source, parent)
         self._build_ui()
+        self._display_max_age_seconds = self._configured_display_max_age_seconds()
         self._load_cage_calibration_overlay()
         self._frame_timer = QTimer(self); self._frame_timer.setInterval(250); self._frame_timer.timeout.connect(self.refresh); self._frame_timer.start(); self.refresh()
+        QTimer.singleShot(0, self.start_trajectory_thread)
 
     def start_refresh(self) -> None:
         """Start the page refresh and the legacy infrared image loader.
@@ -2369,6 +2448,7 @@ class MachineVisionPage(_BaseWorkflowPage):
         if hasattr(self, "_frame_timer") and not self._frame_timer.isActive():
             self._frame_timer.start()
         self._start_legacy_infrared_loader()
+        self.start_trajectory_thread()
         self.refresh()
 
     def stop_refresh(self) -> None:
@@ -2376,6 +2456,155 @@ class MachineVisionPage(_BaseWorkflowPage):
         if hasattr(self, "_frame_timer"):
             self._frame_timer.stop()
         self._stop_legacy_infrared_loader()
+
+    def _request_trajectory_module_load(self) -> None:
+        """Load the old trajectory worker off the GUI thread, as Tab4 did."""
+        try:
+            from Module.monitor_camera.index import tab_4
+
+            should_start = False
+            with tab_4.trajectory_module_loader_lock:
+                trajectory_class = tab_4.mouse_trajectory_thread_class
+                if trajectory_class is None:
+                    loader = tab_4.trajectory_module_loader
+                    if loader is None or loader.isFinished():
+                        loader = tab_4.TrajectoryModuleLoaderThread()
+                        tab_4.trajectory_module_loader = loader
+                        should_start = True
+                    if self._trajectory_module_loader is not loader:
+                        loader.loaded.connect(self._on_trajectory_module_loaded)
+                        loader.failed.connect(self._on_trajectory_module_load_failed)
+                        self._trajectory_module_loader = loader
+                else:
+                    loader = None
+            if trajectory_class is not None:
+                self.start_trajectory_thread()
+            elif should_start:
+                loader.start()
+        except Exception as exc:  # pragma: no cover - optional model dependency
+            logger.exception("加载旧版轨迹模块失败: %s", exc)
+            if hasattr(self, "cage_calibration_status"):
+                self.cage_calibration_status.setText("轨迹服务加载失败；仍可保存鼠笼框校准")
+
+    def _on_trajectory_module_loaded(self, _trajectory_class: Any) -> None:
+        self._trajectory_module_loader = None
+        self.start_trajectory_thread()
+
+    def _on_trajectory_module_load_failed(self, error_message: str) -> None:
+        self._trajectory_module_loader = None
+        logger.error("旧版轨迹模块不可用: %s", error_message)
+        if hasattr(self, "cage_calibration_status"):
+            self.cage_calibration_status.setText("轨迹服务加载失败；仍可保存鼠笼框校准")
+
+    def _connect_trajectory_signal(self, trajectory_thread: Any) -> None:
+        if self._connected_trajectory_signal_thread is trajectory_thread:
+            return
+        self._disconnect_trajectory_signal()
+        trajectory_thread.trajectory_ready.connect(self._on_trajectory_result)
+        self._connected_trajectory_signal_thread = trajectory_thread
+
+    def _disconnect_trajectory_signal(self) -> None:
+        trajectory_thread = self._connected_trajectory_signal_thread
+        if trajectory_thread is None:
+            return
+        try:
+            trajectory_thread.trajectory_ready.disconnect(self._on_trajectory_result)
+        except (TypeError, RuntimeError):
+            pass
+        self._connected_trajectory_signal_thread = None
+
+    def start_trajectory_thread(self) -> None:
+        """Attach P5 to the exact shared worker/submitter used by old Tab4."""
+        try:
+            from Module.monitor_camera.index import tab_4
+
+            with tab_4.trajectory_module_loader_lock:
+                trajectory_class = tab_4.mouse_trajectory_thread_class
+            with tab_4.trajectory_service_lock:
+                existing = tab_4.shared_trajectory_thread
+                needs_new = existing is None or not existing.isRunning()
+            if needs_new and trajectory_class is None:
+                self._request_trajectory_module_load()
+                return
+            trajectory_thread = tab_4.attach_shared_trajectory_service(self)
+            if trajectory_thread is None:
+                return
+            self._connect_trajectory_signal(trajectory_thread)
+            self._apply_selected_cage_calibration_to_service()
+        except Exception as exc:  # pragma: no cover - model/hardware dependent
+            logger.exception("启动旧版轨迹服务失败: %s", exc)
+            if hasattr(self, "cage_calibration_status"):
+                self.cage_calibration_status.setText("轨迹服务启动失败；仍可保存鼠笼框校准")
+
+    def stop_trajectory_thread(self) -> bool:
+        """Detach/finalize through the same contract used during experiment stop."""
+        self._disconnect_trajectory_signal()
+        try:
+            from Module.monitor_camera.index import tab_4
+
+            return tab_4.detach_shared_trajectory_service(self)
+        except Exception as exc:  # pragma: no cover - shutdown dependent
+            logger.exception("停止旧版轨迹服务失败: %s", exc)
+            return False
+
+    def _on_trajectory_result(self, result: Any) -> None:
+        if not isinstance(result, Mapping):
+            return
+        try:
+            channel = int(result.get("cage_number", 0) or 0)
+        except (TypeError, ValueError):
+            return
+        if channel <= 0:
+            return
+        corners = result.get("corners")
+        if isinstance(corners, (list, tuple)) and len(corners) >= 4:
+            parsed: list[dict[str, float]] = []
+            for point in corners[:4]:
+                try:
+                    parsed.append({"x": float(point["x"]), "y": float(point["y"])})
+                except (KeyError, TypeError, ValueError):
+                    parsed = []
+                    break
+            if len(parsed) == 4:
+                self._detected_cage_points[channel] = parsed
+                if channel == self.selected_channel and hasattr(self, "frame_label"):
+                    self.frame_label.set_detected_cage_points(parsed)
+
+        # A normal frame result always carries ``solved``.  A missing solution
+        # is a real blank sample and therefore terminates the current line;
+        # plot/finalization notifications do not represent samples and are
+        # ignored here.
+        if result.get("event_type") == "plot_ready" or result.get("status") in {
+            "final_done", "final_partial"
+        }:
+            return
+        frame_id = int(result.get("frame_id", 0) or 0)
+        previous_frame_id = self._live_trajectory_frame_ids.get(channel, -1)
+        if frame_id > 0 and frame_id <= previous_frame_id:
+            return
+        if frame_id > 0:
+            self._live_trajectory_frame_ids[channel] = frame_id
+        samples = self._live_trajectory_samples.setdefault(channel, [])
+        solved = result.get("solved")
+        point = None
+        if isinstance(solved, Mapping):
+            try:
+                x = _number(solved.get("X"))
+                y = _number(solved.get("Y"))
+                z = _number(solved.get("Z_total", solved.get("Z")))
+                if x is not None and y is not None and z is not None:
+                    point = (float(x), float(y), float(z))
+            except (TypeError, ValueError):
+                point = None
+        if point is None:
+            if samples and samples[-1] is not None:
+                samples.append(None)
+        else:
+            samples.append(point)
+        if len(samples) > 3600:
+            del samples[: len(samples) - 3600]
+        if channel == self.selected_channel and hasattr(self, "trajectory_canvas"):
+            self.trajectory_canvas.set_segmented_points(samples)
 
     def _start_legacy_infrared_loader(self) -> None:
         loader = self._infrared_loader_thread
@@ -2400,6 +2629,23 @@ class MachineVisionPage(_BaseWorkflowPage):
             self._infrared_loader_thread = None
             logger.exception("启动旧版红外图像加载线程失败: %s", exc)
             self._clear_infrared_display("红外相机未提供新图像")
+
+    @staticmethod
+    def _configured_display_max_age_seconds() -> float:
+        """Use the same live-preview age threshold as legacy Tab4."""
+        camera_config = global_setting.get_setting("camera_config", {}) or {}
+        trajectory_config = (
+            camera_config.get("MOUSE_TRAJECTORY", {})
+            if isinstance(camera_config, Mapping)
+            else {}
+        )
+        try:
+            return max(
+                float(trajectory_config.get("display_max_age_seconds", 2.0) or 2.0),
+                0.1,
+            )
+        except (TypeError, ValueError):
+            return 2.0
 
     def _stop_legacy_infrared_loader(self) -> None:
         loader = self._infrared_loader_thread
@@ -2624,6 +2870,7 @@ class MachineVisionPage(_BaseWorkflowPage):
         self._cancel_cage_calibration(update_status=False)
         self.selected_channel = channel
         for index, button in enumerate(self.channel_buttons, 1): button.setChecked(index == channel)
+        self.frame_label.set_detected_cage_points(self._detected_cage_points.get(channel, []))
         self._load_cage_calibration_overlay()
         self.refresh()
 
@@ -2635,10 +2882,42 @@ class MachineVisionPage(_BaseWorkflowPage):
             data = {}
         channel_id = int(channel or self.selected_channel)
         channel_data = data.get(str(channel_id), data.get(channel_id, {}))
-        if not isinstance(channel_data, Mapping):
-            return {}
-        value = channel_data.get("cage_frame_calibration", {})
+        value = channel_data.get("cage_frame_calibration", {}) if isinstance(channel_data, Mapping) else {}
+        if not isinstance(value, Mapping):
+            value = {}
+        if not value:
+            persisted = global_setting.get_setting("cage_frame_calibrations", {})
+            if isinstance(persisted, Mapping):
+                value = persisted.get(str(channel_id), persisted.get(channel_id, {}))
         return value if isinstance(value, Mapping) else {}
+
+    @staticmethod
+    def _order_cage_points(points: Iterable[Iterable[float]]) -> list[tuple[float, float]]:
+        """Order four arbitrary clicks as TL, TR, BR, BL and reject bad quads."""
+        parsed = [(float(point[0]), float(point[1])) for point in points]
+        if len(parsed) != 4:
+            raise ValueError("exactly four cage-frame points are required")
+        sums = [x + y for x, y in parsed]
+        diffs = [x - y for x, y in parsed]
+        indexes = [
+            min(range(4), key=sums.__getitem__),
+            max(range(4), key=diffs.__getitem__),
+            max(range(4), key=sums.__getitem__),
+            min(range(4), key=diffs.__getitem__),
+        ]
+        if len(set(indexes)) != 4:
+            raise ValueError("cage-frame points do not form four distinct corners")
+        ordered = [parsed[index] for index in indexes]
+        area = abs(
+            sum(
+                ordered[index][0] * ordered[(index + 1) % 4][1]
+                - ordered[(index + 1) % 4][0] * ordered[index][1]
+                for index in range(4)
+            )
+        ) / 2.0
+        if area <= 1.0:
+            raise ValueError("cage-frame quadrilateral area is too small")
+        return ordered
 
     def _load_cage_calibration_overlay(self) -> None:
         calibration = self._cage_calibration_entry()
@@ -2658,6 +2937,13 @@ class MachineVisionPage(_BaseWorkflowPage):
             self.cage_calibration_status.setText("使用算法检测鼠笼框；需要时可手动校准")
 
     def _update_cage_calibration_overlay(self) -> None:
+        # While the user is choosing four corners, ``CageCalibrationImage``
+        # owns the in-progress pixel points.  The live frame refresh runs every
+        # 250 ms; replacing those points here with the persisted calibration
+        # made every refresh erase the previous click, so the UI could never
+        # advance beyond 1/4.
+        if self._cage_calibration_mode:
+            return
         width, height = self._last_frame_size
         if width <= 0 or height <= 0:
             self.frame_label.set_calibration_points([])
@@ -2678,7 +2964,7 @@ class MachineVisionPage(_BaseWorkflowPage):
         self.confirm_cage_button.setVisible(True)
         self.cancel_cage_button.setVisible(True)
         self.confirm_cage_button.setEnabled(False)
-        self.cage_calibration_status.setText("请按顺序点击鼠笼框四角：左上、右上、右下、左下")
+        self.cage_calibration_status.setText("请点击鼠笼框的四个角点（顺序不限）")
 
     def _on_cage_calibration_point(self, _x: float, _y: float) -> None:
         if not self._cage_calibration_mode:
@@ -2708,6 +2994,11 @@ class MachineVisionPage(_BaseWorkflowPage):
         width, height = self._last_frame_size
         if len(points) != 4 or width <= 0 or height <= 0:
             self.cage_calibration_status.setText("需要在当前画面中选择四个角点")
+            return
+        try:
+            points = self._order_cage_points(points)
+        except (TypeError, ValueError) as exc:
+            self.cage_calibration_status.setText(f"四个角点无效，请重新校准：{exc}")
             return
         normalized = [[round(x / width, 8), round(y / height, 8)] for x, y in points]
         setting = global_setting.get_setting("experiment_setting", None)
@@ -2746,18 +3037,43 @@ class MachineVisionPage(_BaseWorkflowPage):
             "updated_at": time.time(),
         }
         global_setting.set_setting("cage_frame_calibrations", all_calibrations)
-        try:
-            from Module.monitor_camera.index import tab_4
-            trajectory_thread = getattr(tab_4, "shared_trajectory_thread", None)
-            setter = getattr(trajectory_thread, "set_manual_cage_corners", None)
-            if callable(setter):
-                setter(self.selected_channel, points, (width, height), source="manual_visible_light")
-        except Exception:
-            pass
         self._cage_calibration_points = [(x / width, y / height) for x, y in points]
         self._cancel_cage_calibration(update_status=False)
         self.frame_label.set_calibration_points(points)
-        self.cage_calibration_status.setText("校准完成；后续轨迹映射使用人工鼠笼框")
+        self.start_trajectory_thread()
+        applied = self._apply_selected_cage_calibration_to_service()
+        if applied:
+            self.cage_calibration_status.setText("校准完成；后续轨迹映射使用人工鼠笼框")
+        else:
+            self.cage_calibration_status.setText("校准已保存；轨迹服务就绪后自动应用")
+
+    def _apply_selected_cage_calibration_to_service(self) -> bool:
+        trajectory_thread = self.trajectory_thread
+        setter = getattr(trajectory_thread, "set_manual_cage_corners", None)
+        width, height = self._last_frame_size
+        if not callable(setter) or width <= 0 or height <= 0:
+            return False
+        calibration = self._cage_calibration_entry()
+        normalized = calibration.get("points_normalized", calibration.get("points", []))
+        try:
+            points = self._order_cage_points(
+                (float(point[0]) * width, float(point[1]) * height)
+                for point in normalized
+            )
+        except (TypeError, ValueError, IndexError):
+            return False
+        try:
+            return bool(
+                setter(
+                    self.selected_channel,
+                    points,
+                    (width, height),
+                    source="manual_visible_light",
+                )
+            )
+        except Exception as exc:  # pragma: no cover - worker shutdown race
+            logger.exception("应用鼠笼框四点校准失败: %s", exc)
+            return False
 
     def _trajectory_records(self, channel: Optional[int] = None, limit: Optional[int] = None) -> list[dict[str, Any]]:
         """Read persisted XYZ records for one channel.
@@ -2940,8 +3256,18 @@ class MachineVisionPage(_BaseWorkflowPage):
         return classified
 
     def refresh(self) -> None:
-        frame = shared_video_frame_store.read_frame("deep_camera", self.selected_channel, max_age_seconds=2.0)
-        frame_available = frame is not None and frame.get("frame") is not None
+        fresh_frame = shared_video_frame_store.read_frame(
+            "deep_camera",
+            self.selected_channel,
+            max_age_seconds=self._display_max_age_seconds,
+        )
+        frame_available = fresh_frame is not None and fresh_frame.get("frame") is not None
+        if frame_available:
+            # Match old Tab4: a transient shared-memory miss must not replace a
+            # valid preview with an empty placeholder.  Keep the last complete
+            # payload per cage and replace it only after another valid read.
+            self._last_good_video_frames[int(self.selected_channel)] = fresh_frame
+        frame = fresh_frame or self._last_good_video_frames.get(int(self.selected_channel))
         if frame is None:
             self._last_frame_size = (0, 0)
             self.frame_label.clear_frame_image(); self.frame_label.setText("轨迹相机无新帧（未启用或画面超时）")
@@ -2961,7 +3287,11 @@ class MachineVisionPage(_BaseWorkflowPage):
         # P5 is a live view; keep the recent window bounded.  P6 explicitly
         # requests the complete history for comparison and export.
         records = self._trajectory_records(limit=500); points = [item["point"] for item in records]
-        self.trajectory_canvas.set_points(points)
+        live_samples = self._live_trajectory_samples.get(int(self.selected_channel), [])
+        if any(sample is not None for sample in live_samples):
+            self.trajectory_canvas.set_segmented_points(live_samples)
+        else:
+            self.trajectory_canvas.set_points(points)
         self._render_infrared_image()
         behavior_categories = self._configured_behavior_categories(self.selected_channel)
         behavior = self._classify(records, behavior_categories)

@@ -453,49 +453,69 @@ class MainWindow_Index(ThemedWindow):
             self.stop_experiment()
         # 关闭所有串口
 
-    def closeEvent(self, event):
+    def _experiment_needs_stop_before_close(self):
+        """Return whether closing must wait for the experiment stop/export flow."""
         app_state = global_setting.get_setting("app_state", AppState.INITIALIZED)
-        logger.info(
-            "[SHUTDOWN_DIAGNOSTIC] Main window closeEvent received "
-            f"| app_state={app_state} | open_windows={len(self.open_windows)} "
-            f"| spontaneous={event.spontaneous()}"
+        return (
+            app_state == AppState.MONITORING
+            or self.workflow_run_state in {
+                ExperimentRunState.RUNNING,
+                ExperimentRunState.STOPPING,
+            }
         )
-        if len(self.open_windows)!=0:
-            # 可选择使用 QMessageBox 来确认是否关闭
-            if app_state == AppState.MONITORING:
-                message="当前正在实验中，且还有其他子窗口未关闭,退出程序将停止实验，你确定要退出程序吗？"
-            else:
-                message ="当前还有其他子窗口未关闭，你确定要退出程序吗？"
-            reply = QMessageBox.question(self, '关闭窗口',
-                                         message,
-                                         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                                         QMessageBox.StandardButton.No)
+
+    def _close_after_stop_if_requested(self):
+        """Close the main window only after stop and data export have completed."""
+        if not self._close_after_stop or self.workflow_run_state != ExperimentRunState.STOPPED:
+            return
+        self._close_after_stop = False
+        self._close_without_confirmation = True
+        QTimer.singleShot(0, self.close)
+
+    def closeEvent(self, event):
+        if self._close_without_confirmation:
+            self._close_without_confirmation = False
+            event.accept()
+            return
+
+        if len(self.open_windows) != 0:
+            reply = QMessageBox.question(
+                self,
+                '关闭窗口',
+                "当前还有其他子窗口未关闭，你确定要退出程序吗？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
             if reply == QMessageBox.StandardButton.Yes:
                 for window in self.open_windows:
                     self.close_window_handle()
-                    window.close()
-                # 关闭所有窗口
-                QApplication.closeAllWindows()
-                event.accept()  # 关闭窗口
+                window.close()
+                if self._experiment_needs_stop_before_close():
+                    self._close_after_stop = True
+                    self.setEnabled(False)
+                    event.ignore()
+                else:
+                    event.accept()
             else:
-                event.ignore()  # 忽略关闭事件
+                event.ignore()
         else:
-            # 可选择使用 QMessageBox 来确认是否关闭
-            if app_state == AppState.MONITORING:
-                message = "当前正在实验中,退出程序将停止实验，你确定要退出程序吗？"
-            else:
-                message = "你确定要退出程序吗？"
-            reply = QMessageBox.question(self, '关闭窗口',
-                                         message,
-                                         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                                         QMessageBox.StandardButton.No)
+            reply = QMessageBox.question(
+                self,
+                '关闭窗口',
+                "你确定要退出程序吗？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
             if reply == QMessageBox.StandardButton.Yes:
                 self.close_window_handle()
-                # 关闭所有窗口
-                QApplication.closeAllWindows()
-                event.accept()  # 关闭窗口
+                if self._experiment_needs_stop_before_close():
+                    self._close_after_stop = True
+                    self.setEnabled(False)
+                    event.ignore()
+                else:
+                    event.accept()
             else:
-                event.ignore()  # 忽略关闭事件
+                event.ignore()
         pass
     def setup_tutorial(self):
         # The redesigned main window no longer exposes the legacy menu and
@@ -708,6 +728,8 @@ class MainWindow_Index(ThemedWindow):
         self.stop_export_finished = True
         self.stop_dialog_close_pending = False
         self.pending_stop_export_success_path = None
+        self._close_after_stop = False
+        self._close_without_confirmation = False
         self.periodic_export_timer = QTimer(self)
         self.periodic_export_timer.setSingleShot(False)
         self.periodic_export_timer.setInterval(self._get_periodic_export_interval_ms())
@@ -3234,6 +3256,9 @@ class MainWindow_Index(ThemedWindow):
         # Export success is independent from device-stop warnings.  The old
         # workflow always showed the successfully saved workbook.
         self._show_pending_stop_export_success_message()
+        close_after_stop = getattr(self, "_close_after_stop_if_requested", None)
+        if callable(close_after_stop):
+            close_after_stop()
 
     def _on_stop_experiment_timeout(self):
         if self.workflow_run_state == ExperimentRunState.STOPPING:

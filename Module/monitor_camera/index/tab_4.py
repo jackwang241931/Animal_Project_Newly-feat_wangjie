@@ -726,6 +726,179 @@ class TrajectoryFrameSubmitterThread(MyQThread):
             time.sleep(self.poll_interval_seconds)
 
 
+def _wait_for_trajectory_thread_responsive(thread, timeout_ms: int) -> bool:
+    """Wait for a shared trajectory worker without freezing the Qt UI."""
+    if thread is None or not thread.isRunning():
+        return True
+
+    app = QApplication.instance()
+    if app is None or QThread.currentThread() != app.thread():
+        return thread.wait(timeout_ms)
+
+    wait_loop = QEventLoop()
+    poll_timer = QTimer()
+    timeout_timer = QTimer()
+    timeout_timer.setSingleShot(True)
+
+    def stop_wait_if_finished():
+        if not thread.isRunning():
+            wait_loop.quit()
+
+    poll_timer.timeout.connect(stop_wait_if_finished)
+    timeout_timer.timeout.connect(wait_loop.quit)
+    thread.finished.connect(wait_loop.quit)
+    poll_timer.start(20)
+    timeout_timer.start(max(int(timeout_ms), 0))
+    wait_loop.exec(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+    poll_timer.stop()
+    timeout_timer.stop()
+    try:
+        thread.finished.disconnect(wait_loop.quit)
+    except (TypeError, RuntimeError):
+        pass
+    return not thread.isRunning()
+
+
+def attach_shared_trajectory_service(consumer):
+    """Attach a view to the legacy trajectory service and frame submitter.
+
+    ``None`` means that the trajectory module is still loading, or that the
+    previous service is finalizing.  Callers may retry after the loader emits
+    ``loaded``.  Keeping this lifecycle in one place lets both the legacy Tab4
+    page and the new workflow machine-vision page consume the same service.
+    """
+    global shared_trajectory_thread
+    global shared_trajectory_submitter_thread
+
+    with trajectory_module_loader_lock:
+        trajectory_class = mouse_trajectory_thread_class
+
+    with trajectory_service_lock:
+        trajectory_thread = shared_trajectory_thread
+        if trajectory_thread is not None and trajectory_thread.isRunning():
+            is_finishing = (
+                not getattr(trajectory_thread, "accepting_frames", True)
+                or getattr(trajectory_thread, "finish_after_drain", False)
+                or getattr(trajectory_thread, "final_outputs_done", False)
+            )
+            if is_finishing:
+                logger.warning(
+                    "shared mouse trajectory service is finishing; attach is deferred"
+                )
+                return None
+            if trajectory_thread.isPaused():
+                trajectory_thread.resume()
+        else:
+            if trajectory_class is None:
+                return None
+            stale_submitter = shared_trajectory_submitter_thread
+            if stale_submitter is not None and stale_submitter.isRunning():
+                stale_submitter.stop()
+                stale_submitter.requestInterruption()
+                stale_submitter.wait(2000)
+            shared_trajectory_submitter_thread = None
+            trajectory_thread = trajectory_class()
+            shared_trajectory_thread = trajectory_thread
+            trajectory_thread.start()
+            logger.info(
+                f"shared mouse trajectory service started: object_id={id(trajectory_thread)}"
+            )
+            _emit_runtime_diagnostic(
+                "trajectory_service",
+                f"action=start, object_id={id(trajectory_thread)}",
+                logical_thread_name="gui_main",
+            )
+
+        trajectory_service_consumers.add(consumer)
+        consumer.trajectory_thread = trajectory_thread
+        submitter = shared_trajectory_submitter_thread
+        if submitter is None or not submitter.isRunning():
+            submitter = TrajectoryFrameSubmitterThread(trajectory_thread)
+            shared_trajectory_submitter_thread = submitter
+            submitter.start()
+        elif submitter.isPaused():
+            submitter.resume()
+        consumer.trajectory_submitter_thread = submitter
+        _emit_runtime_diagnostic(
+            "trajectory_service",
+            f"action=attach_view, object_id={id(trajectory_thread)}, "
+            f"consumer_count={len(trajectory_service_consumers)}",
+            logical_thread_name="gui_main",
+        )
+        return trajectory_thread
+
+
+def detach_shared_trajectory_service(consumer) -> bool:
+    """Detach one view and finalize only after the final consumer leaves."""
+    global shared_trajectory_thread
+    global shared_trajectory_submitter_thread
+
+    with trajectory_service_lock:
+        trajectory_thread = getattr(consumer, "trajectory_thread", None)
+        trajectory_service_consumers.discard(consumer)
+        other_consumers = [
+            item
+            for item in trajectory_service_consumers
+            if getattr(item, "trajectory_thread", None) is trajectory_thread
+        ]
+        if trajectory_thread is None or other_consumers:
+            consumer.trajectory_thread = None
+            consumer.trajectory_submitter_thread = None
+            return True
+
+        submitter = shared_trajectory_submitter_thread
+        shared_trajectory_submitter_thread = None
+
+    if submitter is not None and submitter.isRunning():
+        submitter.stop()
+        submitter.requestInterruption()
+        _wait_for_trajectory_thread_responsive(submitter, 2000)
+
+    if trajectory_thread.isRunning():
+        trajectory_thread.request_finish_after_drain()
+        camera_config = global_setting.get_setting("camera_config") or {}
+        trajectory_config = (
+            camera_config.get("MOUSE_TRAJECTORY", {})
+            if isinstance(camera_config, dict)
+            else {}
+        )
+        finalize_timeout_seconds = max(
+            float(
+                trajectory_config.get(
+                    "trajectory_finalize_timeout_seconds",
+                    60,
+                )
+                or 60
+            ),
+            2.0,
+        )
+        _wait_for_trajectory_thread_responsive(
+            trajectory_thread,
+            int(finalize_timeout_seconds * 1000),
+        )
+    if trajectory_thread.isRunning():
+        logger.error(
+            "mouse trajectory finalization timed out; final trajectory output may be incomplete"
+        )
+        return False
+
+    trajectory_thread.finalize_outputs()
+    with trajectory_service_lock:
+        if shared_trajectory_thread is trajectory_thread:
+            shared_trajectory_thread = None
+    consumer.trajectory_thread = None
+    consumer.trajectory_submitter_thread = None
+    logger.info(
+        f"shared mouse trajectory service stopped: object_id={id(trajectory_thread)}"
+    )
+    _emit_runtime_diagnostic(
+        "trajectory_service",
+        f"action=stop, object_id={id(trajectory_thread)}",
+        logical_thread_name="gui_main",
+    )
+    return True
+
+
 class AutoFitGraphicsView(QGraphicsView):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1894,9 +2067,6 @@ class Tab_4(ThemedWindow):
         self.connected_trajectory_signal_thread = None
 
     def start_trajectory_thread(self):
-        global shared_trajectory_thread
-        global shared_trajectory_submitter_thread
-
         with trajectory_module_loader_lock:
             trajectory_class = mouse_trajectory_thread_class
         with trajectory_service_lock:
@@ -1908,62 +2078,9 @@ class Tab_4(ThemedWindow):
         if needs_new_service and trajectory_class is None:
             self._request_trajectory_module_load()
             return
-
-        with trajectory_service_lock:
-            trajectory_thread = shared_trajectory_thread
-            if trajectory_thread is not None and trajectory_thread.isRunning():
-                is_finishing = (
-                    not getattr(trajectory_thread, "accepting_frames", True)
-                    or getattr(trajectory_thread, "finish_after_drain", False)
-                    or getattr(trajectory_thread, "final_outputs_done", False)
-                )
-                if is_finishing:
-                    logger.warning(
-                        "shared mouse trajectory service is finishing; start is deferred"
-                    )
-                    return
-                if trajectory_thread.isPaused():
-                    trajectory_thread.resume()
-            else:
-                stale_submitter = shared_trajectory_submitter_thread
-                if stale_submitter is not None and stale_submitter.isRunning():
-                    stale_submitter.stop()
-                    stale_submitter.requestInterruption()
-                    stale_submitter.wait(2000)
-                shared_trajectory_submitter_thread = None
-                if trajectory_class is None:
-                    QTimer.singleShot(0, self._request_trajectory_module_load)
-                    return
-                trajectory_thread = trajectory_class()
-                shared_trajectory_thread = trajectory_thread
-                trajectory_thread.start()
-                logger.info(
-                    f"shared mouse trajectory service started: object_id={id(trajectory_thread)}"
-                )
-                _emit_runtime_diagnostic(
-                    "trajectory_service",
-                    f"action=start, object_id={id(trajectory_thread)}",
-                    logical_thread_name="gui_main",
-                )
-
-            trajectory_service_consumers.add(self)
-            self.trajectory_thread = trajectory_thread
+        trajectory_thread = attach_shared_trajectory_service(self)
+        if trajectory_thread is not None:
             self._connect_trajectory_signal(trajectory_thread)
-
-            submitter = shared_trajectory_submitter_thread
-            if submitter is None or not submitter.isRunning():
-                submitter = TrajectoryFrameSubmitterThread(trajectory_thread)
-                shared_trajectory_submitter_thread = submitter
-                submitter.start()
-            elif submitter.isPaused():
-                submitter.resume()
-            self.trajectory_submitter_thread = submitter
-            _emit_runtime_diagnostic(
-                "trajectory_service",
-                f"action=attach_view, object_id={id(trajectory_thread)}, "
-                f"consumer_count={len(trajectory_service_consumers)}",
-                logical_thread_name="gui_main",
-            )
 
     def start_trajectory_submitter_thread(self):
         self.start_trajectory_thread()
@@ -1991,105 +2108,11 @@ class Tab_4(ThemedWindow):
 
     @staticmethod
     def _wait_for_thread_responsive(thread, timeout_ms: int) -> bool:
-        if thread is None or not thread.isRunning():
-            return True
-
-        app = QApplication.instance()
-        if app is None or QThread.currentThread() != app.thread():
-            return thread.wait(timeout_ms)
-
-        wait_loop = QEventLoop()
-        poll_timer = QTimer()
-        timeout_timer = QTimer()
-        timeout_timer.setSingleShot(True)
-
-        def stop_wait_if_finished():
-            if not thread.isRunning():
-                wait_loop.quit()
-
-        poll_timer.timeout.connect(stop_wait_if_finished)
-        timeout_timer.timeout.connect(wait_loop.quit)
-        thread.finished.connect(wait_loop.quit)
-        poll_timer.start(20)
-        timeout_timer.start(max(int(timeout_ms), 0))
-        wait_loop.exec(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
-        poll_timer.stop()
-        timeout_timer.stop()
-        try:
-            thread.finished.disconnect(wait_loop.quit)
-        except (TypeError, RuntimeError):
-            pass
-        return not thread.isRunning()
+        return _wait_for_trajectory_thread_responsive(thread, timeout_ms)
 
     def stop_trajectory_thread(self) -> bool:
-        global shared_trajectory_thread
-        global shared_trajectory_submitter_thread
-
-        with trajectory_service_lock:
-            trajectory_thread = self.trajectory_thread
-            trajectory_service_consumers.discard(self)
-            self._disconnect_trajectory_signal()
-            other_consumers = [
-                consumer
-                for consumer in trajectory_service_consumers
-                if getattr(consumer, "trajectory_thread", None) is trajectory_thread
-            ]
-            if trajectory_thread is None or other_consumers:
-                self.trajectory_thread = None
-                self.trajectory_submitter_thread = None
-                return True
-
-            submitter = shared_trajectory_submitter_thread
-            shared_trajectory_submitter_thread = None
-
-        if submitter is not None and submitter.isRunning():
-            submitter.stop()
-            submitter.requestInterruption()
-            self._wait_for_thread_responsive(submitter, 2000)
-
-        if trajectory_thread.isRunning():
-            trajectory_thread.request_finish_after_drain()
-            camera_config = global_setting.get_setting("camera_config") or {}
-            trajectory_config = (
-                camera_config.get("MOUSE_TRAJECTORY", {})
-                if isinstance(camera_config, dict)
-                else {}
-            )
-            finalize_timeout_seconds = max(
-                float(
-                    trajectory_config.get(
-                        "trajectory_finalize_timeout_seconds",
-                        60,
-                    )
-                    or 60
-                ),
-                2.0,
-            )
-            self._wait_for_thread_responsive(
-                trajectory_thread,
-                int(finalize_timeout_seconds * 1000),
-            )
-        if trajectory_thread.isRunning():
-            logger.error(
-                "mouse trajectory finalization timed out; final trajectory output may be incomplete"
-            )
-            return False
-
-        trajectory_thread.finalize_outputs()
-        with trajectory_service_lock:
-            if shared_trajectory_thread is trajectory_thread:
-                shared_trajectory_thread = None
-        self.trajectory_thread = None
-        self.trajectory_submitter_thread = None
-        logger.info(
-            f"shared mouse trajectory service stopped: object_id={id(trajectory_thread)}"
-        )
-        _emit_runtime_diagnostic(
-            "trajectory_service",
-            f"action=stop, object_id={id(trajectory_thread)}",
-            logical_thread_name="gui_main",
-        )
-        return True
+        self._disconnect_trajectory_signal()
+        return detach_shared_trajectory_service(self)
 
     def pause_loader_thread(self):
         if self.loader_thread is None:
@@ -2563,4 +2586,3 @@ class Tab_4(ThemedWindow):
             self.right_panel.show_custom_widget(self.temperature_widget)
         else:
             self.right_panel.show_placeholder("暂无温度数据")
-

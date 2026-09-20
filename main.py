@@ -150,6 +150,23 @@ def release_single_instance_lock():
         lock_handle.close()
 
 
+def close_multiprocessing_queue_now(queue_obj):
+    """Release an IPC queue without blocking process shutdown on its feeder."""
+    if queue_obj is None:
+        return
+    try:
+        # At shutdown there are no consumers left to drain diagnostic or
+        # health snapshots.  Do not let Queue.join_thread() hold the main
+        # controller open while waiting for an already-closed pipe.
+        queue_obj.cancel_join_thread()
+    except (AttributeError, OSError, ValueError):
+        pass
+    try:
+        queue_obj.close()
+    except (AttributeError, OSError, ValueError):
+        pass
+
+
 def emit_runtime_diagnostic(source, event, message, pid=None):
     global runtime_diagnostics_dropped
     if runtime_diagnostics_queue is None:
@@ -740,18 +757,19 @@ def test_integrated_monitor():
         except (queue_module.Full, BrokenPipeError, EOFError, OSError):
             pass
         diagnostics_thread.join(timeout=5)
-        try:
-            runtime_diagnostics_queue.close()
-            runtime_diagnostics_queue.join_thread()
-        except (AttributeError, OSError, ValueError):
-            pass
+        if diagnostics_thread.is_alive():
+            close_multiprocessing_queue_now(runtime_diagnostics_queue)
+            diagnostics_thread.join(timeout=1)
+        else:
+            close_multiprocessing_queue_now(runtime_diagnostics_queue)
         runtime_diagnostics_queue = None
-        try:
-            system_health_snapshot_queue.close()
-            system_health_snapshot_queue.join_thread()
-        except (AttributeError, OSError, ValueError):
-            pass
+        close_multiprocessing_queue_now(system_health_snapshot_queue)
         system_health_snapshot_queue = None
+        close_multiprocessing_queue_now(getattr(monitor, "exception_queue", None))
+        for process_info in getattr(monitor, "processes", {}).values():
+            close_multiprocessing_queue_now(process_info.get("health_queue"))
+        close_multiprocessing_queue_now(q)
+        close_multiprocessing_queue_now(send_message_q)
         process_health_reporters = {}
         release_single_instance_lock()
     return True
