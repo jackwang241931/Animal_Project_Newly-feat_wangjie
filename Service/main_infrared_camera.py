@@ -1267,10 +1267,10 @@ def init_camera_and_image_handle_thread(serials):
     with infrared_connect_lock:
         is_used_ports.clear()
 
-    path = (
-        str(resolve_project_path(global_setting.get_setting("camera_config")['STORAGE']['fold_path']))
-        + global_setting.get_setting("camera_config")['INFRARED_CAMERA']['path']
-    )
+    camera_config = global_setting.get_setting("camera_config")
+    storage_root = resolve_project_path(camera_config['STORAGE']['fold_path'])
+    infrared_path = str(camera_config['INFRARED_CAMERA'].get('path', 'infrared_camera/')).strip('/\\')
+    path = str(storage_root / infrared_path)
     camera_config_temp = global_setting.get_setting("camera_config")
     camera_config_temp['INFRARED_CAMERA']['nums'] = len(serials)
     global_setting.set_setting("camera_config", camera_config_temp)
