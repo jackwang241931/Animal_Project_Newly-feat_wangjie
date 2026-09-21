@@ -81,7 +81,7 @@ class Main_com_assistant(BaseModule):
         pass
     def get_title(self):
         """获取组件title"""
-        return "串口调试（旧版本）"
+        return "串口调试"
     def get_menu_name(self):
         """返回组件所属菜单{id:,text:} 在./config/gui_config.ini文件查看"""
         return {"id":3,"text":"数据分析"}

@@ -3116,7 +3116,7 @@ class MachineVisionPage(_BaseWorkflowPage):
         infrared_card.setMinimumHeight(350)
         infrared_card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         infrared_layout = infrared_card.layout(); self.infrared_label = QLabel("红外相机未提供新图像"); self.infrared_label.setAlignment(Qt.AlignmentFlag.AlignCenter); self.infrared_label.setMinimumSize(360, 280); self.infrared_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding); infrared_layout.addWidget(self.infrared_label, 1)
-        trajectory_card, _, _ = self._card("笼内三维行动轨迹", "", "每 1 分钟更新一次图像；轨迹使用实时 XYZ 数据")
+        trajectory_card, _, _ = self._card("笼内三维行动轨迹", "", "实时更新轨迹数据；轨迹使用实时 XYZ 数据")
         trajectory_card.setMinimumHeight(620)
         trajectory_card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         trajectory_layout = trajectory_card.layout(); self.trajectory_canvas = TrajectoryCanvas(); self.trajectory_canvas.setMinimumSize(460, 540); self.trajectory_canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding); trajectory_layout.addWidget(self.trajectory_canvas, 1)
@@ -3244,7 +3244,7 @@ class MachineVisionPage(_BaseWorkflowPage):
             self._cage_calibration_points = []
             self._update_cage_calibration_overlay()
             self.cage_calibration_status.setText(
-                "使用旧版算法自动检测鼠笼框；需要时可手动校准"
+                "使用算法自动检测鼠笼框；需要时可手动校准"
             )
             return
         calibration = self._cage_calibration_entry()
