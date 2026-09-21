@@ -1295,7 +1295,6 @@ class MouseTrajectoryThread(MyQThread):
         self.ref_corners = extract_box_corners(ref_result)
         if self.ref_corners is None:
             raise RuntimeError(f"could not detect reference box corners from {self.reference_image_path}")
-        self._load_manual_cage_calibrations()
 
     def _write_jpg_atomic(self, output_path: Path, image: Any) -> bool:
         ok, encoded = cv2.imencode(
@@ -3493,7 +3492,20 @@ class MouseTrajectoryThread(MyQThread):
             schema_version = int(json_data.get("schemaVersion", 1) or 1)
             source = str(json_data.get("source", "fixed_box_json") or "fixed_box_json")
             # Legacy cache files were generated from mask->minAreaRect and should be re-detected.
-            if schema_version < 2 or source == "fixed_box_json":
+            # A previous workflow-page build injected its persisted manual
+            # overlay during service startup. That bypassed the legacy YOLO
+            # cage-frame calibration entirely. Only accept a manual cache
+            # when the operator explicitly calibrated this cage in the
+            # current service session; otherwise let the old automatic
+            # detector run and replace the stale cache.
+            if (
+                schema_version < 2
+                or source == "fixed_box_json"
+                or (
+                    source == "manual_visible_light"
+                    and int(cage_number) not in self.manual_cage_calibrations
+                )
+            ):
                 return None
             corners = BoxCorners(
                 [dict(point) for point in json_data.get("corners", [])],

@@ -2513,6 +2513,7 @@ class MachineVisionPage(_BaseWorkflowPage):
         self._display_max_age_seconds = 2.0
         self._cage_calibration_mode = False
         self._cage_calibration_points: list[tuple[float, float]] = []
+        self._manual_calibration_active_channels: set[int] = set()
         self._detected_cage_points: dict[int, list[dict[str, float]]] = {}
 
         self._live_trajectory_samples: dict[int, list[Optional[tuple[float, float, float]]]] = {}
@@ -2629,6 +2630,29 @@ class MachineVisionPage(_BaseWorkflowPage):
                 return []
         return parsed[:4] if len(parsed) >= 4 else []
 
+    @staticmethod
+    def _draw_legacy_cage_corners(frame: Any, corners: Any) -> Any:
+        """Draw the cage polygon into the video frame exactly as old Tab4 did."""
+        try:
+            display_frame = frame.copy()
+        except (AttributeError, MemoryError, SystemError):
+            return frame
+        normalized = MachineVisionPage._normalize_detected_cage_points(corners)
+        if len(normalized) != 4:
+            return display_frame
+        try:
+            import cv2
+            import numpy as np
+
+            points = np.array(
+                [[point["x"], point["y"]] for point in normalized],
+                dtype=np.int32,
+            )
+            cv2.polylines(display_frame, [points], True, (0, 255, 255), 2)
+        except Exception as exc:  # pragma: no cover - optional image backend
+            logger.debug("绘制旧版鼠笼框失败: %s", exc)
+        return display_frame
+
     def _sync_detected_cage_points_from_service(self, channel: Optional[int] = None) -> list[dict[str, float]]:
         """Keep the old page's last-good cage frame visible between results.
 
@@ -2687,7 +2711,6 @@ class MachineVisionPage(_BaseWorkflowPage):
                 set_preview_cage(self.selected_channel)
             self._connect_trajectory_signal(trajectory_thread)
             self._sync_detected_cage_points_from_service(self.selected_channel)
-            self._apply_selected_cage_calibration_to_service()
         except Exception as exc:  # pragma: no cover - model/hardware dependent
             logger.exception("启动旧版轨迹服务失败: %s", exc)
             if hasattr(self, "cage_calibration_status"):
@@ -2718,9 +2741,6 @@ class MachineVisionPage(_BaseWorkflowPage):
             # Match legacy Tab4: retain the latest valid frame and reuse it
             # when the next result is a blank/failed sample.
             self._detected_cage_points[channel] = corners
-            if channel == self.selected_channel and hasattr(self, "frame_label"):
-                self.frame_label.set_detected_cage_points(corners)
-
 
         # A normal frame result always carries ``solved``.  A missing solution
         # is a real blank sample and therefore terminates the current line;
@@ -3026,8 +3046,8 @@ class MachineVisionPage(_BaseWorkflowPage):
             if callable(set_preview):
                 set_preview(channel)
         for index, button in enumerate(self.channel_buttons, 1): button.setChecked(index == channel)
-        detected_points = self._sync_detected_cage_points_from_service(channel)
-        self.frame_label.set_detected_cage_points(detected_points)
+        self._sync_detected_cage_points_from_service(channel)
+        self.frame_label.set_detected_cage_points([])
         self._load_cage_calibration_overlay()
         self.refresh()
 
@@ -3077,6 +3097,17 @@ class MachineVisionPage(_BaseWorkflowPage):
         return ordered
 
     def _load_cage_calibration_overlay(self) -> None:
+        # Match the old page: every application start uses automatic cage-frame
+        # detection. A persisted manual overlay must not silently replace it.
+        # Manual points become active only after the operator confirms them in
+        # this running session.
+        if self.selected_channel not in self._manual_calibration_active_channels:
+            self._cage_calibration_points = []
+            self._update_cage_calibration_overlay()
+            self.cage_calibration_status.setText(
+                "使用旧版算法自动检测鼠笼框；需要时可手动校准"
+            )
+            return
         calibration = self._cage_calibration_entry()
         points = calibration.get("points_normalized", calibration.get("points", []))
         normalized: list[tuple[float, float]] = []
@@ -3099,8 +3130,12 @@ class MachineVisionPage(_BaseWorkflowPage):
         # 250 ms; replacing those points here with the persisted calibration
         # made every refresh erase the previous click, so the UI could never
         # advance beyond 1/4.
-        detected_points = self._sync_detected_cage_points_from_service(self.selected_channel)
-        self.frame_label.set_detected_cage_points(detected_points)
+        self._sync_detected_cage_points_from_service(self.selected_channel)
+        # The old page drew the yellow cage polygon into the BGR frame before
+        # converting it to a QPixmap. Keep the QLabel overlay exclusively for
+        # in-progress/manual calibration points so the automatic frame follows
+        # the exact legacy display path.
+        self.frame_label.set_detected_cage_points([])
         if self._cage_calibration_mode:
             return
         width, height = self._last_frame_size
@@ -3196,6 +3231,7 @@ class MachineVisionPage(_BaseWorkflowPage):
             "updated_at": time.time(),
         }
         global_setting.set_setting("cage_frame_calibrations", all_calibrations)
+        self._manual_calibration_active_channels.add(int(self.selected_channel))
         self._cage_calibration_points = [(x / width, y / height) for x, y in points]
         self._cancel_cage_calibration(update_status=False)
         self.frame_label.set_calibration_points(points)
@@ -3434,7 +3470,15 @@ class MachineVisionPage(_BaseWorkflowPage):
         else:
             array = frame.get("frame")
             if array is not None:
-                rgb = array[:, :, ::-1].copy() if getattr(array, "ndim", 0) == 3 else array.copy()
+                detected_points = self._sync_detected_cage_points_from_service(
+                    self.selected_channel
+                )
+                display_array = self._draw_legacy_cage_corners(array, detected_points)
+                rgb = (
+                    display_array[:, :, ::-1].copy()
+                    if getattr(display_array, "ndim", 0) == 3
+                    else display_array.copy()
+                )
                 height, width = rgb.shape[:2]
                 self._last_frame_size = (int(width), int(height))
                 image = QImage(rgb.data, width, height, rgb.strides[0], QImage.Format.Format_RGB888).copy()
