@@ -7,6 +7,7 @@ from public.config_class.App_Setting import AppSettings
 from public.config_class.global_setting import global_setting
 from public.config_class.ini_parser import ini_parser
 from public.entity.enum.Public_Enum import AppState
+from public.util.project_paths import PROJECT_ROOT
 from theme.ThemeManager import ThemeManager
 
 
@@ -43,7 +44,7 @@ def _init_environment_module_only(config):
 def load_global_setting():
     config_path = "/config"
     # 加载配置
-    config_file_path = os.getcwd() + config_path + "/gui_config.ini"
+    config_file_path = str(PROJECT_ROOT / "config" / "gui_config.ini")
     # 串口配置数据{"section":{"key1":value1,"key2":value2,....}，...}
     configer = ini_parser(config_file_path).read()
     if (len(configer) != 0):
@@ -57,7 +58,7 @@ def load_global_setting():
     global_setting.set_setting("app_setting", app_setting)
 
     # 加载相机配置
-    config_file_path = os.getcwd() + config_path + "/camera_config.ini"
+    config_file_path = str(PROJECT_ROOT / "config" / "camera_config.ini")
     # 串口配置数据{"section":{"key1":value1,"key2":value2,....}，...}
     config = ini_parser(config_file_path).read()
     if (len(config) != 0):
@@ -66,7 +67,7 @@ def load_global_setting():
         logger.error("相机配置文件读取失败。")
     global_setting.set_setting("camera_config", config)
     # 加载监控数据配置
-    config_file_path = os.getcwd() + config_path + "/monitor_datas_config.ini"
+    config_file_path = str(PROJECT_ROOT / "config" / "monitor_datas_config.ini")
     # 配置数据{"section":{"key1":value1,"key2":value2,....}，...}
     config = ini_parser(config_file_path).read()
     if (len(config) != 0):
@@ -75,7 +76,7 @@ def load_global_setting():
         logger.error("监控配置文件读取失败。")
     global_setting.set_setting("monitor_data", config)
     _init_environment_module_only(config)
-    config_file_path = os.getcwd() + config_path+"/UFC_UGC_ZOS_Test.ini"
+    config_file_path = str(PROJECT_ROOT / "config" / "UFC_UGC_ZOS_Test.ini")
     config = ini_parser(config_file_path).read()
     if len(config) != 0:
         logger.info("UFC_UGC_ZOS_config配置文件读取成功。")
@@ -103,7 +104,7 @@ def load_global_setting():
 def load_global_setting_without_Qt():
     config_path = "/config"
     # 加载配置
-    config_file_path = os.getcwd() + config_path + "/gui_config.ini"
+    config_file_path = str(PROJECT_ROOT / "config" / "gui_config.ini")
     # 串口配置数据{"section":{"key1":value1,"key2":value2,....}，...}
     configer = ini_parser(config_file_path).read()
     if (len(configer) != 0):
@@ -117,7 +118,7 @@ def load_global_setting_without_Qt():
     global_setting.set_setting("app_setting", app_setting)
 
     # 加载相机配置
-    config_file_path = os.getcwd() + config_path + "/camera_config.ini"
+    config_file_path = str(PROJECT_ROOT / "config" / "camera_config.ini")
     # 串口配置数据{"section":{"key1":value1,"key2":value2,....}，...}
     config = ini_parser(config_file_path).read()
     if (len(config) != 0):
@@ -126,7 +127,7 @@ def load_global_setting_without_Qt():
         logger.error("相机配置文件读取失败。")
     global_setting.set_setting("camera_config", config)
     # 加载监控数据配置
-    config_file_path = os.getcwd() + config_path + "/monitor_datas_config.ini"
+    config_file_path = str(PROJECT_ROOT / "config" / "monitor_datas_config.ini")
     # 配置数据{"section":{"key1":value1,"key2":value2,....}，...}
     config = ini_parser(config_file_path).read()
     if (len(config) != 0):
@@ -135,7 +136,7 @@ def load_global_setting_without_Qt():
         logger.error("监控配置文件读取失败。")
     global_setting.set_setting("monitor_data", config)
     _init_environment_module_only(config)
-    config_file_path = os.getcwd() + config_path + "/UFC_UGC_ZOS_Test.ini"
+    config_file_path = str(PROJECT_ROOT / "config" / "UFC_UGC_ZOS_Test.ini")
     config = ini_parser(config_file_path).read()
     if len(config) != 0:
         logger.info("UFC_UGC_ZOS_config配置文件读取成功。")
@@ -161,7 +162,7 @@ def load_global_setting_without_Qt():
 def load_global_setting_without_Qt_for_subprocess():
     config_path = "/config"
     # 加载配置
-    config_file_path = "../" + config_path + "/gui_config.ini"
+    config_file_path = str(PROJECT_ROOT / "config" / "gui_config.ini")
     # 串口配置数据{"section":{"key1":value1,"key2":value2,....}，...}
     configer = ini_parser(config_file_path).read()
     if (len(configer) != 0):
@@ -175,7 +176,7 @@ def load_global_setting_without_Qt_for_subprocess():
     global_setting.set_setting("app_setting", app_setting)
 
     # 加载相机配置
-    config_file_path = "../"  + config_path + "/camera_config.ini"
+    config_file_path = str(PROJECT_ROOT / "config" / "camera_config.ini")
     # 串口配置数据{"section":{"key1":value1,"key2":value2,....}，...}
     config = ini_parser(config_file_path).read()
     if (len(config) != 0):
@@ -184,7 +185,7 @@ def load_global_setting_without_Qt_for_subprocess():
         logger.error("相机配置文件读取失败。")
     global_setting.set_setting("camera_config", config)
     # 加载监控数据配置
-    config_file_path = "../" + config_path + "/monitor_datas_config.ini"
+    config_file_path = str(PROJECT_ROOT / "config" / "monitor_datas_config.ini")
     # 配置数据{"section":{"key1":value1,"key2":value2,....}，...}
     config = ini_parser(config_file_path).read()
     if (len(config) != 0):

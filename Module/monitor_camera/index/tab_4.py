@@ -52,6 +52,7 @@ from Module.mouse_trajectory.trajectory_tuning import (
 )
 from public.component.dialog.index.infrared_camera_read_SN_dialog_index import infrared_camera_read_SN_dialog
 from public.config_class.global_setting import global_setting
+from public.util.project_paths import resolve_project_path
 from public.dao.SQLite.Monitor_Datas_Handle import Monitor_Datas_Handle
 from public.entity.MyQThread import MyQThread
 from public.util.folder_util import folder_util
@@ -178,11 +179,11 @@ class ImageLoaderThread(MyQThread):
         self.infrared_path = []
         if self.display_mode != "video":
             infrared_folder_list = folder_util.list_directories(
-                camera_config["STORAGE"]["fold_path"] + camera_config["INFRARED_CAMERA"]["path"]
+                str(resolve_project_path(camera_config["STORAGE"]["fold_path"]) / str(camera_config["INFRARED_CAMERA"]["path"]).strip("/\\"))
             )
 
             self.infrared_path = [
-                camera_config["STORAGE"]["fold_path"]
+                str(resolve_project_path(camera_config["STORAGE"]["fold_path"]))
                 + camera_config["INFRARED_CAMERA"]["path"]
                 + f"{folder_name}/"
                 + camera_config["INFRARED_CAMERA"]["pic_dir"]
@@ -354,7 +355,7 @@ class TrajectoryFrameSubmitterThread(MyQThread):
         self.trajectory_max_age_seconds = 0.75
         self.online_timeout_seconds = 2.0
         self.last_online_seen_by_cage: dict[int, float] = {}
-        self.storage_base_dir = Path.cwd() / "data"
+        self.storage_base_dir = resolve_project_path("data")
         self.deep_camera_path = "deep_camera"
         self.mouse_cage_prefix = "mouse_cage_"
         self.color_dir = "color"
@@ -463,7 +464,7 @@ class TrajectoryFrameSubmitterThread(MyQThread):
             fold_path = str(storage_config.get("fold_path", "./data/") or "./data/")
             storage_base_dir = Path(fold_path)
             if not storage_base_dir.is_absolute():
-                storage_base_dir = Path.cwd() / storage_base_dir
+                storage_base_dir = resolve_project_path(storage_base_dir)
             self.storage_base_dir = storage_base_dir
             self.deep_camera_path = str(deep_config.get("path", self.deep_camera_path) or self.deep_camera_path).strip("/\\")
             self.mouse_cage_prefix = str(deep_config.get("mouse_cage_prefix", self.mouse_cage_prefix) or self.mouse_cage_prefix)
@@ -1384,7 +1385,7 @@ class TemperatureTrendWidget(QWidget):
             f"{experiment_name}_{datetime.fromtimestamp(experiment_start_time).strftime('%Y_%m_%d_%H_%M_%S_%f')}"
         )
         save_dir = os.path.join(
-            os.getcwd() + storage_setting["fold_path"],
+            str(resolve_project_path(storage_setting["fold_path"])),
             storage_setting["sub_fold_path"],
             experiment_folder,
             "temperature_charts",
@@ -1731,7 +1732,7 @@ class TemperatureTrendWidgetV2(QWidget):
             f"{experiment_name}_{datetime.fromtimestamp(experiment_start_time).strftime('%Y_%m_%d_%H_%M_%S_%f')}"
         )
         save_dir = os.path.join(
-            os.getcwd() + storage_setting["fold_path"],
+            str(resolve_project_path(storage_setting["fold_path"])),
             storage_setting["sub_fold_path"],
             experiment_folder,
             "temperature_charts",

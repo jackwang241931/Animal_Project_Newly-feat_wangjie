@@ -17,6 +17,7 @@ from public.function.Modbus.Modbus_Type import Modbus_Slave_Type, Modbus_Slave_I
 from public.function.weight.weight_series_formatter import format_weight_series_for_storage
 # 监控数据操作类
 from public.util.time_util import time_util
+from public.util.project_paths import resolve_project_path
 #logger = logger.bind(category="deep_camera_logger")
 
 class Monitor_Datas_Handle():
@@ -216,9 +217,14 @@ class Monitor_Datas_Handle():
             # 不带扩展名的文件名称
             file_name_without_extension = os.path.splitext(file_name)[0]
         # 定义文件夹路径
-        folder_path =os.getcwd()+ global_setting.get_setting('monitor_data')['STORAGE']['fold_path'] + os.path.join(
-
-            global_setting.get_setting('monitor_data')['STORAGE']['sub_fold_path'], f"{file_name_without_extension}_{time_util.get_format_file_from_time(global_setting.get_setting('start_experiment_time',time.time()))}",f'{year}', f'{month}')
+        storage = global_setting.get_setting('monitor_data')['STORAGE']
+        folder_path = os.path.join(
+            str(resolve_project_path(storage['fold_path'])),
+            str(storage['sub_fold_path']).strip('/\\'),
+            f"{file_name_without_extension}_{time_util.get_format_file_from_time(global_setting.get_setting('start_experiment_time',time.time()))}",
+            f'{year}',
+            f'{month}',
+        )
 
         # 创建文件夹（如果不存在）
         os.makedirs(folder_path, exist_ok=True)

@@ -7,6 +7,7 @@ import time
 import threading
 import traceback
 from collections import deque
+from pathlib import Path
 from typing import Any
 
 import cv2
@@ -24,6 +25,7 @@ from public.util.ffmpeg_video_recorder import (
     FFmpegVideoRecorderThread,
 )
 from public.util.json_util import json_util
+from public.util.project_paths import resolve_project_path
 from public.util.shared_video_frames import shared_video_frame_store
 from public.util.time_util import time_util
 from public.util.uvc_camera_util import (
@@ -255,7 +257,9 @@ def _video_recorder_config():
 
 def _storage_root():
     config = _camera_config()
-    return config["STORAGE"]["fold_path"] + config["DEEP_CAMERA"]["path"]
+    storage_path = config.get("STORAGE", {}).get("fold_path", "./data/")
+    deep_camera_path = config.get("DEEP_CAMERA", {}).get("path", "deep_camera/")
+    return str(resolve_project_path(storage_path) / str(deep_camera_path).strip("/\\"))
 
 
 def _camera_base_path(mouse_cage_number):

@@ -62,6 +62,7 @@ from public.function.weight.weight_postprocessor import (
 )
 from public.function.cage_control_commands import configurable_cages
 from public.util.shared_video_frames import shared_video_frame_store
+from public.util.project_paths import resolve_project_path
 from Module.mouse_trajectory.paths import EXPORT_DIR as TRAJECTORY_EXPORT_DIR
 from Module.mouse_trajectory_analysis.analysis_core import (
     find_matching_trajectory_export,
@@ -1280,10 +1281,9 @@ class DataViewPage(_BaseWorkflowPage):
             started_at = None
         if started_at and started_at > 0:
             storage = global_setting.get_setting("monitor_data", {}).get("STORAGE", {})
-            storage_root = os.path.abspath(os.path.join(
-                os.getcwd(),
-                str(storage.get("fold_path", "./data/")),
-                str(storage.get("sub_fold_path", "monitor_data")).strip("/\\"),
+            storage_root = str(resolve_project_path(
+                Path(str(storage.get("fold_path", "./data/")))
+                / str(storage.get("sub_fold_path", "monitor_data")).strip("/\\")
             ))
             best: tuple[float, str] | None = None
             if os.path.isdir(storage_root):
@@ -1509,7 +1509,7 @@ class DataViewPage(_BaseWorkflowPage):
         default_directory = self._last_export_directory
         if not default_directory:
             db_path = self._db_path()
-            default_directory = os.path.dirname(db_path) if db_path else os.getcwd()
+            default_directory = os.path.dirname(db_path) if db_path else str(resolve_project_path("."))
         default_path = os.path.join(
             default_directory,
             f"采集查询_{channel_label}_{time.strftime('%Y%m%d_%H%M%S')}.csv",
@@ -3982,7 +3982,7 @@ class DataAnalysisPage(_BaseWorkflowPage):
         storage = config.get("STORAGE", {}) if isinstance(config, Mapping) else {}
         folder = str(storage.get("fold_path", "./data/") or "./data/")
         subfolder = str(storage.get("sub_fold_path", "/monitor_data/") or "/monitor_data/")
-        return os.path.abspath(os.path.join(os.getcwd(), folder, subfolder.lstrip("/\\")))
+        return str(resolve_project_path(Path(folder) / subfolder.lstrip("/\\")))
 
     def _scan_experiment_times(self) -> list[tuple[str, str]]:
         # Historical monitor analysis is file-backed: do not present every

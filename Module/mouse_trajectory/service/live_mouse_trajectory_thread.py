@@ -61,6 +61,7 @@ from Module.mouse_trajectory.trajectory_tuning import (
     trajectory_tuning_store,
 )
 from public.config_class.global_setting import global_setting
+from public.util.project_paths import resolve_project_path
 from public.entity.MyQThread import MyQThread
 
 
@@ -1367,7 +1368,7 @@ class MouseTrajectoryThread(MyQThread):
             fold_path = str(storage_config.get("fold_path", "./data/") or "./data/")
             base_dir = Path(fold_path)
             if not base_dir.is_absolute():
-                base_dir = Path.cwd() / base_dir
+                base_dir = resolve_project_path(base_dir)
 
             deep_path = str(deep_config.get("path", "deep_camera/") or "deep_camera/").strip("/\\")
             cage_prefix = str(deep_config.get("mouse_cage_prefix", "mouse_cage_") or "mouse_cage_")

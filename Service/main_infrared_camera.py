@@ -149,7 +149,7 @@ def _channel_health_scope(cage_number):
 
 
 def load_infrared_ellipse_mask_config(cage_id):
-    config_path = os.path.join(os.getcwd(), "config", "infrared_ellipse_mask_config.json")
+    config_path = str(resolve_project_path("config/infrared_ellipse_mask_config.json"))
     camera_config = global_setting.get_setting("camera_config")["INFRARED_CAMERA"]
     fallback = {
         "enabled": int(camera_config.get("ellipse_mask_enabled", 1)),
@@ -266,6 +266,7 @@ read_queue_data_thread = read_queue_data_Thread(name="main_infrared_camera_read_
 
 import msvcrt
 import shutil
+from public.util.project_paths import resolve_project_path
 
 
 def get_infrared_history_config():
@@ -277,9 +278,9 @@ def get_infrared_history_config():
         }
     camera_config = global_setting.get_setting("camera_config")
     infrared_config = camera_config.get('INFRARED_CAMERA', {})
-    storage_root = camera_config.get('STORAGE', {}).get('fold_path', './data/')
+    storage_root = resolve_project_path(camera_config.get('STORAGE', {}).get('fold_path', './data/'))
     history_root = os.path.normpath(
-        os.path.join(storage_root, infrared_config.get('history_path', 'infrared_camera_history/'))
+        str(storage_root / str(infrared_config.get('history_path', 'infrared_camera_history/')).strip('/\\'))
     )
     return {
         'enabled': bool(int(infrared_config.get('history_enabled', 0))),
@@ -1267,7 +1268,7 @@ def init_camera_and_image_handle_thread(serials):
         is_used_ports.clear()
 
     path = (
-        global_setting.get_setting("camera_config")['STORAGE']['fold_path']
+        str(resolve_project_path(global_setting.get_setting("camera_config")['STORAGE']['fold_path']))
         + global_setting.get_setting("camera_config")['INFRARED_CAMERA']['path']
     )
     camera_config_temp = global_setting.get_setting("camera_config")
@@ -1337,8 +1338,9 @@ def main(q, health_snapshot_queue=None):
 def start():
     logger.info(f"{'-' * 30}infrared_camera_run{'-' * 30}")
     # 初始化保存路径
-    path = global_setting.get_setting("camera_config")['STORAGE']['fold_path'] + \
-           global_setting.get_setting("camera_config")['INFRARED_CAMERA']['path']
+    camera_config = global_setting.get_setting("camera_config")
+    path = str(resolve_project_path(camera_config['STORAGE']['fold_path']) / \
+               str(camera_config['INFRARED_CAMERA']['path']).strip('/\\'))
     global delete_file_thread
     # 删除文件线程
     delete_file_thread = Delete_file(path=path, start_time=global_setting.get_setting("start_time"))
