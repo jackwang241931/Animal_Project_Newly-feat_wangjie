@@ -1877,7 +1877,11 @@ class TrajectoryComparisonPlot(QWidget):
 
     def _update_adaptive_size(self) -> None:
         count = max(1, len(self.series))
-        if self.mode in self._PER_CAGE_MODES:
+        if self.mode in {"xy", "dwell"}:
+            # Keep one cage card per row; the cage drawing itself is horizontal.
+            rows = count
+            height = max(460, rows * 360 + 48)
+        elif self.mode in self._PER_CAGE_MODES:
             _columns, rows = self._grid_shape(count)
             height = max(340, rows * 250 + 48)
         elif self.mode == "sleep":
@@ -1893,7 +1897,9 @@ class TrajectoryComparisonPlot(QWidget):
 
     def sizeHint(self) -> QSize:
         count = max(1, len(self.series))
-        if self.mode in self._PER_CAGE_MODES:
+        if self.mode in {"xy", "dwell"}:
+            width = 980
+        elif self.mode in self._PER_CAGE_MODES:
             columns, _rows = self._grid_shape(count)
             width = 760 if columns == 1 else 980
         else:
@@ -1901,8 +1907,11 @@ class TrajectoryComparisonPlot(QWidget):
         return QSize(width, max(340, self.minimumHeight()))
 
     @classmethod
-    def _tile_rects(cls, rect, count: int) -> list[QRect]:
-        columns, rows = cls._grid_shape(count)
+    def _tile_rects(cls, rect, count: int, mode: str = "") -> list[QRect]:
+        if mode in {"xy", "dwell"}:
+            columns, rows = 1, count
+        else:
+            columns, rows = cls._grid_shape(count)
         gap = 12
         tile_width = max(1, int((rect.width() - gap * (columns - 1)) / columns))
         tile_height = max(1, int((rect.height() - gap * (rows - 1)) / rows))
@@ -1916,6 +1925,41 @@ class TrajectoryComparisonPlot(QWidget):
                 tile_height,
             ))
         return tiles
+
+    @staticmethod
+    def _fit_plan_rect(rect, top_reserved: int = 0):
+        """Fit a horizontal 360 x 180 mm plan inside the available plot area."""
+        available = rect.adjusted(34, int(top_reserved) + 2, -10, -30)
+        ratio = max(float(CAGE_LENGTH_MM), 1.0) / max(float(CAGE_WIDTH_MM), 1.0)
+        height = min(max(1, available.height()), max(1, int(available.width() / ratio)))
+        width = min(max(1, available.width()), max(1, int(height * ratio)))
+        return QRect(
+            available.center().x() - width // 2,
+            available.center().y() - height // 2,
+            width,
+            height,
+        )
+
+    @staticmethod
+    def _draw_plan_dimensions(painter: QPainter, rect) -> None:
+        painter.setPen(QPen(QColor("#d8e7f3"), 1))
+        painter.setBrush(QColor("#fbfdff"))
+        painter.drawRect(rect)
+        painter.setPen(QColor("#7191b2"))
+        painter.drawText(
+            QRect(rect.left(), rect.bottom() + 4, rect.width(), 22),
+            Qt.AlignmentFlag.AlignCenter,
+            f"Y / 笼长 {float(CAGE_LENGTH_MM):g} mm",
+        )
+        painter.save()
+        painter.translate(rect.left() - 21, rect.center().y())
+        painter.rotate(-90)
+        painter.drawText(
+            QRect(-rect.height() // 2, -12, rect.height(), 24),
+            Qt.AlignmentFlag.AlignCenter,
+            f"X / 笼宽 {float(CAGE_WIDTH_MM):g} mm",
+        )
+        painter.restore()
 
     @staticmethod
     def _draw_tile_label(painter: QPainter, tile, label: str) -> None:
@@ -1972,21 +2016,14 @@ class TrajectoryComparisonPlot(QWidget):
         painter.setPen(QColor("#7191b2")); painter.drawText(rect.left(), rect.bottom() + 20, x_label); painter.drawText(rect.left() - 8, rect.top() - 8, y_label)
 
     def _paint_legacy_height_tile(self, painter: QPainter, rect, values: list[tuple[float, float, float]]) -> None:
-        """Draw the old X/Z height trajectory directly from physical samples."""
+        """Draw a fixed-scale X/Z chart using one consistent trajectory color."""
         converted = [self._mm(point) for point in values if len(point) >= 3 and all(_number(v) is not None for v in point)]
         if not converted:
             self._empty(painter, rect)
             return
         xs = [float(point[0]) for point in converted]
         heights = [float(point[2]) for point in converted]
-        raw_min = min(heights)
-        raw_max = max(heights)
-        value_range = 20.0 if abs(raw_max - raw_min) < 1e-8 else raw_max - raw_min
-        min_height = max(0.0, raw_min - value_range * 0.2)
-        max_height = min(float(CAGE_HEIGHT_MM), raw_max + value_range * 0.2)
-        if abs(max_height - min_height) < 1e-8:
-            max_height = min(float(CAGE_HEIGHT_MM), min_height + 20.0)
-        chart = rect.adjusted(0, 22, 0, -20)
+        chart = rect.adjusted(0, 22, 0, -30)
         painter.setPen(QPen(QColor("#d8e7f3"), 1))
         painter.setBrush(QColor("#f8fafc"))
         painter.drawRect(chart)
@@ -2000,27 +2037,23 @@ class TrajectoryComparisonPlot(QWidget):
             painter.drawLine(QPointF(chart.left(), y), QPointF(chart.right(), y))
         def map_point(x_value: float, z_value: float) -> QPointF:
             x_ratio = (x_value + float(CAGE_WIDTH_MM) / 2.0) / max(float(CAGE_WIDTH_MM), 1.0)
-            z_ratio = (z_value - min_height) / max(max_height - min_height, 1.0)
+            z_ratio = z_value / max(float(CAGE_HEIGHT_MM), 1.0)
             return QPointF(chart.left() + x_ratio * chart.width(), chart.bottom() - z_ratio * chart.height())
-        plasma = ("#0d0887", "#5c01a6", "#9c179e", "#cc4778", "#ed7953", "#fdb32b", "#f0f921")
         points = [map_point(x_value, z_value) for x_value, z_value in zip(xs, heights)]
-        for index, (first, second) in enumerate(zip(points, points[1:])):
-            color_index = int(index / max(len(points) - 2, 1) * (len(plasma) - 1))
-            painter.setPen(QPen(QColor(plasma[min(len(plasma) - 1, color_index)]), 2))
+        painter.setPen(QPen(QColor("#2563eb"), 2))
+        for first, second in zip(points, points[1:]):
             painter.drawLine(first, second)
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor("#0f172a"))
-        for point in points:
-            painter.drawEllipse(point, 1.8, 1.8)
-        painter.setBrush(QColor("#16a34a")); painter.drawEllipse(points[0], 4, 4)
-        painter.setBrush(QColor("#dc2626")); painter.drawEllipse(points[-1], 4, 4)
         painter.setPen(QColor("#7191b2"))
-        painter.drawText(chart.left(), chart.bottom() + 16, "X")
-        painter.drawText(chart.left() - 4, chart.top() - 4, "Z total")
+        painter.drawText(QRect(chart.left(), chart.bottom() + 4, chart.width(), 22), Qt.AlignmentFlag.AlignCenter, f"X / 笼宽 {float(CAGE_WIDTH_MM):g} mm")
+        painter.save()
+        painter.translate(chart.left() - 21, chart.center().y())
+        painter.rotate(-90)
+        painter.drawText(QRect(-chart.height() // 2, -12, chart.height(), 24), Qt.AlignmentFlag.AlignCenter, f"Z / 笼高 {float(CAGE_HEIGHT_MM):g} mm")
+        painter.restore()
 
     def _paint_per_cage_trajectory(self, painter: QPainter, rect) -> None:
-        """Draw one adaptive subplot per selected cage for 3D/XY/height."""
-        tiles = self._tile_rects(rect, len(self.series))
+        """Draw each cage using the real cage width, length and height."""
+        tiles = self._tile_rects(rect, len(self.series), self.mode)
         for series_index, ((label, values), tile) in enumerate(zip(self.series, tiles)):
             self._draw_tile_label(painter, tile, self._display_label(label))
             plot_rect = tile.adjusted(9, 27, -9, -9)
@@ -2038,26 +2071,44 @@ class TrajectoryComparisonPlot(QWidget):
                          (4, 5), (4, 6), (5, 7), (6, 7))
                 for first, second in edges:
                     painter.drawLine(projected[first], projected[second])
+                half_width = float(CAGE_WIDTH_MM) / 2.0
+                origin = TrajectoryCanvas._project((-half_width, 0.0, 0.0), plot_rect)
+                axes = (
+                    (TrajectoryCanvas._project((half_width, 0.0, 0.0), plot_rect), "X"),
+                    (TrajectoryCanvas._project((-half_width, float(CAGE_LENGTH_MM), 0.0), plot_rect), "Y"),
+                    (TrajectoryCanvas._project((-half_width, 0.0, float(CAGE_HEIGHT_MM)), plot_rect), "Z"),
+                )
+                for endpoint, axis_name in axes:
+                    painter.setPen(QPen(QColor("#7191b2"), 2))
+                    painter.drawLine(origin, endpoint)
+                    painter.drawText(int(endpoint.x()) + 4, int(endpoint.y()) - 3, axis_name)
+                painter.setPen(QColor("#7191b2"))
+                painter.drawText(
+                    plot_rect.adjusted(4, 2, -4, -2),
+                    Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft,
+                    f"X={float(CAGE_WIDTH_MM):g} mm   Y={float(CAGE_LENGTH_MM):g} mm   Z={float(CAGE_HEIGHT_MM):g} mm",
+                )
                 trail = [TrajectoryCanvas._project(point, plot_rect) for point in valid]
-                painter.setPen(QPen(QColor(self._COLORS[0]), 2))
+                painter.setPen(QPen(QColor(self._COLORS[series_index % len(self._COLORS)]), 2))
                 for first, second in zip(trail, trail[1:]):
                     painter.drawLine(first, second)
                 painter.setPen(Qt.PenStyle.NoPen)
                 painter.setBrush(QColor("#e69536")); painter.drawEllipse(trail[0], 3, 3)
                 painter.setBrush(QColor("#288ee0")); painter.drawEllipse(trail[-1], 3, 3)
                 continue
-
-            painter.setPen(QPen(QColor("#d8e7f3"), 1)); painter.drawRect(plot_rect)
+            painter.setPen(QPen(QColor("#d8e7f3"), 1))
             if self.mode == "xy":
+                plan_rect = self._fit_plan_rect(plot_rect)
+                self._draw_plan_dimensions(painter, plan_rect)
                 width, length = float(CAGE_WIDTH_MM), float(CAGE_LENGTH_MM)
                 mapped = []
                 for point in valid:
                     x, y, _z = self._mm(point)
                     mapped.append(QPointF(
-                        plot_rect.left() + (x + width / 2.0) / max(width, 1.0) * plot_rect.width(),
-                        plot_rect.bottom() - y / max(length, 1.0) * plot_rect.height(),
+                        plan_rect.left() + y / max(length, 1.0) * plan_rect.width(),
+                        plan_rect.bottom() - (x + width / 2.0) / max(width, 1.0) * plan_rect.height(),
                     ))
-                axis_label = "X / Y (mm)"
+                axis_label = ""
             else:
                 maximum_height = max(float(CAGE_HEIGHT_MM), max(self._mm(point)[2] for point in valid), 1.0)
                 mapped = [
@@ -2068,37 +2119,57 @@ class TrajectoryComparisonPlot(QWidget):
                     for index, point in enumerate(valid)
                 ]
                 axis_label = "高度 Z (mm)"
-            path = QPainterPath(); path.moveTo(mapped[0])
-            for point in mapped[1:]:
-                path.lineTo(point)
-            color = QColor(self._COLORS[series_index % len(self._COLORS)])
-            painter.setPen(QPen(color, 2)); painter.drawPath(path)
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor("#1B9E77")); painter.drawEllipse(mapped[0], 3, 3)
-            painter.setBrush(QColor("#D95F02")); painter.drawEllipse(mapped[-1], 3, 3)
-            painter.setPen(QColor("#7191b2")); painter.drawText(plot_rect.adjusted(4, 0, -4, -3), Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignLeft, axis_label)
+            if mapped:
+                path = QPainterPath(); path.moveTo(mapped[0])
+                for point in mapped[1:]:
+                    path.lineTo(point)
+                color = QColor(self._COLORS[series_index % len(self._COLORS)])
+                painter.setPen(QPen(color, 2)); painter.drawPath(path)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor("#1B9E77")); painter.drawEllipse(mapped[0], 3, 3)
+                painter.setBrush(QColor("#D95F02")); painter.drawEllipse(mapped[-1], 3, 3)
+                if axis_label:
+                    painter.setPen(QColor("#7191b2")); painter.drawText(plot_rect.adjusted(4, 0, -4, -3), Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignLeft, axis_label)
 
     def _paint_dwell(self, painter: QPainter, rect) -> None:
-        """Draw the legacy rounded-cell dwell-time heatmap per cage."""
-        tiles = self._tile_rects(rect, len(self.series))
+        """Draw the activity heatmap in a horizontal cage-sized grid."""
+        tiles = self._tile_rects(rect, len(self.series), self.mode)
         palette = (QColor("#edf4fb"), QColor("#b9d5ef"), QColor("#6fa4df"), QColor("#f2b233"), QColor("#df4438"))
         for (label, values), tile in zip(self.series, tiles):
             self._draw_tile_label(painter, tile, self._display_label(label))
             plot_rect = tile.adjusted(9, 27, -9, -9)
             if not values:
-                self._empty(painter, plot_rect); continue
+                self._empty(painter, plot_rect)
+                continue
+            painter.setPen(QColor("#7191b2"))
+            painter.drawText(QRect(plot_rect.left(), plot_rect.top(), plot_rect.width(), 18), Qt.AlignmentFlag.AlignLeft, "活动强度")
+            swatch_width = 16
+            for index, color in enumerate(palette):
+                x = plot_rect.left() + 55 + index * (swatch_width + 3)
+                painter.setBrush(color); painter.setPen(Qt.PenStyle.NoPen)
+                painter.drawRoundedRect(x, plot_rect.top() + 3, swatch_width, 12, 3, 3)
+            painter.setPen(QColor("#7191b2"))
+            painter.drawText(plot_rect.right() - 35, plot_rect.top() + 14, "低→高")
+            plan_rect = self._fit_plan_rect(plot_rect, top_reserved=22)
+            self._draw_plan_dimensions(painter, plan_rect)
             columns, rows = 12, 10
             cells = {(int(item[0]), int(item[1])): max(0.0, float(item[2])) for item in values if len(item) >= 3}
             maximum = max(cells.values(), default=0.0)
             if maximum <= 0:
-                self._empty(painter, plot_rect); continue
-            gap = 3.0; cell_w = max(3.0, (plot_rect.width() - gap * (columns - 1)) / columns); cell_h = max(3.0, (plot_rect.height() - gap * (rows - 1)) / rows)
+                self._empty(painter, plan_rect)
+                continue
+            gap = 3.0
+            cell_w = max(3.0, (plan_rect.width() - gap * (columns - 1)) / columns)
+            cell_h = max(3.0, (plan_rect.height() - gap * (rows - 1)) / rows)
             for row in range(rows):
                 for column in range(columns):
                     value = cells.get((column, row), 0.0)
                     index = 0 if not value else min(len(palette) - 1, int(value / maximum * (len(palette) - 1)) + 1)
-                    x = plot_rect.left() + column * (cell_w + gap); y = plot_rect.top() + row * (cell_h + gap)
-                    painter.setBrush(palette[index]); painter.setPen(Qt.PenStyle.NoPen); painter.drawRoundedRect(int(x), int(y), max(1, int(cell_w)), max(1, int(cell_h)), 4, 4)
+                    x = plan_rect.left() + column * (cell_w + gap)
+                    draw_row = rows - 1 - row
+                    y = plan_rect.top() + draw_row * (cell_h + gap)
+                    painter.setBrush(palette[index]); painter.setPen(Qt.PenStyle.NoPen)
+                    painter.drawRoundedRect(int(x), int(y), max(1, int(cell_w)), max(1, int(cell_h)), 4, 4)
 
     def _paint_trajectory_2d(self, painter: QPainter, rect) -> None:
         self._draw_axes(painter, rect, "X（mm）", "Y（mm）")
@@ -4627,8 +4698,8 @@ class DataAnalysisPage(_BaseWorkflowPage):
         width = max(float(CAGE_WIDTH_MM), 1.0); length = max(float(CAGE_LENGTH_MM), 1.0)
         cells: dict[tuple[int, int], int] = {}
         for x, y, _z in converted:
-            column = min(columns - 1, max(0, int((x + width / 2.0) / width * columns)))
-            row = min(rows - 1, max(0, int(y / length * rows)))
+            column = min(columns - 1, max(0, int(y / length * columns)))
+            row = min(rows - 1, max(0, int((x + width / 2.0) / width * rows)))
             cells[(column, row)] = cells.get((column, row), 0) + 1
         return [(column, row, count) for (column, row), count in cells.items()]
 
