@@ -806,6 +806,8 @@ def _load_trajectory_csv_export(
     export_path: Path,
     experiment_started_at: datetime,
     interruption_requested: Callable[[], bool] | None = None,
+    selected_channels: set[int] | None = None,
+    include_comparison: bool = True,
 ) -> ExperimentAnalysis:
     raw_rows: dict[int, list[tuple[float, float, float]]] = {
         channel: [] for channel in range(1, 9)
@@ -813,9 +815,12 @@ def _load_trajectory_csv_export(
     source_sheets: dict[int, list[str]] = {
         channel: [] for channel in range(1, 9)
     }
-    all_timestamps: list[float] = []
+    earliest_timestamp: float | None = None
+    latest_timestamp: float | None = None
 
     for channel in range(1, 9):
+        if selected_channels is not None and channel not in selected_channels:
+            continue
         csv_path = _trajectory_csv_path(export_path, channel)
         if csv_path is None:
             continue
@@ -840,13 +845,14 @@ def _load_trajectory_csv_export(
                     x_value = math.nan
                     y_value = math.nan
                 raw_rows[channel].append((timestamp, x_value, y_value))
-                all_timestamps.append(timestamp)
+                earliest_timestamp = timestamp if earliest_timestamp is None else min(earliest_timestamp, timestamp)
+                latest_timestamp = timestamp if latest_timestamp is None else max(latest_timestamp, timestamp)
 
-    if not all_timestamps:
+    if earliest_timestamp is None or latest_timestamp is None:
         raise ValueError("匹配到的轨迹目录中没有可读取的trajectory.csv数据")
 
-    start_timestamp = min(experiment_started_at.timestamp(), min(all_timestamps))
-    end_timestamp = max(start_timestamp, max(all_timestamps))
+    start_timestamp = min(experiment_started_at.timestamp(), earliest_timestamp)
+    end_timestamp = max(start_timestamp, latest_timestamp)
     channels = {
         channel: _build_channel(
             channel,
@@ -859,11 +865,14 @@ def _load_trajectory_csv_export(
     if not any(channel.total_rows for channel in channels.values()):
         raise ValueError("匹配到的轨迹文件中没有有效坐标")
 
-    comparison_series, comparison_source_path = _load_matching_comparison_series(
-        experiment_started_at,
-        start_timestamp,
-        interruption_requested=interruption_requested,
-    )
+    if include_comparison:
+        comparison_series, comparison_source_path = _load_matching_comparison_series(
+            experiment_started_at,
+            start_timestamp,
+            interruption_requested=interruption_requested,
+        )
+    else:
+        comparison_series, comparison_source_path = {}, None
 
     return ExperimentAnalysis(
         source_path=source_path,
@@ -880,6 +889,8 @@ def _load_trajectory_csv_export(
 def load_trajectory_experiment(
     export_path: str | Path,
     interruption_requested: Callable[[], bool] | None = None,
+    selected_channels: set[int] | None = None,
+    include_comparison: bool = True,
 ) -> ExperimentAnalysis:
     """Load one trajectory export and attach its time-matched monitor data."""
     source_path = Path(export_path).expanduser().resolve()
@@ -898,6 +909,8 @@ def load_trajectory_experiment(
         source_path,
         started_at,
         interruption_requested=interruption_requested,
+        selected_channels=selected_channels,
+        include_comparison=include_comparison,
     )
 
 

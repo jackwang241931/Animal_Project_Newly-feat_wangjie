@@ -15,6 +15,9 @@ import sqlite3
 import time
 import uuid
 import csv
+import tempfile
+from itertools import chain, zip_longest
+from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional
@@ -43,6 +46,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 from public.component.analysis_export_widgets import ChartImageDialog
+from public.component.analysis_performance import extrema_preview, sleep_preview, sleep_segments
 from public.component.live_analysis_snapshot import LiveDatabaseSnapshotLoader
 from loguru import logger
 
@@ -143,6 +147,28 @@ def _number(value: Any) -> Optional[float]:
     except (TypeError, ValueError):
         return None
     return number if math.isfinite(number) else None
+
+
+def _plot_time_value(value: Any) -> Optional[float]:
+    """Normalize numeric/ISO timestamps the same way the plot does."""
+    numeric = _number(value)
+    if numeric is not None:
+        return numeric / 1000.0 if abs(numeric) > 100_000_000_000 else numeric
+    text = str(value or "").strip()
+    if not text:
+        return None
+    candidates = (text, text.replace("Z", "+00:00"), text.replace("_", "-"))
+    for candidate in candidates:
+        try:
+            return datetime.fromisoformat(candidate).timestamp()
+        except ValueError:
+            continue
+    for pattern in ("%Y-%m-%d-%H-%M-%S-%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d-%H-%M-%S"):
+        try:
+            return datetime.strptime(text.replace("_", "-"), pattern).timestamp()
+        except ValueError:
+            continue
+    return None
 
 
 def _numbers(value: Any) -> list[float]:
@@ -2321,7 +2347,9 @@ class TrajectoryComparisonPlot(QWidget):
                 state = values[column] if column < len(values) else None
                 color = QColor("#d9dde3") if state is None else (self._SLEEP_COLORS[1] if float(state) >= 0.5 else self._SLEEP_COLORS[0])
                 painter.setBrush(color); painter.setPen(Qt.PenStyle.NoPen); painter.drawRect(int(rect.left() + column * cell_w), int(rect.top() + row * cell_h), max(1, int(cell_w - 1)), max(1, int(cell_h - 2)))
-        painter.setPen(QColor("#7191b2")); painter.drawText(rect.left(), rect.bottom() + 20, "实验时间（每格 10 秒；红色=睡眠，浅色=活动）")
+        multiplier = max(1, int(getattr(self, "_sleep_segment_multiplier", 1)))
+        interval_text = f"每格约 {10 * multiplier} 秒" if multiplier > 1 else "每格 10 秒"
+        painter.setPen(QColor("#7191b2")); painter.drawText(rect.left(), rect.bottom() + 20, f"实验时间（{interval_text}；红色=睡眠，浅色=活动）")
 
     def paintEvent(self, event) -> None:
         del event
@@ -2364,6 +2392,7 @@ class TrajectoryComparisonPlot(QWidget):
 class DualAxisChart(QWidget):
     """Draw persisted comparison data as a readable dual-axis chart."""
 
+    viewport_changed = pyqtSignal(float, float)
     _CHANNEL_COLORS = ("#1677B8", "#D95F02", "#009E73", "#CC79A7", "#E69F00", "#56B4E9", "#D62728", "#1A1A1A")
     _LEFT_COLORS = _CHANNEL_COLORS
     _RIGHT_COLORS = _CHANNEL_COLORS
@@ -2381,6 +2410,11 @@ class DualAxisChart(QWidget):
         self._left_axis_label = "左轴"
         self._right_axis_label = "右轴"
         self._uses_elapsed_time = False
+        self._full_x_range: Optional[tuple[float, float]] = None
+        self._view_x_range: Optional[tuple[float, float]] = None
+        self._drag_anchor: Optional[QPointF] = None
+        self._detail_mode = False
+        self.setMouseTracking(True)
         self.setMinimumHeight(360)
 
     def sizeHint(self) -> QSize:
@@ -2463,10 +2497,121 @@ class DualAxisChart(QWidget):
         timed_values.sort(key=lambda point: point[0])
         return numeric_values, timed_values, has_clock_time
 
+    @property
+    def full_x_range(self) -> Optional[tuple[float, float]]:
+        return self._full_x_range
+
+    @property
+    def view_x_range(self) -> Optional[tuple[float, float]]:
+        return self._view_x_range
+
+    def reset_view(self) -> None:
+        if self._full_x_range is not None:
+            self._view_x_range = self._full_x_range
+        self._detail_mode = False
+        self.update()
+
+    def _clamp_view(self, low: float, high: float) -> tuple[float, float]:
+        full_low, full_high = self._full_x_range or (low, high)
+        full_span = max(full_high - full_low, 1e-9)
+        span = min(max(high - low, full_span / 10000.0), full_span)
+        low = max(full_low, min(low, full_high - span))
+        return low, low + span
+
+    def _emit_viewport(self) -> None:
+        if self._full_x_range is None or self._view_x_range is None:
+            return
+        full_low, full_high = self._full_x_range
+        full_span = max(full_high - full_low, 1e-9)
+        view_low, view_high = self._view_x_range
+        start = max(0.0, min(1.0, (view_low - full_low) / full_span))
+        end = max(start, min(1.0, (view_high - full_low) / full_span))
+        if start <= 0.000001 and end >= 0.999999:
+            self.viewport_changed.emit(0.0, 1.0)
+        else:
+            self.viewport_changed.emit(float(start), float(end))
+
+    def _plot_rect(self) -> QRect:
+        legend_rows = 1
+        metrics = self.fontMetrics()
+        usable_width = max(200, self.width() - 96)
+        row_width = 0
+        for label, _color, _line_style in self._legend_items():
+            item_width = metrics.horizontalAdvance(label) + 42
+            if row_width and row_width + item_width > usable_width:
+                legend_rows += 1
+                row_width = 0
+            row_width += item_width
+        bottom_margin = 48 + (legend_rows * 24 if self._legend_items() else 0)
+        return self.rect().adjusted(72, 38, -72, -bottom_margin)
+
+    def wheelEvent(self, event) -> None:  # noqa: N802 - Qt API
+        if not self._full_x_range or not self._view_x_range:
+            event.ignore()
+            return
+        delta = event.angleDelta().y()
+        if not delta:
+            event.ignore()
+            return
+        rect = self._plot_rect()
+        if not rect.contains(event.position().toPoint()):
+            event.ignore()
+            return
+        factor = 0.72 if delta > 0 else 1.0 / 0.72
+        view_low, view_high = self._view_x_range
+        center_ratio = max(0.0, min(1.0, (event.position().x() - rect.left()) / max(rect.width(), 1)))
+        center = view_low + center_ratio * (view_high - view_low)
+        span = (view_high - view_low) * factor
+        self._view_x_range = self._clamp_view(center - span * center_ratio, center + span * (1.0 - center_ratio))
+        self._detail_mode = self._view_x_range != self._full_x_range
+        self.update()
+        self._emit_viewport()
+        event.accept()
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt API
+        if event.button() == Qt.MouseButton.LeftButton and self._view_x_range:
+            if self._plot_rect().contains(event.position().toPoint()):
+                self._drag_anchor = event.position()
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802 - Qt API
+        if self._drag_anchor is not None and self._view_x_range and self._full_x_range:
+            rect = self._plot_rect()
+            delta = event.position().x() - self._drag_anchor.x()
+            span = self._view_x_range[1] - self._view_x_range[0]
+            shift = -delta / max(rect.width(), 1) * span
+            low, high = self._clamp_view(self._view_x_range[0] + shift, self._view_x_range[1] + shift)
+            actual_shift = low - self._view_x_range[0]
+            self._view_x_range = (low, high)
+            self._drag_anchor = QPointF(
+                self._drag_anchor.x() - actual_shift / max(span, 1e-9) * rect.width(),
+                self._drag_anchor.y(),
+            )
+            self._detail_mode = self._view_x_range != self._full_x_range
+            self.update()
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802 - Qt API
+        if event.button() == Qt.MouseButton.LeftButton and self._drag_anchor is not None:
+            self._drag_anchor = None
+            self.unsetCursor()
+            self._emit_viewport()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
     def set_timed_channel_series(
         self,
         left: Iterable[tuple[str, Iterable[tuple[Any, Any]]]],
         right: Iterable[tuple[str, Iterable[tuple[Any, Any]]]],
+        full_x_range: Optional[tuple[float, float]] = None,
+        reset_view: bool = False,
+        detail_mode: bool = False,
     ) -> None:
         left_cleaned = [(str(label), *self._clean_timed_series(values)) for label, values in left]
         right_cleaned = [(str(label), *self._clean_timed_series(values)) for label, values in right]
@@ -2477,6 +2622,22 @@ class DualAxisChart(QWidget):
         self.left = [value for _label, values in self.left_series for value in values]
         self.right = [value for _label, values in self.right_series for value in values]
         self._uses_elapsed_time = any(clock for *_rest, clock in left_cleaned + right_cleaned)
+        current_points = [point for _label, points in self._left_points + self._right_points for point in points]
+        current_values = [point[0] for point in current_points]
+        if full_x_range is None:
+            full_x_range = (
+                min(current_values) if current_values else 0.0,
+                max(current_values) if current_values else 1.0,
+            )
+        full_low, full_high = full_x_range
+        if math.isclose(full_low, full_high):
+            full_high = full_low + 1.0
+        self._full_x_range = (float(full_low), float(full_high))
+        if reset_view or self._view_x_range is None:
+            self._view_x_range = self._full_x_range
+        else:
+            self._view_x_range = self._clamp_view(*self._view_x_range)
+        self._detail_mode = bool(detail_mode)
         self.update()
 
     @staticmethod
@@ -2566,8 +2727,21 @@ class DualAxisChart(QWidget):
             painter.end()
             return
 
-        left_low, left_high, left_step = self._axis_bounds(self.left)
-        right_low, right_high, right_step = self._axis_bounds(self.right)
+        view_low, view_high = self._view_x_range or (0.0, 1.0)
+        visible_left = [
+            (label, [point for point in points if view_low <= point[0] <= view_high])
+            for label, points in self._left_points
+        ]
+        visible_right = [
+            (label, [point for point in points if view_low <= point[0] <= view_high])
+            for label, points in self._right_points
+        ]
+        left_low, left_high, left_step = self._axis_bounds(
+            [value for _label, points in visible_left for _time, value in points]
+        )
+        right_low, right_high, right_step = self._axis_bounds(
+            [value for _label, points in visible_right for _time, value in points]
+        )
         horizontal_ticks = 5
         for tick in range(horizontal_ticks + 1):
             ratio = tick / horizontal_ticks
@@ -2581,11 +2755,13 @@ class DualAxisChart(QWidget):
             painter.setPen(self._RIGHT_AXIS_COLOR)
             painter.drawText(QRect(rect.right() + 9, int(y - 9), 56, 18), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, self._tick_text(right_value, right_step))
 
-        all_points = [point for _label, values in self._left_points + self._right_points for point in values]
+        all_points = [point for _label, values in visible_left + visible_right for point in values]
         x_values = [point[0] for point in all_points]
-        x_low, x_high = (min(x_values), max(x_values)) if x_values else (0.0, 1.0)
-        if math.isclose(x_low, x_high):
-            x_high = x_low + 1.0
+        x_low, x_high = view_low, view_high
+        if not x_values:
+            x_low, x_high = (min(x_values), max(x_values)) if x_values else (0.0, 1.0)
+            if math.isclose(x_low, x_high):
+                x_high = x_low + 1.0
         x_ticks = 6
         for tick in range(x_ticks + 1):
             ratio = tick / x_ticks
@@ -2606,12 +2782,15 @@ class DualAxisChart(QWidget):
         painter.drawText(QRect(rect.center().x(), 8, rect.width() // 2 + 52, 24), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, f"右 · {self._right_axis_label}")
 
         for series, axis_low, axis_high, line_style in (
-            (self._left_points, left_low, left_high, Qt.PenStyle.SolidLine),
-            (self._right_points, right_low, right_high, Qt.PenStyle.DashLine),
+            (visible_left, left_low, left_high, Qt.PenStyle.SolidLine),
+            (visible_right, right_low, right_high, Qt.PenStyle.DashLine),
         ):
             axis_span = max(axis_high - axis_low, 1e-12)
             for series_index, (_label, points) in enumerate(series):
-                points = self._decimate(points, max(300, rect.width() * 2))
+                points = self._decimate(
+                    points,
+                    max(300, rect.width() * (8 if self._detail_mode else 2)),
+                )
                 if not points:
                     continue
                 path = QPainterPath()
@@ -3421,7 +3600,7 @@ class MachineVisionPage(_BaseWorkflowPage):
         if not db_path or not os.path.isfile(str(db_path)): return []
         records: list[dict[str, Any]] = []
         try:
-            with sqlite3.connect(str(db_path)) as connection:
+            with closing(sqlite3.connect(str(db_path))) as connection:
                 tables = connection.execute("SELECT name FROM sqlite_master WHERE type='table' AND (name LIKE 'DetectionResults%cage_%' OR name LIKE '%Trajectory%cage_%')").fetchall()
                 for (table,) in tables:
                     if not _table_matches_channel(table, channel): continue
@@ -3456,7 +3635,10 @@ class MachineVisionPage(_BaseWorkflowPage):
                     elif bbox_xyxy:
                         select.extend(f'"{name}"' for name in bbox_xyxy)
                     limit_clause = f" LIMIT {int(limit)}" if limit is not None and int(limit) > 0 else ""
-                    for row in connection.execute(f'SELECT {", ".join(select)} FROM "{table}" ORDER BY rowid ASC{limit_clause}').fetchall():
+                    for row_index, row in enumerate(connection.execute(f'SELECT {", ".join(select)} FROM "{table}" ORDER BY rowid ASC{limit_clause}')):
+                        interrupted = getattr(self, "_interrupted", None)
+                        if row_index % 1000 == 0 and callable(interrupted) and interrupted():
+                            return []
                         values = [_number(item) for item in row[:3]]
                         if all(item is not None for item in values):
                             offset = 3
@@ -3795,6 +3977,13 @@ class DataAnalysisPage(_BaseWorkflowPage):
         self._historical_start_timestamp = 0.0
         self._historical_load_generation = 0
         self._historical_workers: set[_HistoricalWorkbookLoader] = set()
+        self._analysis_worker: Optional[_AnalysisPreviewLoader] = None
+        self._csv_export_worker: Optional[_AnalysisCsvExporter] = None
+        self._analysis_requested_key: Optional[tuple[Any, ...]] = None
+        self._analysis_completed_key: Optional[tuple[Any, ...]] = None
+        self._analysis_started_at = 0.0
+        self._analysis_next_allowed_at = 0.0
+        self._compare_viewport: Optional[tuple[float, float]] = None
         self._left_channels: set[int] = {1}; self._right_channels: set[int] = {1}
         self._compare_left_series: list[tuple[str, float]] = []
         self._compare_right_series: list[tuple[str, float]] = []
@@ -3808,6 +3997,12 @@ class DataAnalysisPage(_BaseWorkflowPage):
 
     def stop_refresh(self) -> None:
         super().stop_refresh()
+        if self._csv_export_worker is not None:
+            self._csv_export_worker.requestInterruption()
+            self._csv_export_worker.wait(3000)
+        if self._analysis_worker is not None:
+            self._analysis_worker.requestInterruption()
+            self._analysis_worker.wait(3000)
         self._cancel_historical_workbook_loads()
         self._cancel_live_snapshot_worker()
         live_worker = self._live_snapshot_worker
@@ -3820,6 +4015,10 @@ class DataAnalysisPage(_BaseWorkflowPage):
         for worker in tuple(self._historical_workers):
             if worker.isRunning():
                 worker.wait(3000)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        QTimer.singleShot(0, self.refresh)
 
     def _analysis_export_meta(self, module: Optional[str] = None) -> dict[str, str]:
         selected = str(module or next(iter(self._trajectory_modules), "3d"))
@@ -3907,7 +4106,7 @@ class DataAnalysisPage(_BaseWorkflowPage):
         chart_title = QLabel("对比曲线（近 1 小时 · 左右双轴）"); chart_title.setProperty("title", True); chart_layout.addWidget(chart_title)
         chart_hint = QLabel("左轴使用蓝色，右轴使用橙色；只有左右通道都选中并存在真实采集数据时才绘制曲线。")
         chart_title.setText("对比曲线（所选实验全部数据 · 左右双轴）")
-        chart_hint.setText("显示所选实验从首条到最新一条的全部真实采集数据；未选通道或没有真实数据时，图表保持空白。")
+        chart_hint.setText("显示所选实验从首条到最新一条的真实采集数据；滚轮放大/缩小，按住鼠标左键拖动查看，放大后会加载该时间段的更多原始点。")
         chart_hint.setProperty("hint", True); chart_hint.setWordWrap(True); chart_layout.addWidget(chart_hint)
         export_row = QHBoxLayout()
         export_row.addStretch(1)
@@ -3918,7 +4117,11 @@ class DataAnalysisPage(_BaseWorkflowPage):
         self.export_compare_svg_button.clicked.connect(self._export_compare_svg)
         export_row.addWidget(self.export_compare_svg_button)
         chart_layout.addLayout(export_row)
-        self.compare_canvas = DualAxisChart(); chart_layout.addWidget(self.compare_canvas, 1); self._register_zoomable_chart(self.compare_canvas, "对比曲线"); layout.addWidget(compare_chart)
+        self.compare_canvas = DualAxisChart()
+        self.compare_canvas.viewport_changed.connect(self._compare_viewport_changed)
+        chart_layout.addWidget(self.compare_canvas, 1)
+        self._register_zoomable_chart(self.compare_canvas, "对比曲线")
+        layout.addWidget(compare_chart)
         self.compare_export_status = QLabel("")
         self.compare_export_status.setProperty("hint", True)
         chart_layout.addWidget(self.compare_export_status)
@@ -4188,6 +4391,7 @@ class DataAnalysisPage(_BaseWorkflowPage):
             self._live_snapshot_error = ""
 
     def _activate_live_analysis(self, refresh_page: bool = True) -> None:
+        self._reset_compare_viewport()
         self._live_analysis_mode = True
         self._selected_experiment_selection_path = self.LIVE_EXPERIMENT_KEY
         self._selected_experiment_db_path = None
@@ -4344,6 +4548,7 @@ class DataAnalysisPage(_BaseWorkflowPage):
         self._legacy_trajectory_cache = None
 
     def _trajectory_experiment_changed(self, _index: int) -> None:
+        self._reset_compare_viewport()
         self._trajectory_selection_user_set = True
         selected = str(self.trajectory_experiment_combo.currentData() or "")
         self._selected_trajectory_export_path = selected if selected and os.path.isdir(selected) else None
@@ -4544,6 +4749,7 @@ class DataAnalysisPage(_BaseWorkflowPage):
         self._set_historical_loading(True, "加载失败", "fault")
 
     def _experiment_time_changed(self, _index: int) -> None:
+        self._reset_compare_viewport()
         selected = str(self.experiment_time_combo.currentData() or "")
         if selected == self.LIVE_EXPERIMENT_KEY:
             self._activate_live_analysis()
@@ -4609,7 +4815,7 @@ class DataAnalysisPage(_BaseWorkflowPage):
         box = QVBoxLayout(card); box.setContentsMargins(14, 12, 14, 12); box.setSpacing(8)
         top = QHBoxLayout(); top.setSpacing(10)
         chip = QLabel(title); chip.setProperty("chip", True); chip.setProperty("tone", tone); top.addWidget(chip)
-        metric = QComboBox(); metric.addItems(metrics); metric.currentIndexChanged.connect(self._refresh_compare_chart); top.addWidget(metric, 1)
+        metric = QComboBox(); metric.addItems(metrics); metric.currentIndexChanged.connect(self._compare_source_changed); top.addWidget(metric, 1)
         box.addLayout(top)
         hint = QLabel("可多选通道；同一坐标轴使用相近色系区分")
         hint.setProperty("hint", True); box.addWidget(hint)
@@ -4624,6 +4830,21 @@ class DataAnalysisPage(_BaseWorkflowPage):
             buttons.append(button); buttons_layout.addWidget(button)
         buttons_layout.addStretch(1); box.addLayout(buttons_layout)
         return card, metric, buttons
+
+    def _reset_compare_viewport(self) -> None:
+        self._compare_viewport = None
+        if hasattr(self, "compare_canvas"):
+            self.compare_canvas.reset_view()
+
+    def _compare_source_changed(self, _index: int = -1) -> None:
+        self._reset_compare_viewport()
+        self._refresh_compare_chart()
+
+    def _compare_viewport_changed(self, start: float, end: float) -> None:
+        start = max(0.0, min(1.0, float(start)))
+        end = max(start, min(1.0, float(end)))
+        self._compare_viewport = None if start <= 0.000001 and end >= 0.999999 else (start, end)
+        self._schedule_analysis_refresh(force=True)
 
     def _relayout_trajectory_comparison(self) -> None:
         """Show one selected module and let it consume the available width."""
@@ -4658,7 +4879,7 @@ class DataAnalysisPage(_BaseWorkflowPage):
             button = self.trajectory_channel_buttons[int(channel) - 1]
             button.blockSignals(True); button.setChecked(True); button.blockSignals(False)
         self._reset_trajectory_animation_states()
-        self._refresh_trajectory_comparison()
+        self.refresh()
         self._refresh_analysis_recognition()
 
     def _set_trajectory_module(self, module: str, checked: bool) -> None:
@@ -4680,7 +4901,7 @@ class DataAnalysisPage(_BaseWorkflowPage):
         self.export_trajectory_svg_button.setText(f"导出{meta['title']} SVG")
         self._update_trajectory_play_visibility()
         self._relayout_trajectory_comparison()
-        self._refresh_trajectory_comparison()
+        self.refresh()
 
     def _set_trajectory_playback_speed(self, index: int) -> None:
         """Change playback cadence without changing the current frame."""
@@ -4801,20 +5022,7 @@ class DataAnalysisPage(_BaseWorkflowPage):
     @classmethod
     def _sleep_states(cls, records: list[dict[str, Any]], segment_seconds: float = 10.0) -> list[float]:
         points, elapsed, _cumulative = cls._trajectory_distance_metrics(records)
-        if not points:
-            return []
-        duration = max(elapsed[-1] if elapsed else 0.0, segment_seconds)
-        count = max(1, int(math.ceil(duration / segment_seconds)))
-        states: list[float] = []
-        for segment in range(count):
-            indexes = [index for index, value in enumerate(elapsed) if segment * segment_seconds <= value < (segment + 1) * segment_seconds]
-            if not indexes:
-                states.append(None); continue
-            segment_points = [points[index] for index in indexes]
-            center = tuple(sum(point[axis] for point in segment_points) / len(segment_points) for axis in range(3))
-            radius = max(math.dist(point, center) for point in segment_points)
-            states.append(1.0 if radius <= 5.0 else 0.0)
-        return states
+        return sleep_segments(points, elapsed, segment_seconds)
 
     def _trajectory_records_for_channels(self, channels: Optional[set[int]] = None) -> dict[int, list[dict[str, Any]]]:
         records: dict[int, list[dict[str, Any]]] = {}
@@ -5199,56 +5407,25 @@ class DataAnalysisPage(_BaseWorkflowPage):
                 self.compare_export_status.setText(f"行为识别数据导出失败：{error}")
             return
         if selected == "infrared":
-            records_by_channel = self._infrared_temperature_records_for_channels()
-            if not any(records_by_channel.values()):
-                self.compare_export_status.setText("当前没有可导出的真实红外温度数据")
-                return
             file_path, _ = QFileDialog.getSaveFileName(self, "保存红外温度数据", f"{meta['filename']}.csv", "CSV 文件 (*.csv)")
             if not file_path:
                 return
-            try:
-                with open(file_path, "w", newline="", encoding="utf-8-sig") as stream:
-                    writer = csv.writer(stream)
-                    writer.writerow(["通道", "采集时间", "红外最高温度(°C)"])
-                    for channel, samples in records_by_channel.items():
-                        for stamp_text, _stamp, temperature in samples:
-                            writer.writerow([f"CH{channel:02d}", stamp_text, temperature])
-                self.compare_export_status.setText(f"已导出红外温度数据：{file_path}")
-            except (OSError, csv.Error) as error:
-                self.compare_export_status.setText(f"红外温度数据导出失败：{error}")
-            return
-        records_by_channel = self._trajectory_records_for_channels()
-        if not any(records_by_channel.values()):
-            self.compare_export_status.setText(f"当前没有可导出的真实{meta['data']}")
+            self._start_csv_export("infrared", file_path, meta["data"])
             return
         file_path, _ = QFileDialog.getSaveFileName(self, f"保存{meta['data']}", f"{meta['filename']}.csv", "CSV 文件 (*.csv)")
         if not file_path:
             return
-        try:
-            with open(file_path, "w", newline="", encoding="utf-8-sig") as stream:
-                writer = csv.writer(stream); writer.writerow(["通道", "时间", "X(mm)", "Y(mm)", "Z(mm)", "累计二维距离(mm)", "每分钟运动量(mm)", "蛰伏状态"])
-                for channel, records in records_by_channel.items():
-                    points, elapsed, cumulative = self._trajectory_distance_metrics(records); steps = [0.0] + [cumulative[index] - cumulative[index - 1] for index in range(1, len(cumulative))]; minute_map = dict(self._minute_distance(elapsed, steps)); states = self._sleep_states(records)
-                    for index, (record, point) in enumerate(zip(records, points)):
-                        bucket = int(elapsed[index] // 60.0); state_index = int(elapsed[index] // 10.0); state = states[state_index] if state_index < len(states) else None
-                        xyz = [f"{value:.6f}" for value in point]
-                        if record.get("source") == "legacy_trajectory_csv":
-                            xyz[2] = ""  # legacy trajectory.csv has X/Y only
-                        writer.writerow([f"CH{channel:02d}", record.get("time", ""), *xyz, f"{cumulative[index]:.6f}", f"{minute_map.get(bucket, 0.0):.6f}", "蛰伏" if state == 1.0 else ("自由活动" if state == 0.0 else UNKNOWN)])
-            self.compare_export_status.setText(f"已导出{meta['data']}：{file_path}")
-        except (OSError, csv.Error) as error:
-            self.compare_export_status.setText(f"{meta['data']}导出失败：{error}")
+        self._start_csv_export("trajectory", file_path, meta["data"])
 
     def _export_trajectory_svg(self) -> None:
         selected = next(iter(self._trajectory_modules), "3d")
         meta = self._analysis_export_meta(selected)
+        plot = self.trajectory_compare_plots.get(selected)
         if selected == "recognition":
             self._refresh_analysis_recognition()
             has_data = bool(getattr(self.analysis_behavior_chart, "counts", []))
-        elif selected == "infrared":
-            has_data = any(self._infrared_temperature_records_for_channels().values())
         else:
-            has_data = any(self._trajectory_records_for_channels().values())
+            has_data = bool(plot and any(values for _label, values in plot.series))
         if not has_data:
             self.compare_export_status.setText(f"当前没有可导出的真实{meta['title']}")
             return
@@ -5258,7 +5435,6 @@ class DataAnalysisPage(_BaseWorkflowPage):
         if not file_path:
             return
         try:
-            plot = self.trajectory_compare_plots.get(selected)
             if plot is None:
                 raise RuntimeError("当前模块没有可导出的图表")
             self._render_chart_svg(plot, file_path, meta["title"])
@@ -5271,6 +5447,7 @@ class DataAnalysisPage(_BaseWorkflowPage):
             target.add(int(channel))
         else:
             target.discard(int(channel))
+        self._reset_compare_viewport()
         self._refresh_compare_chart()
 
     def _select_channel(self, channel: int) -> None:
@@ -5316,7 +5493,7 @@ class DataAnalysisPage(_BaseWorkflowPage):
         if db_path and os.path.isfile(str(db_path)):
             table = f"Epoch_data_cage_{self.selected_channel}"
             try:
-                with sqlite3.connect(str(db_path)) as connection:
+                with closing(sqlite3.connect(str(db_path))) as connection:
                     exists = connection.execute(
                         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
                     ).fetchone()
@@ -5417,7 +5594,13 @@ class DataAnalysisPage(_BaseWorkflowPage):
     def _metric_values(self, channels: set[int], metric_index: int) -> list[float]:
         return [value for _timestamp, value in self._metric_series(channels, metric_index)]
 
-    def _metric_channel_series(self, channels: set[int], metric_index: int) -> list[tuple[str, list[tuple[str, float]]]]:
+    def _metric_channel_series(
+        self,
+        channels: set[int],
+        metric_index: int,
+        preview_limit: Optional[int] = None,
+        time_range: Optional[tuple[float, float]] = None,
+    ) -> list[tuple[str, list[tuple[str, float]]]]:
         """Return every persisted value grouped by channel, without a time cap."""
         legacy_keys = ("weight", "food", "temperature", "oxygen", "co2")
         if 0 <= metric_index < len(legacy_keys):
@@ -5432,8 +5615,14 @@ class DataAnalysisPage(_BaseWorkflowPage):
                             (str(excel_origin + float(elapsed)), float(value))
                             for elapsed, value in zip(series.elapsed_seconds, series.values)
                             if math.isfinite(float(value))
+                            and (
+                                time_range is None
+                                or time_range[0] <= excel_origin + float(elapsed) <= time_range[1]
+                            )
                         ]
                         if values:
+                            if preview_limit is not None:
+                                values = extrema_preview(values, preview_limit)
                             series_by_channel.append((f"CH{channel:02d}", values))
                 if series_by_channel or self._selected_experiment_excel_path:
                     return series_by_channel
@@ -5448,7 +5637,7 @@ class DataAnalysisPage(_BaseWorkflowPage):
         _label, metric_candidates = COMPARE_METRIC_DEFINITIONS[metric_index]
         channel_series: list[tuple[str, list[tuple[str, float]]]] = []
         try:
-            with sqlite3.connect(str(db_path)) as connection:
+            with closing(sqlite3.connect(str(db_path))) as connection:
                 selected = sorted(channels)
                 for channel in selected:
                     table = f"Epoch_data_cage_{channel}"
@@ -5478,10 +5667,16 @@ class DataAnalysisPage(_BaseWorkflowPage):
                             query = f'SELECT {quoted_time}, {quoted_vo2}, {quoted_vco2} FROM "{table}" ORDER BY {quoted_time} ASC, rowid ASC'
                         else:
                             query = f'SELECT rowid, {quoted_vo2}, {quoted_vco2} FROM "{table}" ORDER BY rowid ASC'
-                        rows = connection.execute(query).fetchall()
                         series: list[tuple[str, float]] = []
-                        for row_index, (raw_time, raw_vo2, raw_vco2) in enumerate(rows, 1):
+                        for row_index, (raw_time, raw_vo2, raw_vco2) in enumerate(connection.execute(query), 1):
+                            interrupted = getattr(self, "_interrupted", None)
+                            if row_index % 1000 == 0 and callable(interrupted) and interrupted():
+                                return []
                             vo2_values = _numbers(raw_vo2); vco2_values = _numbers(raw_vco2)
+                            if time_range is not None:
+                                plot_time = _plot_time_value(raw_time if raw_time is not None else row_index)
+                                if plot_time is None or not (time_range[0] <= plot_time <= time_range[1]):
+                                    continue
                             for vo2, vco2 in zip(vo2_values, vco2_values):
                                 if metric_index == 8:
                                     if vo2 == 0:
@@ -5491,6 +5686,8 @@ class DataAnalysisPage(_BaseWorkflowPage):
                                     value = 60.0 * (3.815 * vo2 + 1.232 * vco2)
                                 series.append((str(raw_time if raw_time is not None else row_index), value))
                         if series:
+                            if preview_limit is not None:
+                                series = extrema_preview(series, preview_limit)
                             channel_series.append((f"CH{channel:02d}", series))
                         continue
                     quoted_column = '"' + column.replace('"', '""') + '"'
@@ -5499,12 +5696,21 @@ class DataAnalysisPage(_BaseWorkflowPage):
                         query = f'SELECT {quoted_time}, {quoted_column} FROM "{table}" ORDER BY {quoted_time} ASC, rowid ASC'
                     else:
                         query = f'SELECT rowid, {quoted_column} FROM "{table}" ORDER BY rowid ASC'
-                    rows = connection.execute(query).fetchall()
                     series: list[tuple[str, float]] = []
-                    for row_index, (raw_time, raw_value) in enumerate(rows, 1):
+                    for row_index, (raw_time, raw_value) in enumerate(connection.execute(query), 1):
+                        interrupted = getattr(self, "_interrupted", None)
+                        if row_index % 1000 == 0 and callable(interrupted) and interrupted():
+                            return []
+                        plot_time = _plot_time_value(raw_time if raw_time is not None else row_index)
+                        if time_range is not None and (
+                            plot_time is None or not (time_range[0] <= plot_time <= time_range[1])
+                        ):
+                            continue
                         for value in _numbers(raw_value):
                             series.append((str(raw_time if raw_time is not None else row_index), value))
                     if series:
+                        if preview_limit is not None:
+                            series = extrema_preview(series, preview_limit)
                         channel_series.append((f"CH{channel:02d}", series))
         except (OSError, sqlite3.Error, ValueError):
             return []
@@ -5515,49 +5721,58 @@ class DataAnalysisPage(_BaseWorkflowPage):
         return [point for _channel, series in self._metric_channel_series(channels, metric_index) for point in series]
 
     def _refresh_compare_chart(self) -> None:
-        left_index = self.left_metric.currentIndex()
-        right_index = self.right_metric.currentIndex()
-        self._compare_left_channel_series = self._metric_channel_series(self._left_channels, left_index)
-        self._compare_right_channel_series = self._metric_channel_series(self._right_channels, right_index)
-        self._compare_left_series = [point for _channel, series in self._compare_left_channel_series for point in series]
-        self._compare_right_series = [point for _channel, series in self._compare_right_channel_series for point in series]
+        if not hasattr(self, "_analysis_worker"):
+            return
+        self._schedule_analysis_refresh()
+
+    def _display_compare_chart(self, left, right) -> None:
+        self._compare_left_channel_series = left
+        self._compare_right_channel_series = right
+        self._compare_left_series = [point for _channel, series in left for point in series]
+        self._compare_right_series = [point for _channel, series in right for point in series]
         self.compare_canvas.set_axis_labels(self.left_metric.currentText(), self.right_metric.currentText())
         self.compare_canvas.set_timed_channel_series(
-            self._compare_left_channel_series,
-            self._compare_right_channel_series,
+            left,
+            right,
+            full_x_range=getattr(self, "_analysis_full_x_range", None),
+            reset_view=self._compare_viewport is None,
+            detail_mode=self._compare_viewport is not None,
         )
 
     def _comparison_export_rows(self) -> tuple[list[tuple[str, list[tuple[str, float]]]], list[tuple[str, list[tuple[str, float]]]], str, str]:
         """Return complete per-channel series and the selected metric labels."""
-        self._refresh_compare_chart()
-        return self._compare_left_channel_series, self._compare_right_channel_series, self.left_metric.currentText(), self.right_metric.currentText()
+        left = self._metric_channel_series(self._left_channels, self.left_metric.currentIndex())
+        right = self._metric_channel_series(self._right_channels, self.right_metric.currentIndex())
+        return left, right, self.left_metric.currentText(), self.right_metric.currentText()
 
     def _export_compare_csv(self) -> None:
-        left, right, left_metric, right_metric = self._comparison_export_rows()
-        left_rows = [(channel, timestamp, value) for channel, series in left for timestamp, value in series]
-        right_rows = [(channel, timestamp, value) for channel, series in right for timestamp, value in series]
-        if not left_rows and not right_rows:
-            self.compare_export_status.setText("当前没有可导出的真实对比数据")
-            return
         file_path, _ = QFileDialog.getSaveFileName(
             self, "保存对比数据", "experiment_comparison.csv", "CSV 文件 (*.csv)"
         )
         if not file_path:
             return
-        try:
-            with open(file_path, "w", newline="", encoding="utf-8-sig") as stream:
-                writer = csv.writer(stream)
-                writer.writerow(["序号", "左轴通道", "左轴指标", "左轴时间", "左轴数值", "右轴通道", "右轴指标", "右轴时间", "右轴数值"])
-                for index in range(max(len(left_rows), len(right_rows))):
-                    left_item = left_rows[index] if index < len(left_rows) else ("", "", "")
-                    right_item = right_rows[index] if index < len(right_rows) else ("", "", "")
-                    writer.writerow([index + 1, left_item[0], left_metric, left_item[1], left_item[2], right_item[0], right_metric, right_item[1], right_item[2]])
-            self.compare_export_status.setText(f"已导出全部对比数据：{file_path}")
-        except (OSError, csv.Error) as error:
-            self.compare_export_status.setText(f"对比数据导出失败：{error}")
+        self._start_csv_export("compare", file_path, "对比数据")
+
+    def _start_csv_export(self, kind: str, file_path: str, title: str) -> None:
+        if self._csv_export_worker is not None:
+            self.compare_export_status.setText("已有导出任务正在进行，请稍候")
+            return
+        _key, request = self._analysis_request()
+        worker = _AnalysisCsvExporter(kind, file_path, title, request)
+        self._csv_export_worker = worker
+        self.compare_export_status.setText(f"正在导出完整{title}…")
+        worker.completed.connect(self.compare_export_status.setText)
+        worker.finished.connect(lambda current=worker: self._csv_export_finished(current))
+        worker.start()
+
+    def _csv_export_finished(self, worker: "_AnalysisCsvExporter") -> None:
+        if self._csv_export_worker is worker:
+            self._csv_export_worker = None
+        worker.deleteLater()
 
     def _export_compare_svg(self) -> None:
-        left, right, left_metric, right_metric = self._comparison_export_rows()
+        left, right = self._compare_left_channel_series, self._compare_right_channel_series
+        left_metric, right_metric = self.left_metric.currentText(), self.right_metric.currentText()
         if not left and not right:
             self.compare_export_status.setText("至少需要一个轴存在真实数据后才能导出 SVG")
             return
@@ -5669,6 +5884,131 @@ class DataAnalysisPage(_BaseWorkflowPage):
         self.analysis_recognition_count_label.setText(f"统计类别：{category_text}；每个通道勾选一次计 1 次")
         self.analysis_behavior_chart.set_counts(chart_counts)
 
+    @staticmethod
+    def _analysis_file_signature(path: Any) -> tuple[Any, ...]:
+        if not path:
+            return ("",)
+        try:
+            source = Path(path)
+            stat = source.stat()
+            return (str(source), stat.st_size, stat.st_mtime_ns)
+        except OSError:
+            return (str(path),)
+
+    def _analysis_request(self) -> tuple[tuple[Any, ...], dict[str, Any]]:
+        context = dict(_provider_value(self._context_provider))
+        module = next(iter(self._trajectory_modules), "3d")
+        export_path = self._selected_trajectory_export_path
+        viewport = self._compare_viewport
+        full_x_range = (
+            getattr(self.compare_canvas, "full_x_range", None)
+            if viewport is not None
+            else None
+        )
+        csv_signature = ()
+        if export_path:
+            root = Path(export_path)
+            csv_signature = tuple(
+                self._analysis_file_signature(path)
+                for channel in sorted(self._trajectory_channels | {self.selected_channel})
+                for path in (root / f"cage_{channel}" / "data" / "trajectory.csv",
+                             root / f"cage{channel}" / "data" / "trajectory.csv")
+                if path.is_file()
+            )
+        key = (
+            self._analysis_file_signature(context.get("experiment_db_path")),
+            self._analysis_file_signature(self._selected_experiment_excel_path),
+            csv_signature,
+            self._legacy_comparison_cache_key,
+            module,
+            tuple(sorted(self._trajectory_channels)),
+            self.selected_channel,
+            tuple(sorted(self._left_channels)),
+            tuple(sorted(self._right_channels)),
+            self.left_metric.currentIndex(),
+            self.right_metric.currentIndex(),
+            viewport,
+            self._configured_behavior_categories(self.selected_channel),
+        )
+        request = {
+            "context": context,
+            "live_mode": self._live_analysis_mode,
+            "module": module,
+            "trajectory_channels": tuple(self._trajectory_channels),
+            "bio_channel": self.selected_channel,
+            "trajectory_export_path": export_path,
+            "trajectory_selection_user_set": self._trajectory_selection_user_set,
+            "excel_path": self._selected_experiment_excel_path,
+            "comparison_origin": self._historical_start_timestamp,
+            "comparison_cache": self._legacy_comparison_cache,
+            "left_channels": tuple(self._left_channels),
+            "right_channels": tuple(self._right_channels),
+            "left_metric": self.left_metric.currentIndex(),
+            "right_metric": self.right_metric.currentIndex(),
+            "left_metric_label": self.left_metric.currentText(),
+            "right_metric_label": self.right_metric.currentText(),
+            "compare_full_x_range": full_x_range,
+            "compare_viewport": viewport,
+            "behavior_categories": self._configured_behavior_categories(self.selected_channel),
+        }
+        return key, request
+
+    def _schedule_analysis_refresh(self, force: bool = False) -> None:
+        if not self.isVisible() or not hasattr(self, "right_metric") or not hasattr(self, "trajectory_compare_plots"):
+            return
+        key, request = self._analysis_request()
+        previous = self._analysis_requested_key
+        self._analysis_requested_key = key
+        if self._analysis_worker is not None or key == self._analysis_completed_key:
+            return
+        if not force and previous is not None and key[4:] == previous[4:] and time.monotonic() < self._analysis_next_allowed_at:
+            return
+        worker = _AnalysisPreviewLoader(key, request)
+        self._analysis_worker = worker
+        self._analysis_started_at = time.monotonic()
+        worker.loaded.connect(self._analysis_preview_loaded)
+        worker.failed.connect(self._analysis_preview_failed)
+        worker.finished.connect(lambda current=worker: self._analysis_worker_finished(current))
+        worker.start()
+
+    def _analysis_worker_finished(self, worker: "_AnalysisPreviewLoader") -> None:
+        duration = max(0.0, time.monotonic() - self._analysis_started_at)
+        self._analysis_next_allowed_at = time.monotonic() + min(30.0, duration)
+        if self._analysis_worker is worker:
+            self._analysis_worker = None
+        worker.deleteLater()
+        if self._refresh_timer.isActive() and self._analysis_requested_key != self._analysis_completed_key:
+            self._schedule_analysis_refresh()
+
+    def _analysis_preview_failed(self, key: tuple[Any, ...], error: str) -> None:
+        if key != self._analysis_requested_key:
+            return
+        self._analysis_completed_key = key
+        logger.warning("数据分析预览加载失败：{}", error)
+        self.compare_export_status.setText(f"数据加载失败：{error}")
+
+    def _analysis_preview_loaded(self, key: tuple[Any, ...], payload: Mapping[str, Any]) -> None:
+        requested = self._analysis_requested_key
+        if requested is None or (key != requested and key[4:] != requested[4:]):
+            return
+        self._analysis_completed_key = key
+        self._analysis_full_x_range = payload.get("compare_full_x_range")
+        left, right = payload["compare"]
+        self._display_compare_chart(left, right)
+        module = next(iter(self._trajectory_modules), "3d")
+        if module != "recognition":
+            plot = self.trajectory_compare_plots[module]
+            plot._sleep_segment_multiplier = payload["sleep_multiplier"]
+            plot.set_series(payload["series"])
+            self._relayout_trajectory_comparison()
+        points = payload["bio_points"]
+        self._history_points = points
+        self.heatmap_canvas.set_heatmap(payload["bio_cells"])
+        self.history_canvas.set_points(points)
+        self.metric_labels["main_behavior"].setText(payload["behavior"])
+        activity = payload["activity"]
+        self.metric_labels["heat"].setText(f"{activity:.2f}" if activity is not None else UNKNOWN)
+
     def refresh(self) -> None:
         if self._live_analysis_mode:
             live_record = self._live_experiment_record()
@@ -5677,28 +6017,11 @@ class DataAnalysisPage(_BaseWorkflowPage):
             self._maybe_start_live_snapshot()
         else:
             self._update_live_analysis_status()
-        points = self._load_points(); self._history_points = points
         measurements = self._latest_channel_measurements()
-        self._update_bio_card(measurements, points)
+        self._update_bio_card(measurements, [])
         self._update_bio_status()
         self._refresh_analysis_recognition()
-        if points:
-            cells: dict[tuple[int, int], int] = {}
-            xs = [item[0] for item in points]; ys = [item[1] for item in points]; min_x, max_x = min(xs), max(xs); min_y, max_y = min(ys), max(ys); span_x = max(max_x-min_x, 1e-9); span_y = max(max_y-min_y, 1e-9)
-            for x, y, _ in points:
-                key = (int((x-min_x)/span_x*9), int((y-min_y)/span_y*9)); cells[key] = cells.get(key, 0) + 1
-            self.heatmap_canvas.set_heatmap([(x, y, count) for (x, y), count in cells.items()]); self.history_canvas.set_points(points)
-            self.metric_labels["patterns"].setText(f"{len(self._configured_behavior_categories(self.selected_channel))} 类")
-            records = [{"point": point} for point in points]
-            behavior = MachineVisionPage._classify(records, self._configured_behavior_categories(self.selected_channel))
-            self.metric_labels["main_behavior"].setText(behavior)
-            distances = [math.dist(a, b) for a, b in zip(points, points[1:])]
-            self.metric_labels["heat"].setText(f"{sum(distances):.2f}") if distances else self.metric_labels["heat"].setText(UNKNOWN)
-        else:
-            self.heatmap_canvas.set_heatmap([]); self.history_canvas.set_points([])
-            self.metric_labels["patterns"].setText(f"{len(self._configured_behavior_categories(self.selected_channel))} 类")
-            self.metric_labels["main_behavior"].setText(UNKNOWN)
-            self.metric_labels["heat"].setText(UNKNOWN)
+        self.metric_labels["patterns"].setText(f"{len(self._configured_behavior_categories(self.selected_channel))} 类")
         alerts = []
         for item in _health_items(self._health_source):
             if str(item.get("status", item.get("state", ""))).lower() in {"warning", "fault", "unavailable"}:
@@ -5706,6 +6029,353 @@ class DataAnalysisPage(_BaseWorkflowPage):
                 if scope.upper().startswith("CH"):
                     alerts.append(scope.upper())
         self.metric_labels["alerts"].setText(", ".join(sorted(set(alerts))) if alerts else "0")
-        self._refresh_trajectory_comparison()
-        self._refresh_compare_chart()
+        self._schedule_analysis_refresh()
         self.refreshed.emit()
+
+
+class _AnalysisWorkContext:
+    """Immutable inputs for analysis work that must never touch Qt widgets."""
+
+    _trajectory_records_for_channels = DataAnalysisPage._trajectory_records_for_channels
+    _height_records_from_export = DataAnalysisPage._height_records_from_export
+    _trajectory_time_seconds = staticmethod(DataAnalysisPage._trajectory_time_seconds)
+    _trajectory_distance_metrics = DataAnalysisPage._trajectory_distance_metrics
+    _minute_distance = DataAnalysisPage._minute_distance
+    _sleep_states = DataAnalysisPage._sleep_states
+    _dwell_cells = staticmethod(DataAnalysisPage._dwell_cells)
+    _metric_channel_series = DataAnalysisPage._metric_channel_series
+
+    def __init__(self, request: Mapping[str, Any], interrupted: Callable[[], bool]):
+        self._request = dict(request)
+        self._interrupted = interrupted
+        self._context_provider = lambda: self._request["context"]
+        self._trajectory_channels = set(request["trajectory_channels"])
+        self._requested_channels = self._trajectory_channels | {int(request["bio_channel"])}
+        self._trajectory_modules = {request["module"]}
+        self._live_analysis_mode = bool(request.get("live_mode", False))
+        self._trajectory_selection_user_set = bool(request["trajectory_selection_user_set"])
+        self._selected_trajectory_export_path = request["trajectory_export_path"]
+        self._selected_experiment_excel_path = request["excel_path"]
+        self.selected_channel = int(request["bio_channel"])
+        self._trajectory_records_cache: dict[int, list[dict[str, Any]]] = {}
+
+    def _legacy_comparison_series(self) -> tuple[float, dict[int, Any]]:
+        return float(self._request["comparison_origin"]), self._request["comparison_cache"]
+
+    def _legacy_trajectory_analysis(self) -> Any:
+        export = self._selected_trajectory_export_path
+        if self._trajectory_selection_user_set and not export:
+            return None
+        if not export and self._selected_experiment_excel_path:
+            workbook = Path(self._selected_experiment_excel_path)
+            started = parse_experiment_time(workbook)
+            export = find_matching_trajectory_export(TRAJECTORY_EXPORT_DIR, started) if started else None
+        if not export:
+            db_path = self._request["context"].get("experiment_db_path")
+            if db_path:
+                folder = os.path.basename(os.path.dirname(os.path.dirname(str(db_path))))
+                match = re.search(r"20\d{2}_\d{2}_\d{2}_\d{2}_\d{2}_\d{2}_\d{3}(?!\d)", folder)
+                if match:
+                    started = datetime.strptime(match.group(), "%Y_%m_%d_%H_%M_%S_%f")
+                    export = find_matching_trajectory_export(TRAJECTORY_EXPORT_DIR, started)
+        if not export or self._interrupted():
+            return None
+        export_path = Path(export)
+        if not export_path.is_dir() or not any(export_path.glob("cage*/data/trajectory.csv")):
+            return None
+        try:
+            return load_trajectory_experiment(
+                export_path,
+                interruption_requested=self._interrupted,
+                selected_channels=self._requested_channels,
+                include_comparison=False,
+            )
+        except (OSError, ValueError, csv.Error, InterruptedError) as error:
+            if not self._interrupted():
+                logger.warning("读取轨迹 CSV 失败：{}", error)
+            return None
+
+
+class _AnalysisPreviewLoader(QThread):
+    """Prepare screen-sized chart data without blocking the Qt event loop."""
+
+    loaded = pyqtSignal(object, object)
+    failed = pyqtSignal(object, str)
+
+    def __init__(self, key: tuple[Any, ...], request: Mapping[str, Any]):
+        super().__init__()
+        self.key = key
+        self.request = dict(request)
+
+    def run(self) -> None:
+        try:
+            context = _AnalysisWorkContext(self.request, self.isInterruptionRequested)
+            viewport = self.request.get("compare_viewport")
+            requested_full_range = self.request.get("compare_full_x_range")
+            time_range = None
+            if (
+                viewport
+                and requested_full_range
+                and len(requested_full_range) == 2
+            ):
+                full_low, full_high = map(float, requested_full_range)
+                time_range = (
+                    full_low + (full_high - full_low) * float(viewport[0]),
+                    full_low + (full_high - full_low) * float(viewport[1]),
+                )
+            preview_limit = 20000 if time_range is not None else 3000
+            left = context._metric_channel_series(
+                set(self.request["left_channels"]), int(self.request["left_metric"]),
+                preview_limit, time_range,
+            )
+            if self.isInterruptionRequested():
+                return
+            right = context._metric_channel_series(
+                set(self.request["right_channels"]), int(self.request["right_metric"]),
+                preview_limit, time_range,
+            )
+            compare = (left, right)
+            if self.isInterruptionRequested():
+                return
+            module = str(self.request["module"])
+            channels = set(self.request["trajectory_channels"]) | {int(self.request["bio_channel"])}
+            records_by_channel = context._trajectory_records_for_channels(
+                {int(self.request["bio_channel"])} if module == "infrared" else channels
+            )
+            if self.isInterruptionRequested():
+                return
+            bio_records = records_by_channel.get(int(self.request["bio_channel"]), [])
+            bio_points = [item["point"] for item in bio_records]
+            bio_preview = extrema_preview(bio_points, 3000, (0, 1, 2))
+            cells: dict[tuple[int, int], int] = {}
+            if bio_points:
+                xs = [point[0] for point in bio_points]
+                ys = [point[1] for point in bio_points]
+                min_x, max_x = min(xs), max(xs)
+                min_y, max_y = min(ys), max(ys)
+                span_x, span_y = max(max_x - min_x, 1e-9), max(max_y - min_y, 1e-9)
+                for x, y, _z in bio_points:
+                    cell = (int((x - min_x) / span_x * 9), int((y - min_y) / span_y * 9))
+                    cells[cell] = cells.get(cell, 0) + 1
+            behavior = MachineVisionPage._classify(
+                bio_records[-4:], self.request["behavior_categories"]
+            )
+            activity = sum(math.dist(a, b) for a, b in zip(bio_points, bio_points[1:]))
+            series: list[tuple[str, Any]] = []
+            sleep_multiplier = 1
+            if module == "infrared":
+                origin = float(self.request["comparison_origin"])
+                comparison = self.request["comparison_cache"]
+                for channel in sorted(self.request["trajectory_channels"]):
+                    temperature = comparison.get(channel, {}).get("temperature")
+                    if temperature is None:
+                        continue
+                    values = [
+                        (origin + float(elapsed), float(value))
+                        for elapsed, value in zip(temperature.elapsed_seconds, temperature.values)
+                        if math.isfinite(float(elapsed)) and math.isfinite(float(value))
+                    ]
+                    series.append((f"CH{channel:02d}", extrema_preview(values, 3000)))
+            elif module != "recognition":
+                for channel in sorted(self.request["trajectory_channels"]):
+                    records = records_by_channel.get(channel, [])
+                    label = f"CH{channel:02d}"
+                    if not records:
+                        series.append((label, []))
+                        continue
+                    points, elapsed, cumulative = context._trajectory_distance_metrics(records)
+                    if module in {"3d", "xy", "height"}:
+                        values = extrema_preview(points, 3000, (0, 1, 2))
+                    elif module == "cumulative":
+                        values = extrema_preview(
+                            list(zip((time_value / 60.0 for time_value in elapsed), cumulative)), 3000
+                        )
+                    elif module == "total":
+                        values = cumulative[-1] if cumulative else 0.0
+                    elif module == "minute":
+                        steps = [0.0] + [
+                            cumulative[index] - cumulative[index - 1]
+                            for index in range(1, len(cumulative))
+                        ]
+                        values = extrema_preview(context._minute_distance(elapsed, steps), 3000)
+                    elif module == "sleep":
+                        values = sleep_segments(points, elapsed, 10.0)
+                    elif module == "dwell":
+                        values = context._dwell_cells(points)
+                    else:
+                        values = []
+                    series.append((label, values))
+                    if self.isInterruptionRequested():
+                        return
+                if module == "sleep":
+                    longest = max((len(values) for _label, values in series), default=0)
+                    sleep_multiplier = max(1, math.ceil(longest / 1800))
+                    series = [
+                        (label, sleep_preview(values, 1800, sleep_multiplier)[0])
+                        for label, values in series
+                    ]
+            current_points = [
+                point
+                for _label, series in left + right
+                for point in series
+                if _plot_time_value(point[0]) is not None
+            ]
+            current_x_range = (
+                min(_plot_time_value(point[0]) for point in current_points),
+                max(_plot_time_value(point[0]) for point in current_points),
+            ) if current_points else (0.0, 1.0)
+            compare_full_x_range = requested_full_range or current_x_range
+            self.loaded.emit(self.key, {
+                "compare": compare,
+                "compare_full_x_range": compare_full_x_range,
+                "series": series,
+                "sleep_multiplier": sleep_multiplier,
+                "bio_points": bio_preview,
+                "bio_cells": [(x, y, count) for (x, y), count in cells.items()],
+                "behavior": behavior,
+                "activity": activity if len(bio_points) > 1 else None,
+            })
+        except Exception as error:
+            if not self.isInterruptionRequested():
+                self.failed.emit(self.key, str(error))
+
+
+class _AnalysisCsvExporter(QThread):
+    """Write complete analysis data in a worker and publish only a finished CSV."""
+
+    completed = pyqtSignal(str)
+
+    def __init__(self, kind: str, file_path: str, title: str, request: Mapping[str, Any]):
+        super().__init__()
+        self.kind = kind
+        self.file_path = file_path
+        self.title = title
+        self.request = dict(request)
+
+    def run(self) -> None:
+        temporary_path = ""
+        try:
+            context = _AnalysisWorkContext(self.request, self.isInterruptionRequested)
+            channels = set(self.request["trajectory_channels"])
+            context._requested_channels = channels
+            destination = Path(self.file_path)
+            with tempfile.NamedTemporaryFile(
+                mode="w", newline="", encoding="utf-8-sig",
+                prefix=".analysis_export_", suffix=".csv",
+                dir=destination.parent, delete=False,
+            ) as stream:
+                temporary_path = stream.name
+                writer = csv.writer(stream)
+                if self.kind == "compare":
+                    rows = self._write_comparison(context, writer)
+                elif self.kind == "infrared":
+                    rows = self._write_infrared(writer, channels)
+                else:
+                    rows = self._write_trajectory(context, writer, channels)
+            if self.isInterruptionRequested():
+                return
+            if rows == 0:
+                self.completed.emit(f"当前没有可导出的真实{self.title}")
+                return
+            os.replace(temporary_path, destination)
+            temporary_path = ""
+            self.completed.emit(f"已导出全部{self.title}：{destination}")
+        except (OSError, ValueError, csv.Error, sqlite3.Error) as error:
+            if not self.isInterruptionRequested():
+                self.completed.emit(f"{self.title}导出失败：{error}")
+        finally:
+            if temporary_path:
+                try:
+                    os.unlink(temporary_path)
+                except OSError:
+                    pass
+
+    def _write_comparison(self, context: _AnalysisWorkContext, writer: Any) -> int:
+        left = context._metric_channel_series(
+            set(self.request["left_channels"]), int(self.request["left_metric"])
+        )
+        if self.isInterruptionRequested():
+            return 0
+        right = context._metric_channel_series(
+            set(self.request["right_channels"]), int(self.request["right_metric"])
+        )
+        left_rows = chain.from_iterable(
+            ((channel, timestamp, value) for timestamp, value in series)
+            for channel, series in left
+        )
+        right_rows = chain.from_iterable(
+            ((channel, timestamp, value) for timestamp, value in series)
+            for channel, series in right
+        )
+        writer.writerow(["序号", "左轴通道", "左轴指标", "左轴时间", "左轴数值",
+                         "右轴通道", "右轴指标", "右轴时间", "右轴数值"])
+        count = 0
+        for count, (left_item, right_item) in enumerate(
+            zip_longest(left_rows, right_rows, fillvalue=("", "", "")), 1
+        ):
+            if count % 1000 == 0 and self.isInterruptionRequested():
+                return 0
+            writer.writerow([
+                count, left_item[0], self.request["left_metric_label"],
+                left_item[1], left_item[2], right_item[0],
+                self.request["right_metric_label"], right_item[1], right_item[2],
+            ])
+        return count
+
+    def _write_infrared(self, writer: Any, channels: set[int]) -> int:
+        writer.writerow(["通道", "采集时间", "红外最高温度(°C)"])
+        origin = float(self.request["comparison_origin"])
+        comparison = self.request["comparison_cache"]
+        count = 0
+        for channel in sorted(channels):
+            series = comparison.get(channel, {}).get("temperature")
+            if series is None:
+                continue
+            for elapsed, raw_value in zip(series.elapsed_seconds, series.values):
+                try:
+                    timestamp = origin + float(elapsed)
+                    value = float(raw_value)
+                    if not math.isfinite(timestamp) or not math.isfinite(value):
+                        continue
+                    stamp = datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                count += 1
+                if count % 1000 == 0 and self.isInterruptionRequested():
+                    return 0
+                writer.writerow([f"CH{channel:02d}", stamp, value])
+        return count
+
+    def _write_trajectory(
+        self, context: _AnalysisWorkContext, writer: Any, channels: set[int]
+    ) -> int:
+        writer.writerow(["通道", "时间", "X(mm)", "Y(mm)", "Z(mm)",
+                         "累计二维距离(mm)", "每分钟运动量(mm)", "蛰伏状态"])
+        records_by_channel = context._trajectory_records_for_channels(channels)
+        count = 0
+        for channel, records in records_by_channel.items():
+            if self.isInterruptionRequested():
+                return 0
+            points, elapsed, cumulative = context._trajectory_distance_metrics(records)
+            steps = [0.0] + [
+                cumulative[index] - cumulative[index - 1]
+                for index in range(1, len(cumulative))
+            ]
+            minute_map = dict(context._minute_distance(elapsed, steps))
+            states = context._sleep_states(records)
+            for index, (record, point) in enumerate(zip(records, points)):
+                count += 1
+                if count % 1000 == 0 and self.isInterruptionRequested():
+                    return 0
+                bucket = int(elapsed[index] // 60.0)
+                state_index = int(elapsed[index] // 10.0)
+                state = states[state_index] if state_index < len(states) else None
+                xyz = [f"{value:.6f}" for value in point]
+                if record.get("source") == "legacy_trajectory_csv":
+                    xyz[2] = ""
+                writer.writerow([
+                    f"CH{channel:02d}", record.get("time", ""), *xyz,
+                    f"{cumulative[index]:.6f}", f"{minute_map.get(bucket, 0.0):.6f}",
+                    "蛰伏" if state == 1.0 else ("自由活动" if state == 0.0 else UNKNOWN),
+                ])
+        return count
