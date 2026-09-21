@@ -182,8 +182,7 @@ def _as_bool(value, default=False):
 
 
 def _save_raw_frames():
-    if not global_setting.get_setting("behavior_feature_enabled", False):
-        return False
+
     config = _camera_config() or {}
     deep_config = config.get("DEEP_CAMERA", {}) if isinstance(config, dict) else {}
     trajectory_config = config.get("MOUSE_TRAJECTORY", {}) if isinstance(config, dict) else {}
@@ -232,8 +231,7 @@ def _color_jpg_quality():
 
 
 def _record_video_enabled():
-    if not global_setting.get_setting("behavior_feature_enabled", False):
-        return False
+
     return _as_bool(_deep_camera_config().get("record_video", False), False)
 
 

@@ -389,6 +389,7 @@ class CageCalibrationImage(QLabel):
         self._detected_points = parsed[:4]
         self.update()
 
+
     def _display_rect(self) -> QRect:
         pixmap = self.pixmap()
         if pixmap is None or pixmap.isNull():
@@ -455,6 +456,7 @@ class CageCalibrationImage(QLabel):
             painter.setPen(QPen(QColor("#f4b400"), 2))
             for first, second in zip(detected, detected[1:] + detected[:1]):
                 painter.drawLine(first, second)
+
 
         pen = QPen(QColor("#ff4d5a" if self._calibration_mode else "#28b779"), 3)
         painter.setPen(pen)
@@ -2512,6 +2514,7 @@ class MachineVisionPage(_BaseWorkflowPage):
         self._cage_calibration_mode = False
         self._cage_calibration_points: list[tuple[float, float]] = []
         self._detected_cage_points: dict[int, list[dict[str, float]]] = {}
+
         self._live_trajectory_samples: dict[int, list[Optional[tuple[float, float, float]]]] = {}
         self._live_trajectory_frame_ids: dict[int, int] = {}
         self.trajectory_thread = None
@@ -2676,6 +2679,12 @@ class MachineVisionPage(_BaseWorkflowPage):
             # to the consumer, but keep it explicit here so P5 can read the
             # legacy worker's last-good corner cache during a refresh.
             self.trajectory_thread = trajectory_thread
+            apply_tuning = getattr(trajectory_thread, "apply_trajectory_tuning", None)
+            if callable(apply_tuning):
+                apply_tuning(tab_4.trajectory_tuning_store.snapshot())
+            set_preview_cage = getattr(trajectory_thread, "set_preview_cage_number", None)
+            if callable(set_preview_cage):
+                set_preview_cage(self.selected_channel)
             self._connect_trajectory_signal(trajectory_thread)
             self._sync_detected_cage_points_from_service(self.selected_channel)
             self._apply_selected_cage_calibration_to_service()
@@ -2711,6 +2720,7 @@ class MachineVisionPage(_BaseWorkflowPage):
             self._detected_cage_points[channel] = corners
             if channel == self.selected_channel and hasattr(self, "frame_label"):
                 self.frame_label.set_detected_cage_points(corners)
+
 
         # A normal frame result always carries ``solved``.  A missing solution
         # is a real blank sample and therefore terminates the current line;
@@ -3011,6 +3021,10 @@ class MachineVisionPage(_BaseWorkflowPage):
     def _select_channel(self, channel: int) -> None:
         self._cancel_cage_calibration(update_status=False)
         self.selected_channel = channel
+        if self.trajectory_thread is not None:
+            set_preview = getattr(self.trajectory_thread, "set_preview_cage_number", None)
+            if callable(set_preview):
+                set_preview(channel)
         for index, button in enumerate(self.channel_buttons, 1): button.setChecked(index == channel)
         detected_points = self._sync_detected_cage_points_from_service(channel)
         self.frame_label.set_detected_cage_points(detected_points)
@@ -3400,6 +3414,7 @@ class MachineVisionPage(_BaseWorkflowPage):
                                "channel": source.get("channel")})
         return classified
 
+
     def refresh(self) -> None:
         fresh_frame = shared_video_frame_store.read_frame(
             "deep_camera",
@@ -3425,10 +3440,12 @@ class MachineVisionPage(_BaseWorkflowPage):
                 image = QImage(rgb.data, width, height, rgb.strides[0], QImage.Format.Format_RGB888).copy()
                 self.frame_label.setText("")
                 self.frame_label.set_frame_image(QPixmap.fromImage(image), self._last_frame_size)
+
                 self._update_cage_calibration_overlay()
             else:
                 self._last_frame_size = (0, 0)
                 self.frame_label.clear_frame_image(); self.frame_label.setText("轨迹相机无新帧（未启用或画面超时）")
+
         # P5 is a live view; keep the recent window bounded.  P6 explicitly
         # requests the complete history for comparison and export.
         records = self._trajectory_records(limit=500); points = [item["point"] for item in records]
@@ -4627,6 +4644,10 @@ class DataAnalysisPage(_BaseWorkflowPage):
 
     def _select_channel(self, channel: int) -> None:
         self.selected_channel = channel
+        if self.trajectory_thread is not None:
+            set_preview = getattr(self.trajectory_thread, "set_preview_cage_number", None)
+            if callable(set_preview):
+                set_preview(channel)
         for index, button in enumerate(self.channel_buttons, 1): button.setChecked(index == channel)
         self.refresh()
 
