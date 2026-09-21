@@ -3613,7 +3613,7 @@ class DataAnalysisPage(_BaseWorkflowPage):
         self._trajectory_animation_active = False; self._trajectory_animation_index = 1
         self._trajectory_animation_states: dict[str, dict[str, Any]] = {
             module: {"active": False, "index": 1, "finished": False}
-            for module in ("3d", "xy", "height")
+            for module in ("3d", "xy", "height", "sleep", "cumulative", "total", "minute", "dwell", "recognition", "infrared")
         }
         self._trajectory_channels: set[int] = {1}
         self._trajectory_modules: set[str] = {"3d"}
@@ -4277,7 +4277,10 @@ class DataAnalysisPage(_BaseWorkflowPage):
         self.trajectory_play_button.setVisible(visible)
         if not visible:
             return
-        state = self._trajectory_animation_states[selected]
+        state = self._trajectory_animation_states.setdefault(
+            selected,
+            {"active": False, "index": 1, "finished": False},
+        )
         if state["active"]:
             text = "暂停轨迹动画"
         elif state["finished"]:
