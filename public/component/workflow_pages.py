@@ -4737,7 +4737,7 @@ class DataAnalysisPage(_BaseWorkflowPage):
             }
             payloads = self._trajectory_payload(partial_records)
         for key, plot in self.trajectory_compare_plots.items():
-            if key == "recognition":
+            if key == "recognition" or isinstance(plot, LegacyTrajectoryImageGrid):
                 continue
             plot.set_series(payloads.get(key, []))
         self._relayout_trajectory_comparison()
