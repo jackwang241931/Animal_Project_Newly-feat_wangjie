@@ -2321,7 +2321,7 @@ class TrajectoryComparisonPlot(QWidget):
                 state = values[column] if column < len(values) else None
                 color = QColor("#d9dde3") if state is None else (self._SLEEP_COLORS[1] if float(state) >= 0.5 else self._SLEEP_COLORS[0])
                 painter.setBrush(color); painter.setPen(Qt.PenStyle.NoPen); painter.drawRect(int(rect.left() + column * cell_w), int(rect.top() + row * cell_h), max(1, int(cell_w - 1)), max(1, int(cell_h - 2)))
-        painter.setPen(QColor("#7191b2")); painter.drawText(rect.left(), rect.bottom() + 20, "实验时间（每格 10 秒；红色=蛰伏，浅色=活动）")
+        painter.setPen(QColor("#7191b2")); painter.drawText(rect.left(), rect.bottom() + 20, "实验时间（每格 10 秒；红色=睡眠，浅色=活动）")
 
     def paintEvent(self, event) -> None:
         del event
