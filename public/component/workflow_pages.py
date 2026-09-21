@@ -1848,7 +1848,8 @@ class TrajectoryComparisonPlot(QWidget):
     # Keep the old analysis window's channel palette so the comparison plots
     # remain visually compatible with the legacy charts.
     _COLORS = ("#1677B8", "#D95F02", "#009E73", "#CC79A7", "#E69F00", "#56B4E9", "#D62728", "#1A1A1A")
-    _INFRARED_COLORS = ("#ff6b35", "#ff814f", "#f59e0b", "#e76f51", "#d95d39", "#f4a261", "#e85d04", "#c7511f")
+    # Fixed, high-contrast cage colors for the infrared comparison chart.
+    _INFRARED_COLORS = ("#0072B2", "#D55E00", "#009E73", "#CC79A7", "#E69F00", "#56B4E9", "#F0E442", "#000000")
     _SLEEP_COLORS = (QColor("#f4f7fb"), QColor("#e0584f"))
 
     def __init__(self, mode: str, parent=None):
@@ -1965,6 +1966,13 @@ class TrajectoryComparisonPlot(QWidget):
         painter.drawText(tile.adjusted(9, 6, -8, -6), Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft, label)
 
     @staticmethod
+    def _infrared_color(label: str, index: int) -> QColor:
+        """Return a stable color derived from the physical cage number."""
+        match = re.search(r"(\d+)$", str(label))
+        palette_index = int(match.group(1)) - 1 if match else int(index)
+        return QColor(TrajectoryComparisonPlot._INFRARED_COLORS[palette_index % len(TrajectoryComparisonPlot._INFRARED_COLORS)])
+
+    @staticmethod
     def _display_label(label: str) -> str:
         """Show both the channel and its physical cage number."""
         text = str(label)
@@ -1994,7 +2002,7 @@ class TrajectoryComparisonPlot(QWidget):
         y = rect.top() - 44
         palette = self._INFRARED_COLORS if self.mode == "infrared" else self._COLORS
         for index, (label, _values) in enumerate(self.series):
-            color = QColor(palette[index % len(palette)])
+            color = self._infrared_color(label, index) if self.mode == "infrared" else QColor(palette[index % len(palette)])
             painter.setPen(QPen(color, 3)); painter.drawLine(x, y - 4, x + 13, y - 4)
             display = self._display_label(label)
             painter.setPen(QColor("#355775")); painter.drawText(x + 18, y, display)
@@ -2283,7 +2291,7 @@ class TrajectoryComparisonPlot(QWidget):
             ]
             if not numeric:
                 continue
-            color = QColor(self._INFRARED_COLORS[index % len(self._INFRARED_COLORS)])
+            color = self._infrared_color(_label, index)
             painter.setPen(QPen(color, 1))
             painter.setBrush(color)
             for stamp, temperature in numeric:
