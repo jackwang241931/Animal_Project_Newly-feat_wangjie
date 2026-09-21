@@ -476,10 +476,26 @@ class MainWindow_Index(ThemedWindow):
         self._close_without_confirmation = True
         QTimer.singleShot(0, self.close)
 
+    def _prepare_close_stop_display(self):
+        """Show the stopping state before the window is disabled for close."""
+        show_page = getattr(self, "show_experiment_control_page", None)
+        if callable(show_page):
+            try:
+                show_page()
+            except Exception as error:
+                logger.debug(f"unable to show experiment control page while stopping: {error}")
+
     def closeEvent(self, event):
         if self._close_without_confirmation:
             self._close_without_confirmation = False
             event.accept()
+            return
+
+        if self.workflow_run_state == ExperimentRunState.STOPPING:
+            self._prepare_close_stop_display()
+            self._close_after_stop = True
+            self.setEnabled(False)
+            event.ignore()
             return
 
         if len(self.open_windows) != 0:
@@ -491,10 +507,13 @@ class MainWindow_Index(ThemedWindow):
                 QMessageBox.StandardButton.No,
             )
             if reply == QMessageBox.StandardButton.Yes:
-                for window in self.open_windows:
-                    self.close_window_handle()
-                window.close()
-                if self._experiment_needs_stop_before_close():
+                needs_stop = self._experiment_needs_stop_before_close()
+                if needs_stop:
+                    self._prepare_close_stop_display()
+                self.close_window_handle()
+                for window in list(self.open_windows):
+                    window.close()
+                if needs_stop:
                     self._close_after_stop = True
                     self.setEnabled(False)
                     event.ignore()
@@ -511,8 +530,11 @@ class MainWindow_Index(ThemedWindow):
                 QMessageBox.StandardButton.No,
             )
             if reply == QMessageBox.StandardButton.Yes:
+                needs_stop = self._experiment_needs_stop_before_close()
+                if needs_stop:
+                    self._prepare_close_stop_display()
                 self.close_window_handle()
-                if self._experiment_needs_stop_before_close():
+                if needs_stop:
                     self._close_after_stop = True
                     self.setEnabled(False)
                     event.ignore()
