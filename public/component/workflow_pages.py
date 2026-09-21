@@ -2361,11 +2361,12 @@ class TrajectoryComparisonPlot(QWidget):
 class DualAxisChart(QWidget):
     """Draw persisted comparison data as a readable dual-axis chart."""
 
-    _LEFT_COLORS = ("#1769aa", "#268bd2", "#4aa8df", "#0f4c81", "#68b7e3", "#3478b7", "#78c1ea", "#245d8f")
-    _RIGHT_COLORS = ("#c7530c", "#e88318", "#f2a340", "#9f3f05", "#f5b461", "#d96813", "#ffc778", "#b94b0a")
-    _GRID_COLOR = QColor("#e5eef6")
-    _LEFT_AXIS_COLOR = QColor("#2f86ca")
-    _RIGHT_AXIS_COLOR = QColor("#df7418")
+    _CHANNEL_COLORS = ("#1677B8", "#D95F02", "#009E73", "#CC79A7", "#E69F00", "#56B4E9", "#D62728", "#1A1A1A")
+    _LEFT_COLORS = _CHANNEL_COLORS
+    _RIGHT_COLORS = _CHANNEL_COLORS
+    _GRID_COLOR = QColor("#DCEAF6")
+    _LEFT_AXIS_COLOR = QColor("#1677B8")
+    _RIGHT_AXIS_COLOR = QColor("#D95F02")
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -2503,6 +2504,12 @@ class DualAxisChart(QWidget):
         text = re.sub(r"（[^）]*）|\([^)]*\)", "", str(label)).strip()
         return text or str(label)
 
+    @classmethod
+    def _channel_color(cls, label: str, fallback_index: int = 0) -> str:
+        match = re.search(r"(\d+)$", str(label))
+        index = int(match.group(1)) - 1 if match else fallback_index
+        return cls._CHANNEL_COLORS[index % len(cls._CHANNEL_COLORS)]
+
     @staticmethod
     def _decimate(points: list[tuple[float, float]], limit: int) -> list[tuple[float, float]]:
         if len(points) <= limit:
@@ -2513,11 +2520,17 @@ class DualAxisChart(QWidget):
             sampled.append(points[-1])
         return sampled
 
-    def _legend_items(self) -> list[tuple[str, str]]:
+    def _legend_items(self) -> list[tuple[str, str, Qt.PenStyle]]:
         left_metric = self._metric_short_name(self._left_axis_label)
         right_metric = self._metric_short_name(self._right_axis_label)
-        items = [(f"{label} · {left_metric}", self._LEFT_COLORS[index % len(self._LEFT_COLORS)]) for index, (label, values) in enumerate(self.left_series) if values]
-        items.extend((f"{label} · {right_metric}", self._RIGHT_COLORS[index % len(self._RIGHT_COLORS)]) for index, (label, values) in enumerate(self.right_series) if values)
+        items = [
+            (f"{label} · {left_metric}", self._channel_color(label, index), Qt.PenStyle.SolidLine)
+            for index, (label, values) in enumerate(self.left_series) if values
+        ]
+        items.extend(
+            (f"{label} · {right_metric}", self._channel_color(label, index), Qt.PenStyle.DashLine)
+            for index, (label, values) in enumerate(self.right_series) if values
+        )
         return items
 
     def paintEvent(self, event) -> None:
@@ -2529,7 +2542,7 @@ class DualAxisChart(QWidget):
         usable_legend_width = max(200, self.width() - 96)
         legend_rows = 1
         row_width = 0
-        for label, _color in legend_items:
+        for label, _color, _line_style in legend_items:
             item_width = metrics.horizontalAdvance(label) + 42
             if row_width and row_width + item_width > usable_legend_width:
                 legend_rows += 1
@@ -2589,9 +2602,9 @@ class DualAxisChart(QWidget):
         painter.setPen(self._RIGHT_AXIS_COLOR)
         painter.drawText(QRect(rect.center().x(), 8, rect.width() // 2 + 52, 24), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, f"右 · {self._right_axis_label}")
 
-        for series, colors, axis_low, axis_high in (
-            (self._left_points, self._LEFT_COLORS, left_low, left_high),
-            (self._right_points, self._RIGHT_COLORS, right_low, right_high),
+        for series, axis_low, axis_high, line_style in (
+            (self._left_points, left_low, left_high, Qt.PenStyle.SolidLine),
+            (self._right_points, right_low, right_high, Qt.PenStyle.DashLine),
         ):
             axis_span = max(axis_high - axis_low, 1e-12)
             for series_index, (_label, points) in enumerate(series):
@@ -2607,17 +2620,17 @@ class DualAxisChart(QWidget):
                         path.moveTo(point)
                     else:
                         path.lineTo(point)
-                painter.setPen(QPen(QColor(colors[series_index % len(colors)]), 2.2))
+                painter.setPen(QPen(QColor(self._channel_color(_label, series_index)), 1.9, line_style))
                 painter.drawPath(path)
 
         legend_x = rect.left()
         legend_y = rect.bottom() + 48
-        for label, color in legend_items:
+        for label, color, line_style in legend_items:
             item_width = metrics.horizontalAdvance(label) + 42
             if legend_x > rect.left() and legend_x + item_width > rect.right():
                 legend_x = rect.left()
                 legend_y += 24
-            painter.setPen(QPen(QColor(color), 4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            painter.setPen(QPen(QColor(color), 4, line_style, Qt.PenCapStyle.RoundCap))
             painter.drawLine(legend_x, legend_y - 5, legend_x + 16, legend_y - 5)
             painter.setPen(QColor("#476985"))
             painter.drawText(legend_x + 23, legend_y, label)
