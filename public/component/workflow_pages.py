@@ -1968,6 +1968,53 @@ class TrajectoryComparisonPlot(QWidget):
             painter.setPen(QPen(QColor("#e8f0f7"), 1)); painter.drawLine(QPointF(x, rect.top()), QPointF(x, rect.bottom())); painter.drawLine(QPointF(rect.left(), y), QPointF(rect.right(), y))
         painter.setPen(QColor("#7191b2")); painter.drawText(rect.left(), rect.bottom() + 20, x_label); painter.drawText(rect.left() - 8, rect.top() - 8, y_label)
 
+    def _paint_legacy_height_tile(self, painter: QPainter, rect, values: list[tuple[float, float, float]]) -> None:
+        """Draw the old X/Z height trajectory directly from physical samples."""
+        converted = [self._mm(point) for point in values if len(point) >= 3 and all(_number(v) is not None for v in point)]
+        if not converted:
+            self._empty(painter, rect)
+            return
+        xs = [float(point[0]) for point in converted]
+        heights = [float(point[2]) for point in converted]
+        raw_min = min(heights)
+        raw_max = max(heights)
+        value_range = 20.0 if abs(raw_max - raw_min) < 1e-8 else raw_max - raw_min
+        min_height = max(0.0, raw_min - value_range * 0.2)
+        max_height = min(float(CAGE_HEIGHT_MM), raw_max + value_range * 0.2)
+        if abs(max_height - min_height) < 1e-8:
+            max_height = min(float(CAGE_HEIGHT_MM), min_height + 20.0)
+        chart = rect.adjusted(0, 22, 0, -20)
+        painter.setPen(QPen(QColor("#d8e7f3"), 1))
+        painter.setBrush(QColor("#f8fafc"))
+        painter.drawRect(chart)
+        painter.setPen(QColor("#355775"))
+        painter.drawText(rect.adjusted(2, 1, -2, -1), Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter, "Mouse Height by X")
+        for tick in range(1, 5):
+            x = chart.left() + chart.width() * tick / 5.0
+            y = chart.top() + chart.height() * tick / 5.0
+            painter.setPen(QPen(QColor("#e8f0f7"), 1))
+            painter.drawLine(QPointF(x, chart.top()), QPointF(x, chart.bottom()))
+            painter.drawLine(QPointF(chart.left(), y), QPointF(chart.right(), y))
+        def map_point(x_value: float, z_value: float) -> QPointF:
+            x_ratio = (x_value + float(CAGE_WIDTH_MM) / 2.0) / max(float(CAGE_WIDTH_MM), 1.0)
+            z_ratio = (z_value - min_height) / max(max_height - min_height, 1.0)
+            return QPointF(chart.left() + x_ratio * chart.width(), chart.bottom() - z_ratio * chart.height())
+        plasma = ("#0d0887", "#5c01a6", "#9c179e", "#cc4778", "#ed7953", "#fdb32b", "#f0f921")
+        points = [map_point(x_value, z_value) for x_value, z_value in zip(xs, heights)]
+        for index, (first, second) in enumerate(zip(points, points[1:])):
+            color_index = int(index / max(len(points) - 2, 1) * (len(plasma) - 1))
+            painter.setPen(QPen(QColor(plasma[min(len(plasma) - 1, color_index)]), 2))
+            painter.drawLine(first, second)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#0f172a"))
+        for point in points:
+            painter.drawEllipse(point, 1.8, 1.8)
+        painter.setBrush(QColor("#16a34a")); painter.drawEllipse(points[0], 4, 4)
+        painter.setBrush(QColor("#dc2626")); painter.drawEllipse(points[-1], 4, 4)
+        painter.setPen(QColor("#7191b2"))
+        painter.drawText(chart.left(), chart.bottom() + 16, "X")
+        painter.drawText(chart.left() - 4, chart.top() - 4, "Z total")
+
     def _paint_per_cage_trajectory(self, painter: QPainter, rect) -> None:
         """Draw one adaptive subplot per selected cage for 3D/XY/height."""
         tiles = self._tile_rects(rect, len(self.series))
@@ -1977,6 +2024,9 @@ class TrajectoryComparisonPlot(QWidget):
             valid = [point for point in values if len(point) >= 3 and all(_number(v) is not None for v in point)]
             if not valid:
                 self._empty(painter, plot_rect)
+                continue
+            if self.mode == "height":
+                self._paint_legacy_height_tile(painter, plot_rect, valid)
                 continue
             if self.mode == "3d":
                 projected = [TrajectoryCanvas._project(corner, plot_rect) for corner in TrajectoryCanvas._cage_corners()]
@@ -3797,10 +3847,6 @@ class DataAnalysisPage(_BaseWorkflowPage):
                 self.analysis_recognition_count_label.setProperty("hint", True)
                 self.analysis_recognition_count_label.setWordWrap(True)
                 card_layout.addWidget(self.analysis_recognition_count_label)
-            elif key == "height":
-                plot = LegacyTrajectoryImageGrid("暂无旧版高度图，请先选择有轨迹导出的实验")
-            elif key == "dwell":
-                plot = LegacyTrajectoryImageGrid("暂无旧版活动热力图，请先选择有轨迹导出的实验")
             else:
                 plot = TrajectoryComparisonPlot("minute" if key == "minute" else key)
             card_layout.addWidget(plot, 1)
@@ -4271,9 +4317,9 @@ class DataAnalysisPage(_BaseWorkflowPage):
         if not hasattr(self, "trajectory_play_button"):
             return
         selected = next(iter(self._trajectory_modules), "3d")
-        # Height and occupancy views are legacy exported images, not animated
-        # re-plots.  Keep playback only for the point-series views.
-        visible = selected in {"3d", "xy", "cumulative", "minute"}
+        # The legacy height view is redrawn from the selected trajectory samples.
+        # Activity heatmaps remain direct grid renderings and do not animate.
+        visible = selected in {"3d", "xy", "height", "cumulative", "minute"}
         self.trajectory_play_button.setVisible(visible)
         if not visible:
             return
@@ -4723,13 +4769,6 @@ class DataAnalysisPage(_BaseWorkflowPage):
             self._relayout_trajectory_comparison()
             return
         selected = next(iter(self._trajectory_modules), "3d")
-        if selected in {"height", "dwell"}:
-            image_plot = self.trajectory_compare_plots.get(selected)
-            if isinstance(image_plot, LegacyTrajectoryImageGrid):
-                image_plot.set_image_paths(self._legacy_trajectory_image_paths(selected))
-            self._relayout_trajectory_comparison()
-            self.trajectory_compare_container.adjustSize()
-            return
         records_by_channel = self._trajectory_records_for_channels()
         payloads = self._trajectory_payload(records_by_channel)
         state = self._trajectory_animation_states.get(selected)
@@ -4740,7 +4779,7 @@ class DataAnalysisPage(_BaseWorkflowPage):
             }
             payloads = self._trajectory_payload(partial_records)
         for key, plot in self.trajectory_compare_plots.items():
-            if key == "recognition" or isinstance(plot, LegacyTrajectoryImageGrid):
+            if key == "recognition":
                 continue
             plot.set_series(payloads.get(key, []))
         self._relayout_trajectory_comparison()

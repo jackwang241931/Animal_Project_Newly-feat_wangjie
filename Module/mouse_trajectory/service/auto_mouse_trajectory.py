@@ -649,10 +649,12 @@ def occupancy_points(
     in_instrument_gap = False
 
     for row in rows:
-        is_valid = row.get("status") == "ok" and row.get("X") is not None and row.get("Y") is not None
+        raw_x = row.get("rawX") if row.get("rawX") is not None else row.get("X")
+        raw_y = row.get("rawY") if row.get("rawY") is not None else row.get("Y")
+        is_valid = row.get("status") == "ok" and raw_x is not None and raw_y is not None
         if is_valid:
-            xs.append(float(row["X"]))
-            ys.append(float(row["Y"]))
+            xs.append(float(raw_x))
+            ys.append(float(raw_y))
             previous_valid = True
             in_instrument_gap = False
         elif row.get("status") == "no_mouse" and instrument_polygon and (previous_valid or in_instrument_gap):
@@ -820,25 +822,35 @@ def save_plots(output_dir: Path, rows: Sequence[Dict[str, Any]], instrument_poly
     fig.savefig(output_dir / "occupancy_heatmap.png", dpi=160)
     plt.close(fig)
 
-    valid_h = [
-        r
-        for r in rows
-        if r.get("status") == "ok" and r.get("X") is not None and r.get("Z") is not None
-    ]
+    valid_h = []
+    for row in rows:
+        raw_x = row.get("rawX") if row.get("rawX") is not None else row.get("X")
+        raw_z = row.get("rawZ") if row.get("rawZ") is not None else row.get("Z")
+        if row.get("status") == "ok" and raw_x is not None and raw_z is not None:
+            plot_row = dict(row)
+            plot_row["X"] = raw_x
+            plot_row["Z"] = raw_z
+            valid_h.append(plot_row)
     fig, ax = plt.subplots(figsize=(9.2, 5.2))
     fig.patch.set_facecolor("#ffffff")
     ax.set_facecolor("#f8fafc")
     if valid_h:
-        first_timestamp = float(valid_h[0].get("timestamp", 0.0) or 0.0)
-        elapsed = [max(float(row.get("timestamp", first_timestamp) or first_timestamp) - first_timestamp, 0.0) for row in valid_h]
-        stable_heights = [float(r["Z"]) for r in valid_h]
-        raw_heights = [float(r.get("rawZ", r["Z"])) for r in valid_h]
-        ax.plot(elapsed, raw_heights, color="#94a3b8", linewidth=1.2, alpha=0.70, label="raw Z")
-        ax.plot(elapsed, stable_heights, color="#7c3aed", linewidth=2.2, alpha=0.95, label="stable Z")
-        ax.scatter(elapsed[0], stable_heights[0], c="#16a34a", s=48, edgecolors="white", linewidths=1.1, label="start", zorder=4)
-        ax.scatter(elapsed[-1], stable_heights[-1], c="#dc2626", s=48, edgecolors="white", linewidths=1.1, label="end", zorder=4)
-        raw_min = min(raw_heights + stable_heights)
-        raw_max = max(raw_heights + stable_heights)
+        xs = [float(r["X"]) for r in valid_h]
+        heights = [float(r["Z"]) for r in valid_h]
+        if len(xs) > 1:
+            points = np.column_stack([xs, heights]).reshape(-1, 1, 2)
+            segments = np.concatenate([points[:-1], points[1:]], axis=1)
+            line = LineCollection(segments, cmap="plasma", linewidths=2.4, alpha=0.94, zorder=2)
+            line.set_array(np.linspace(0.0, 1.0, len(segments)))
+            ax.add_collection(line)
+            cbar = fig.colorbar(line, ax=ax, pad=0.018, fraction=0.045)
+            cbar.set_label("trajectory progress")
+            cbar.outline.set_visible(False)
+        ax.scatter(xs, heights, c="#0f172a", s=12, alpha=0.42, linewidths=0, zorder=3)
+        ax.scatter(xs[0], heights[0], c="#16a34a", s=58, edgecolors="white", linewidths=1.3, label="start", zorder=4)
+        ax.scatter(xs[-1], heights[-1], c="#dc2626", s=58, edgecolors="white", linewidths=1.3, label="end", zorder=4)
+        raw_min = min(heights)
+        raw_max = max(heights)
         value_range = 20.0 if abs(raw_max - raw_min) < 1e-8 else raw_max - raw_min
         min_h = max(0.0, raw_min - value_range * 0.2)
         max_h = min(CAL.HEIGHT_EST, raw_max + value_range * 0.2)
@@ -846,9 +858,10 @@ def save_plots(output_dir: Path, rows: Sequence[Dict[str, Any]], instrument_poly
             max_h = min(CAL.HEIGHT_EST, min_h + 20.0)
         ax.set_ylim(min_h, max_h)
         ax.legend(loc="upper right", frameon=False)
-    ax.set_title("Mouse Height over Time")
-    ax.set_xlabel("Elapsed time (s)")
-    ax.set_ylabel("Z (mm)")
+    ax.set_title("Mouse Height by X")
+    ax.set_xlabel("X")
+    ax.set_ylabel("Z total")
+    ax.set_xlim(-CAL.BOTTOM_W / 2.0, CAL.BOTTOM_W / 2.0)
     ax.grid(True, color="#cbd5e1", alpha=0.38, linewidth=0.8)
     for spine in ax.spines.values():
         spine.set_color("#cbd5e1")
