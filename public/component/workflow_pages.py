@@ -43,6 +43,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 from public.component.analysis_export_widgets import ChartImageDialog
+from public.component.live_analysis_snapshot import LiveDatabaseSnapshotLoader
 from loguru import logger
 
 from public.config_class.global_setting import global_setting
@@ -3739,6 +3740,8 @@ class LegacyTrajectoryImageGrid(QWidget):
 class DataAnalysisPage(_BaseWorkflowPage):
     """P6 behaviour analysis and historical trajectory view."""
 
+    LIVE_EXPERIMENT_KEY = "__LIVE_EXPERIMENT__"
+
     _ANALYSIS_EXPORT_META = {
         "3d": {"title": "三维轨迹图", "data": "三维轨迹数据", "filename": "trajectory_3d"},
         "xy": {"title": "二维轨迹平面图", "data": "二维轨迹数据", "filename": "trajectory_xy"},
@@ -3769,6 +3772,15 @@ class DataAnalysisPage(_BaseWorkflowPage):
         self._trajectory_modules: set[str] = {"3d"}
         self._zoomable_widgets: dict[int, tuple[QWidget, str]] = {}
         self._chart_export_sizes: dict[int, QSize] = {}
+        self._live_analysis_mode = True
+        self._live_snapshot_db_path: Optional[str] = None
+        self._live_snapshot_source_db_path: Optional[str] = None
+        self._live_snapshot_updated_at: Optional[float] = None
+        self._live_snapshot_last_requested_at = 0.0
+        self._live_snapshot_interval_seconds = 5.0
+        self._live_snapshot_generation = 0
+        self._live_snapshot_worker: Optional[LiveDatabaseSnapshotLoader] = None
+        self._live_snapshot_error = ""
         self._trajectory_records_cache: dict[int, list[dict[str, Any]]] = {}
         self._legacy_trajectory_cache_key: Optional[tuple[Any, ...]] = None
         self._legacy_trajectory_cache: Any = None
@@ -3792,6 +3804,14 @@ class DataAnalysisPage(_BaseWorkflowPage):
     def stop_refresh(self) -> None:
         super().stop_refresh()
         self._cancel_historical_workbook_loads()
+        self._cancel_live_snapshot_worker()
+        live_worker = self._live_snapshot_worker
+        if live_worker is not None:
+            try:
+                if live_worker.isRunning():
+                    live_worker.wait(3000)
+            except RuntimeError:
+                pass
         for worker in tuple(self._historical_workers):
             if worker.isRunning():
                 worker.wait(3000)
@@ -3850,9 +3870,13 @@ class DataAnalysisPage(_BaseWorkflowPage):
         self.analysis_loading_label.setProperty("tone", "info")
         self.analysis_loading_label.setVisible(False)
         experiment_row.addWidget(self.analysis_loading_label)
+        self.live_analysis_status_label = QLabel("")
+        self.live_analysis_status_label.setProperty("hint", True)
+        self.live_analysis_status_label.setMinimumWidth(260)
+        experiment_row.addWidget(self.live_analysis_status_label)
         experiment_row.addWidget(self.refresh_experiment_times_button)
         layout.addLayout(experiment_row)
-        self._header(layout, "DATA ANALYSIS", "数据分析 · 高级统计", "历史实验优先读取导出 Excel；二维轨迹读取对应的 Excel / 逐笼 CSV，三维与红外读取真实数据库记录。")
+        self._header(layout, "DATA ANALYSIS", "数据分析 · 高级统计", "默认读取当前实验的实时数据库快照；历史实验仍按已保存 Excel / 轨迹 CSV 读取，实时快照允许有几秒延迟。")
         summary = QGridLayout(); self.metric_labels = {}
         for index, (key, title) in enumerate((("patterns", "行为模式"), ("main_behavior", "主导行为"), ("night_day", "昼夜活动比"), ("coverage", "轨迹覆盖度"), ("heat", "平均活动"), ("alerts", "异常通道"))):
             card, value, _detail = self._card(title, PENDING if key not in {"patterns", "main_behavior", "alerts"} else UNKNOWN, "真实数据/公式待定")
@@ -3995,8 +4019,187 @@ class DataAnalysisPage(_BaseWorkflowPage):
         trajectory_layout.addWidget(self.trajectory_compare_container, 1); layout.addWidget(trajectory_section)
         layout.addStretch(1)
 
+    def _live_context_status(self) -> str:
+        raw_status = _provider_value(self._base_context_provider).get("experiment_status", "unknown")
+        return str(getattr(raw_status, "value", raw_status) or "unknown").strip().lower()
+
+    def _live_experiment_record(self) -> Optional[tuple[str, str]]:
+        if self._live_context_status() not in {"starting", "running", "monitoring", "stopping"}:
+            return None
+        context = _provider_value(self._base_context_provider)
+        started_at = context.get("started_at")
+        label = "实时实验数据分析（当前实验）"
+        try:
+            if started_at not in (None, ""):
+                label += " · " + datetime.fromtimestamp(float(started_at)).strftime("%Y-%m-%d %H:%M:%S")
+        except (TypeError, ValueError, OSError):
+            pass
+        return label, self.LIVE_EXPERIMENT_KEY
+
+    def _live_source_database_path(self) -> Optional[str]:
+        if self._live_context_status() not in {"starting", "running", "monitoring", "stopping"}:
+            return None
+        source = _provider_value(self._base_context_provider).get("experiment_db_path")
+        if not source:
+            return None
+        source = os.path.abspath(str(source))
+        return source if os.path.isfile(source) else None
+
+    def _live_snapshot_directory(self, source_path: str) -> Path:
+        context = _provider_value(self._base_context_provider)
+        root = context.get("experiment_root_path")
+        if root:
+            return Path(str(root)) / "analysis_snapshots"
+        return Path(source_path).parent.parent / "analysis_snapshots"
+
+    def _update_live_analysis_status(self) -> None:
+        label = getattr(self, "live_analysis_status_label", None)
+        if label is None:
+            return
+        if not self._live_analysis_mode:
+            label.setText("历史实验：按已保存数据读取")
+            return
+        source = self._live_source_database_path()
+        worker = self._live_snapshot_worker
+        if worker is not None and worker.isRunning():
+            label.setText("实时分析：正在生成数据库快照…")
+        elif source is None:
+            if self._live_context_status() in {"starting", "running", "monitoring", "stopping"}:
+                label.setText("实时分析：等待当前实验数据库…")
+            else:
+                label.setText("实时分析：当前未运行实验")
+        elif self._live_snapshot_error:
+            label.setText(f"实时分析：快照失败（{self._live_snapshot_error}）")
+        elif self._live_snapshot_updated_at is not None:
+            delay = max(0, int(time.time() - self._live_snapshot_updated_at))
+            stamp = datetime.fromtimestamp(self._live_snapshot_updated_at).strftime("%H:%M:%S")
+            label.setText(f"实时分析：{stamp} 更新，约延迟 {delay} 秒")
+        else:
+            label.setText("实时分析：等待首次快照")
+
+    def _cleanup_live_snapshots(self, directory: Path, current_path: Path) -> None:
+        try:
+            files = sorted(
+                directory.glob("analysis_live_*.db"),
+                key=lambda item: item.stat().st_mtime,
+                reverse=True,
+            )
+        except OSError:
+            return
+        keep = {str(current_path.resolve())}
+        for item in files:
+            if len(keep) < 4:
+                keep.add(str(item.resolve()))
+                continue
+            try:
+                item.unlink()
+            except OSError:
+                pass
+
+    def _live_snapshot_worker_finished(self, worker: LiveDatabaseSnapshotLoader) -> None:
+        if self._live_snapshot_worker is worker:
+            self._live_snapshot_worker = None
+        worker.deleteLater()
+        self._update_live_analysis_status()
+
+    def _live_snapshot_loaded(
+        self,
+        generation: int,
+        source_path: str,
+        snapshot_path: str,
+        updated_at: float,
+    ) -> None:
+        if not self._live_analysis_mode or generation != self._live_snapshot_generation:
+            return
+        current_source = self._live_source_database_path()
+        if current_source and os.path.normcase(os.path.abspath(source_path)) != os.path.normcase(current_source):
+            return
+        self._live_snapshot_source_db_path = os.path.abspath(source_path)
+        self._live_snapshot_db_path = os.path.abspath(snapshot_path)
+        self._live_snapshot_updated_at = float(updated_at)
+        self._live_snapshot_error = ""
+        self._cleanup_live_snapshots(Path(snapshot_path).parent, Path(snapshot_path))
+        self._update_live_analysis_status()
+        self.refresh()
+
+    def _live_snapshot_failed(self, generation: int, _source_path: str, error: str) -> None:
+        if not self._live_analysis_mode or generation != self._live_snapshot_generation:
+            return
+        self._live_snapshot_error = str(error)
+        logger.warning(f"实时分析快照失败：{error}")
+        self._update_live_analysis_status()
+
+    def _maybe_start_live_snapshot(self) -> None:
+        if not self._live_analysis_mode:
+            return
+        worker = self._live_snapshot_worker
+        if worker is not None and worker.isRunning():
+            self._update_live_analysis_status()
+            return
+        source = self._live_source_database_path()
+        if source is None:
+            self._update_live_analysis_status()
+            return
+        now = time.monotonic()
+        if (
+            os.path.normcase(source) == os.path.normcase(self._live_snapshot_source_db_path or "")
+            and now - self._live_snapshot_last_requested_at < self._live_snapshot_interval_seconds
+        ):
+            self._update_live_analysis_status()
+            return
+        if os.path.normcase(source) != os.path.normcase(self._live_snapshot_source_db_path or ""):
+            self._live_snapshot_db_path = None
+            self._live_snapshot_updated_at = None
+        self._live_snapshot_source_db_path = source
+        self._live_snapshot_last_requested_at = now
+        self._live_snapshot_generation += 1
+        snapshot_directory = self._live_snapshot_directory(source)
+        snapshot_path = snapshot_directory / f"analysis_live_{int(time.time() * 1000)}.db"
+        worker = LiveDatabaseSnapshotLoader(self._live_snapshot_generation, source, str(snapshot_path))
+        self._live_snapshot_worker = worker
+        worker.loaded.connect(self._live_snapshot_loaded)
+        worker.failed.connect(self._live_snapshot_failed)
+        worker.finished.connect(lambda current=worker: self._live_snapshot_worker_finished(current))
+        self._update_live_analysis_status()
+        worker.start()
+
+    def _cancel_live_snapshot_worker(self, clear_snapshot: bool = False) -> None:
+        self._live_snapshot_generation += 1
+        worker = self._live_snapshot_worker
+        if worker is not None and worker.isRunning():
+            worker.requestInterruption()
+        if clear_snapshot:
+            self._live_snapshot_db_path = None
+            self._live_snapshot_source_db_path = None
+            self._live_snapshot_updated_at = None
+            self._live_snapshot_error = ""
+
+    def _activate_live_analysis(self, refresh_page: bool = True) -> None:
+        self._live_analysis_mode = True
+        self._selected_experiment_selection_path = self.LIVE_EXPERIMENT_KEY
+        self._selected_experiment_db_path = None
+        self._selected_experiment_excel_path = None
+        self._selected_trajectory_export_path = None
+        self._trajectory_selection_user_set = False
+        self._legacy_comparison_cache_key = None
+        self._legacy_comparison_cache = {}
+        self._historical_latest_rows = {}
+        self._historical_start_timestamp = 0.0
+        self._cancel_historical_workbook_loads()
+        self._set_historical_loading(False)
+        self._live_snapshot_error = ""
+        self._update_live_analysis_status()
+        if hasattr(self, "trajectory_experiment_combo"):
+            self.refresh_trajectory_experiments()
+        if refresh_page:
+            self.refresh()
     def _selected_experiment_context(self) -> dict[str, Any]:
         context = dict(_provider_value(self._base_context_provider))
+        if self._live_analysis_mode:
+            snapshot = self._live_snapshot_db_path
+            if snapshot and os.path.isfile(snapshot):
+                context["experiment_db_path"] = snapshot
+            return context
         selected = self._selected_experiment_db_path
         if selected is None:
             return context
@@ -4017,6 +4220,8 @@ class DataAnalysisPage(_BaseWorkflowPage):
         return context
 
     def _selected_experiment_health(self) -> Mapping[str, Any]:
+        if self._live_analysis_mode:
+            return _provider_value(self._base_health_source)
         selected = self._selected_experiment_db_path
         current = _provider_value(self._base_context_provider).get("experiment_db_path")
         if selected is not None and (
@@ -4025,7 +4230,6 @@ class DataAnalysisPage(_BaseWorkflowPage):
         ):
             return {}
         return _provider_value(self._base_health_source)
-
     def _experiment_storage_root(self) -> str:
         context = _provider_value(self._base_context_provider)
         specified = context.get("experiment_storage_root")
@@ -4053,6 +4257,8 @@ class DataAnalysisPage(_BaseWorkflowPage):
         if records:
             return records
 
+        if self._live_analysis_mode:
+            return []
         # Keep live, not-yet-exported experiments usable until their workbook
         # exists. This is a fallback only, never mixed into historical Excel.
         root = self._experiment_storage_root()
@@ -4103,7 +4309,7 @@ class DataAnalysisPage(_BaseWorkflowPage):
         self.trajectory_experiment_combo.blockSignals(True)
         try:
             self.trajectory_experiment_combo.clear()
-            self.trajectory_experiment_combo.addItem("请选择轨迹实验", "")
+            self.trajectory_experiment_combo.addItem("实时轨迹数据（跟随上方当前实验）", "")
             selected_index = 0
             for label, path in records:
                 self.trajectory_experiment_combo.addItem(label, path)
@@ -4200,14 +4406,14 @@ class DataAnalysisPage(_BaseWorkflowPage):
 
     def refresh_experiment_times(self) -> None:
         initial_selection = (
-            self._selected_experiment_db_path is None
+            self._selected_experiment_selection_path is None
+            and self._selected_experiment_db_path is None
             and self._selected_experiment_excel_path is None
         )
-        # The upper selector belongs to monitor Excel data. The lower
-        # trajectory selector must not move it when a different trajectory
-        # experiment is chosen.
-        preferred = self._selected_experiment_selection_path or self._selected_experiment_excel_path
-        if preferred is None and self._selected_experiment_db_path is None:
+        preferred = self.LIVE_EXPERIMENT_KEY if self._live_analysis_mode else (
+            self._selected_experiment_selection_path or self._selected_experiment_excel_path
+        )
+        if not self._live_analysis_mode and preferred is None and self._selected_experiment_db_path is None:
             current = _provider_value(self._base_context_provider).get("experiment_db_path")
             if current:
                 folder = os.path.basename(os.path.dirname(os.path.dirname(str(current))))
@@ -4225,6 +4431,9 @@ class DataAnalysisPage(_BaseWorkflowPage):
                 if preferred is None and os.path.isfile(str(current)):
                     preferred = os.path.abspath(str(current))
         records = self._scan_experiment_times()
+        live_record = self._live_experiment_record()
+        if live_record is not None:
+            records.insert(0, live_record)
         self.experiment_time_combo.blockSignals(True)
         try:
             self.experiment_time_combo.clear()
@@ -4232,18 +4441,21 @@ class DataAnalysisPage(_BaseWorkflowPage):
             selected_index = 0
             for label, path in records:
                 self.experiment_time_combo.addItem(label, path)
-                if preferred and os.path.normcase(path) == os.path.normcase(preferred):
+                if preferred and path == self.LIVE_EXPERIMENT_KEY and preferred == self.LIVE_EXPERIMENT_KEY:
+                    selected_index = self.experiment_time_combo.count() - 1
+                elif preferred and path != self.LIVE_EXPERIMENT_KEY and os.path.normcase(path) == os.path.normcase(preferred):
                     selected_index = self.experiment_time_combo.count() - 1
             self.experiment_time_combo.setCurrentIndex(selected_index)
         finally:
             self.experiment_time_combo.blockSignals(False)
-        if not initial_selection:
+        selected_data = str(self.experiment_time_combo.itemData(selected_index) or "")
+        if selected_data == self.LIVE_EXPERIMENT_KEY:
+            self._activate_live_analysis(refresh_page=False)
+            self.refresh()
+        elif not initial_selection:
             self._experiment_time_changed(selected_index)
         else:
-            # Opening P6 must not silently replace the live experiment with
-            # an unrelated historical workbook.
             self.refresh()
-
     @staticmethod
     def _workbook_cache_key(path: str) -> tuple[Any, ...]:
         source = Path(path)
@@ -4320,6 +4532,11 @@ class DataAnalysisPage(_BaseWorkflowPage):
 
     def _experiment_time_changed(self, _index: int) -> None:
         selected = str(self.experiment_time_combo.currentData() or "")
+        if selected == self.LIVE_EXPERIMENT_KEY:
+            self._activate_live_analysis()
+            return
+        self._live_analysis_mode = False
+        self._cancel_live_snapshot_worker(clear_snapshot=True)
         self._selected_experiment_selection_path = selected or None
         self._selected_experiment_excel_path = selected if selected.lower().endswith(".xlsx") and os.path.isfile(selected) else None
         if selected and os.path.isdir(selected):
@@ -4343,8 +4560,8 @@ class DataAnalysisPage(_BaseWorkflowPage):
         else:
             self._cancel_historical_workbook_loads()
             self._set_historical_loading(False)
+        self._update_live_analysis_status()
         self.refresh()
-
     def _enhance_bio_card(self) -> None:
         """Add the screenshot-style selected-cage measurement tiles."""
         card = self.bio_label.parentWidget()
@@ -4573,12 +4790,13 @@ class DataAnalysisPage(_BaseWorkflowPage):
         historical_selection = bool(
             self._selected_experiment_excel_path or self._selected_trajectory_export_path
         )
-        legacy = (
-            self._legacy_trajectory_analysis()
-            if historical_selection
-            or self._trajectory_modules & {"xy", "cumulative", "total", "minute", "sleep", "dwell", "recognition"}
-            else None
-        )
+        # The live trajectory worker persists the same legacy CSV format while
+        # the experiment is running.  Use it for every trajectory module,
+        # including 3D, before falling back to the monitor database.  The
+        # previous condition skipped 3D/height in live mode, which made the
+        # analysis page show an empty chart even though trajectory.csv already
+        # contained fresh samples.
+        legacy = self._legacy_trajectory_analysis() if (historical_selection or self._live_analysis_mode) else None
         for channel in sorted(requested_channels):
             if self._trajectory_modules == {"height"} and historical_selection:
                 # The legacy analysis object intentionally exposes only X/Y.
@@ -4675,7 +4893,7 @@ class DataAnalysisPage(_BaseWorkflowPage):
                 return None
             export = os.fspath(export)
             export_path = Path(export)
-            paths = sorted(export_path.glob("cage_*/data/trajectory.csv"))
+            paths = sorted(export_path.glob("cage*/data/trajectory.csv"))
             signature = tuple((str(path), path.stat().st_size, path.stat().st_mtime_ns) for path in paths)
             key = (str(db_path), str(export_path), signature)
             if key != self._legacy_trajectory_cache_key:
@@ -5025,8 +5243,9 @@ class DataAnalysisPage(_BaseWorkflowPage):
 
     def _select_channel(self, channel: int) -> None:
         self.selected_channel = channel
-        if self.trajectory_thread is not None:
-            set_preview = getattr(self.trajectory_thread, "set_preview_cage_number", None)
+        trajectory_thread = getattr(self, "trajectory_thread", None)
+        if trajectory_thread is not None:
+            set_preview = getattr(trajectory_thread, "set_preview_cage_number", None)
             if callable(set_preview):
                 set_preview(channel)
         for index, button in enumerate(self.channel_buttons, 1): button.setChecked(index == channel)
@@ -5407,6 +5626,13 @@ class DataAnalysisPage(_BaseWorkflowPage):
         self.analysis_behavior_chart.set_counts(chart_counts)
 
     def refresh(self) -> None:
+        if self._live_analysis_mode:
+            live_record = self._live_experiment_record()
+            if live_record is not None and hasattr(self, "experiment_time_combo") and self.experiment_time_combo.currentData() != self.LIVE_EXPERIMENT_KEY:
+                self.refresh_experiment_times()
+            self._maybe_start_live_snapshot()
+        else:
+            self._update_live_analysis_status()
         points = self._load_points(); self._history_points = points
         measurements = self._latest_channel_measurements()
         self._update_bio_card(measurements, points)
