@@ -19,7 +19,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional
 
-from PyQt6.QtCore import QPointF, QRect, QSize, QThread, QTimer, Qt, pyqtSignal
+from PyQt6.QtCore import QEvent, QPointF, QRect, QSize, QThread, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QBrush, QColor, QImage, QPainter, QPainterPath, QPen, QPixmap
 from PyQt6.QtSvg import QSvgGenerator
 from PyQt6.QtWidgets import (
@@ -42,6 +42,7 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from public.component.analysis_export_widgets import ChartImageDialog
 from loguru import logger
 
 from public.config_class.global_setting import global_setting
@@ -3738,6 +3739,18 @@ class LegacyTrajectoryImageGrid(QWidget):
 class DataAnalysisPage(_BaseWorkflowPage):
     """P6 behaviour analysis and historical trajectory view."""
 
+    _ANALYSIS_EXPORT_META = {
+        "3d": {"title": "三维轨迹图", "data": "三维轨迹数据", "filename": "trajectory_3d"},
+        "xy": {"title": "二维轨迹平面图", "data": "二维轨迹数据", "filename": "trajectory_xy"},
+        "height": {"title": "高度图", "data": "高度数据", "filename": "height"},
+        "sleep": {"title": "睡眠热力图", "data": "睡眠热力数据", "filename": "sleep_heatmap"},
+        "cumulative": {"title": "累计二维距离图", "data": "累计二维距离数据", "filename": "cumulative_distance"},
+        "total": {"title": "二维总路程图", "data": "二维总路程数据", "filename": "total_distance"},
+        "minute": {"title": "每分钟运动量图", "data": "每分钟运动量数据", "filename": "minute_movement"},
+        "dwell": {"title": "活动热力图", "data": "活动热力数据", "filename": "activity_heatmap"},
+        "recognition": {"title": "行为识别统计图", "data": "行为识别数据", "filename": "behavior_recognition"},
+        "infrared": {"title": "红外温度折线图", "data": "红外温度数据", "filename": "infrared_temperature"},
+    }
     def __init__(self, context_provider: Any = None, health_source: Any = None, parent=None):
         self._base_context_provider = context_provider
         self._base_health_source = health_source
@@ -3754,6 +3767,8 @@ class DataAnalysisPage(_BaseWorkflowPage):
         }
         self._trajectory_channels: set[int] = {1}
         self._trajectory_modules: set[str] = {"3d"}
+        self._zoomable_widgets: dict[int, tuple[QWidget, str]] = {}
+        self._chart_export_sizes: dict[int, QSize] = {}
         self._trajectory_records_cache: dict[int, list[dict[str, Any]]] = {}
         self._legacy_trajectory_cache_key: Optional[tuple[Any, ...]] = None
         self._legacy_trajectory_cache: Any = None
@@ -3781,6 +3796,44 @@ class DataAnalysisPage(_BaseWorkflowPage):
             if worker.isRunning():
                 worker.wait(3000)
 
+    def _analysis_export_meta(self, module: Optional[str] = None) -> dict[str, str]:
+        selected = str(module or next(iter(self._trajectory_modules), "3d"))
+        return dict(self._ANALYSIS_EXPORT_META.get(selected, self._ANALYSIS_EXPORT_META["3d"]))
+
+    def _register_zoomable_chart(self, widget: QWidget, title: str) -> None:
+        widget.installEventFilter(self)
+        self._zoomable_widgets[id(widget)] = (widget, str(title))
+
+    def eventFilter(self, watched, event) -> bool:  # noqa: N802 - Qt API
+        item = self._zoomable_widgets.get(id(watched))
+        if item is not None and event.type() == QEvent.Type.MouseButtonDblClick:
+            widget, title = item
+            dialog = ChartImageDialog(widget, title, self)
+            dialog.exec()
+            if dialog.export_size.isValid():
+                self._chart_export_sizes[id(widget)] = QSize(dialog.export_size)
+            return True
+        return super().eventFilter(watched, event)
+
+    def _chart_export_size(self, widget: QWidget) -> QSize:
+        size = self._chart_export_sizes.get(id(widget), widget.size())
+        return QSize(max(1, size.width()), max(1, size.height()))
+
+    def _render_chart_svg(self, widget: QWidget, file_path: str, title: str) -> None:
+        target = self._chart_export_size(widget)
+        source_size = widget.size()
+        if source_size.width() < 2 or source_size.height() < 2:
+            source_size = widget.sizeHint()
+        source_size = QSize(max(1, source_size.width()), max(1, source_size.height()))
+        generator = QSvgGenerator()
+        generator.setFileName(file_path)
+        generator.setSize(target)
+        generator.setViewBox(QRect(0, 0, target.width(), target.height()))
+        generator.setTitle(title)
+        painter = QPainter(generator)
+        painter.scale(target.width() / source_size.width(), target.height() / source_size.height())
+        widget.render(painter)
+        painter.end()
     def _build_ui(self) -> None:
         _scroll, layout = self._canvas()
         experiment_row = QHBoxLayout(); experiment_row.setSpacing(8)
@@ -3836,7 +3889,7 @@ class DataAnalysisPage(_BaseWorkflowPage):
         self.export_compare_svg_button.clicked.connect(self._export_compare_svg)
         export_row.addWidget(self.export_compare_svg_button)
         chart_layout.addLayout(export_row)
-        self.compare_canvas = DualAxisChart(); chart_layout.addWidget(self.compare_canvas, 1); layout.addWidget(compare_chart)
+        self.compare_canvas = DualAxisChart(); chart_layout.addWidget(self.compare_canvas, 1); self._register_zoomable_chart(self.compare_canvas, "对比曲线"); layout.addWidget(compare_chart)
         self.compare_export_status = QLabel("")
         self.compare_export_status.setProperty("hint", True)
         chart_layout.addWidget(self.compare_export_status)
@@ -3845,8 +3898,8 @@ class DataAnalysisPage(_BaseWorkflowPage):
         self.left_metric.setCurrentIndex(3)
         self.right_metric.setCurrentIndex(4)
         behaviour_grid = QGridLayout()
-        heat_card, _, _ = self._card("行动轨迹 · 活动热力图", "", "颜色由真实轨迹点密度计算"); heat_layout = heat_card.layout(); self.heatmap_canvas = TrajectoryCanvas(); heat_layout.addWidget(self.heatmap_canvas, 1)
-        history_card, _, _ = self._card("历史 3D 轨迹", "", "动画描述轨迹变动"); history_layout = history_card.layout(); self.history_canvas = TrajectoryCanvas(); history_layout.addWidget(self.history_canvas, 1); self.play_button = QPushButton("播放历史轨迹"); self.play_button.clicked.connect(self._start_animation); history_layout.addWidget(self.play_button)
+        heat_card, _, _ = self._card("行动轨迹 · 活动热力图", "", "颜色由真实轨迹点密度计算"); heat_layout = heat_card.layout(); self.heatmap_canvas = TrajectoryCanvas(); heat_layout.addWidget(self.heatmap_canvas, 1); self._register_zoomable_chart(self.heatmap_canvas, "活动热力图")
+        history_card, _, _ = self._card("历史 3D 轨迹", "", "动画描述轨迹变动"); history_layout = history_card.layout(); self.history_canvas = TrajectoryCanvas(); history_layout.addWidget(self.history_canvas, 1); self._register_zoomable_chart(self.history_canvas, "历史 3D 轨迹"); self.play_button = QPushButton("播放历史轨迹"); self.play_button.clicked.connect(self._start_animation); history_layout.addWidget(self.play_button)
         day_card, _, _ = self._card("昼夜节律", PENDING, "公式待定")
         sleep_card, _, _ = self._card("运动蛰伏", PENDING, "沿用停留不动定义算法，汇总指标待定")
         behaviour_grid.addWidget(heat_card, 0, 0); behaviour_grid.addWidget(history_card, 0, 1)
@@ -3937,7 +3990,7 @@ class DataAnalysisPage(_BaseWorkflowPage):
             else:
                 plot = TrajectoryComparisonPlot("minute" if key == "minute" else key)
             card_layout.addWidget(plot, 1)
-            self.trajectory_compare_plots[key] = plot; self.trajectory_compare_cards[key] = card
+            self.trajectory_compare_plots[key] = plot; self.trajectory_compare_cards[key] = card; self._register_zoomable_chart(plot, title)
         self._relayout_trajectory_comparison()
         trajectory_layout.addWidget(self.trajectory_compare_container, 1); layout.addWidget(trajectory_section)
         layout.addStretch(1)
@@ -4392,9 +4445,9 @@ class DataAnalysisPage(_BaseWorkflowPage):
                 self._animation_timer.stop()
             self._trajectory_animation_active = False
         self._trajectory_modules = {str(module)}
-        infrared = module == "infrared"
-        self.export_trajectory_csv_button.setText("导出红外温度数据" if infrared else "导出轨迹对比数据")
-        self.export_trajectory_svg_button.setText("导出红外温度 SVG" if infrared else "导出轨迹对比 SVG")
+        meta = self._analysis_export_meta(str(module))
+        self.export_trajectory_csv_button.setText(f"导出{meta['data']}")
+        self.export_trajectory_svg_button.setText(f"导出{meta['title']} SVG")
         self._update_trajectory_play_visibility()
         self._relayout_trajectory_comparison()
         self._refresh_trajectory_comparison()
@@ -4873,12 +4926,34 @@ class DataAnalysisPage(_BaseWorkflowPage):
         self.trajectory_compare_container.adjustSize()
 
     def _export_trajectory_csv(self) -> None:
-        if self._trajectory_modules == {"infrared"}:
+        selected = next(iter(self._trajectory_modules), "3d")
+        meta = self._analysis_export_meta(selected)
+        if selected == "recognition":
+            self._refresh_analysis_recognition()
+            counts = list(getattr(self.analysis_behavior_chart, "counts", []))
+            if not counts or not any(values for _label, values in counts):
+                self.compare_export_status.setText("当前没有可导出的真实行为识别数据")
+                return
+            file_path, _ = QFileDialog.getSaveFileName(self, "保存行为识别数据", f"{meta['filename']}.csv", "CSV 文件 (*.csv)")
+            if not file_path:
+                return
+            try:
+                with open(file_path, "w", newline="", encoding="utf-8-sig") as stream:
+                    writer = csv.writer(stream)
+                    writer.writerow(["通道", "行为", "次数"])
+                    for label, values in counts:
+                        for behavior, count in values.items():
+                            writer.writerow([label, behavior, int(count)])
+                self.compare_export_status.setText(f"已导出行为识别数据：{file_path}")
+            except (OSError, csv.Error) as error:
+                self.compare_export_status.setText(f"行为识别数据导出失败：{error}")
+            return
+        if selected == "infrared":
             records_by_channel = self._infrared_temperature_records_for_channels()
             if not any(records_by_channel.values()):
                 self.compare_export_status.setText("当前没有可导出的真实红外温度数据")
                 return
-            file_path, _ = QFileDialog.getSaveFileName(self, "保存红外温度数据", "infrared_temperature_comparison.csv", "CSV 文件 (*.csv)")
+            file_path, _ = QFileDialog.getSaveFileName(self, "保存红外温度数据", f"{meta['filename']}.csv", "CSV 文件 (*.csv)")
             if not file_path:
                 return
             try:
@@ -4894,9 +4969,9 @@ class DataAnalysisPage(_BaseWorkflowPage):
             return
         records_by_channel = self._trajectory_records_for_channels()
         if not any(records_by_channel.values()):
-            self.compare_export_status.setText("当前没有可导出的真实轨迹数据")
+            self.compare_export_status.setText(f"当前没有可导出的真实{meta['data']}")
             return
-        file_path, _ = QFileDialog.getSaveFileName(self, "保存轨迹对比数据", "trajectory_comparison.csv", "CSV 文件 (*.csv)")
+        file_path, _ = QFileDialog.getSaveFileName(self, f"保存{meta['data']}", f"{meta['filename']}.csv", "CSV 文件 (*.csv)")
         if not file_path:
             return
         try:
@@ -4910,29 +4985,36 @@ class DataAnalysisPage(_BaseWorkflowPage):
                         if record.get("source") == "legacy_trajectory_csv":
                             xyz[2] = ""  # legacy trajectory.csv has X/Y only
                         writer.writerow([f"CH{channel:02d}", record.get("time", ""), *xyz, f"{cumulative[index]:.6f}", f"{minute_map.get(bucket, 0.0):.6f}", "蛰伏" if state == 1.0 else ("自由活动" if state == 0.0 else UNKNOWN)])
-            self.compare_export_status.setText(f"已导出轨迹对比数据：{file_path}")
+            self.compare_export_status.setText(f"已导出{meta['data']}：{file_path}")
         except (OSError, csv.Error) as error:
-            self.compare_export_status.setText(f"轨迹数据导出失败：{error}")
+            self.compare_export_status.setText(f"{meta['data']}导出失败：{error}")
 
     def _export_trajectory_svg(self) -> None:
-        if not self._trajectory_modules:
-            self.compare_export_status.setText("请至少选择一个轨迹对比模块")
-            return
-        infrared = self._trajectory_modules == {"infrared"}
-        has_data = any((self._infrared_temperature_records_for_channels() if infrared else self._trajectory_records_for_channels()).values())
+        selected = next(iter(self._trajectory_modules), "3d")
+        meta = self._analysis_export_meta(selected)
+        if selected == "recognition":
+            self._refresh_analysis_recognition()
+            has_data = bool(getattr(self.analysis_behavior_chart, "counts", []))
+        elif selected == "infrared":
+            has_data = any(self._infrared_temperature_records_for_channels().values())
+        else:
+            has_data = any(self._trajectory_records_for_channels().values())
         if not has_data:
-            self.compare_export_status.setText("当前没有可导出的真实红外温度数据" if infrared else "当前没有可导出的真实轨迹数据")
+            self.compare_export_status.setText(f"当前没有可导出的真实{meta['title']}")
             return
-        file_path, _ = QFileDialog.getSaveFileName(self, "保存红外温度 SVG" if infrared else "保存轨迹对比 SVG", "infrared_temperature_comparison.svg" if infrared else "trajectory_comparison.svg", "SVG 图片 (*.svg)")
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, f"保存{meta['title']} SVG", f"{meta['filename']}.svg", "SVG 图片 (*.svg)"
+        )
         if not file_path:
             return
         try:
-            generator = QSvgGenerator(); generator.setFileName(file_path); generator.setSize(self.trajectory_compare_container.size()); generator.setViewBox(self.trajectory_compare_container.rect()); generator.setTitle("红外温度多通道对比" if infrared else "行为与轨迹多通道对比")
-            painter = QPainter(generator); self.trajectory_compare_container.render(painter); painter.end()
-            self.compare_export_status.setText(f"已导出{'红外温度' if infrared else '轨迹对比'} SVG：{file_path}")
+            plot = self.trajectory_compare_plots.get(selected)
+            if plot is None:
+                raise RuntimeError("当前模块没有可导出的图表")
+            self._render_chart_svg(plot, file_path, meta["title"])
+            self.compare_export_status.setText(f"已导出{meta['title']} SVG：{file_path}")
         except (OSError, RuntimeError) as error:
-            self.compare_export_status.setText(f"轨迹 SVG 导出失败：{error}")
-
+            self.compare_export_status.setText(f"{meta['title']} SVG 导出失败：{error}")
     def _set_compare_channel(self, target: set[int], buttons: list[QPushButton], channel: int, checked: bool) -> None:
         """Maintain an independent multi-selection for one comparison axis."""
         if checked:
@@ -5234,22 +5316,10 @@ class DataAnalysisPage(_BaseWorkflowPage):
         if not file_path:
             return
         try:
-            chart = DualAxisChart()
-            chart.resize(1600, 720)
-            chart.set_axis_labels(left_metric, right_metric)
-            chart.set_timed_channel_series(left, right)
-            generator = QSvgGenerator()
-            generator.setFileName(file_path)
-            generator.setSize(chart.size())
-            generator.setViewBox(chart.rect())
-            generator.setTitle(f"{left_metric} vs {right_metric}")
-            painter = QPainter(generator)
-            chart.render(painter)
-            painter.end()
-            self.compare_export_status.setText(f"已导出 SVG 图片：{file_path}")
+            self._render_chart_svg(self.compare_canvas, file_path, f"{left_metric} vs {right_metric}")
+            self.compare_export_status.setText(f"已导出对比曲线 SVG：{file_path}")
         except (OSError, RuntimeError) as error:
-            self.compare_export_status.setText(f"SVG 导出失败：{error}")
-
+            self.compare_export_status.setText(f"对比曲线 SVG 导出失败：{error}")
     def _start_animation(self) -> None:
         self._animation_index = 1; self.history_canvas.set_points(self._history_points[:1]); self._animation_timer.start()
 
