@@ -2611,6 +2611,51 @@ class MachineVisionPage(_BaseWorkflowPage):
             pass
         self._connected_trajectory_signal_thread = None
 
+    @staticmethod
+    def _normalize_detected_cage_points(points: Any) -> list[dict[str, float]]:
+        """Normalize legacy trajectory corner payloads for the live preview."""
+        parsed: list[dict[str, float]] = []
+        for point in points or []:
+            try:
+                if isinstance(point, Mapping):
+                    x, y = point.get("x"), point.get("y")
+                else:
+                    x, y = point[0], point[1]
+                parsed.append({"x": float(x), "y": float(y)})
+            except (IndexError, KeyError, TypeError, ValueError):
+                return []
+        return parsed[:4] if len(parsed) >= 4 else []
+
+    def _sync_detected_cage_points_from_service(self, channel: Optional[int] = None) -> list[dict[str, float]]:
+        """Keep the old page's last-good cage frame visible between results.
+
+        The legacy Tab4 page used ``last_good_corners`` while the trajectory
+        worker was processing frames.  P5 previously only updated its overlay
+        from a newly delivered signal, so a refresh or a page switch could
+        leave the raw frame visible with no cage frame at all.
+        """
+        channel_id = int(channel or self.selected_channel)
+        points = self._normalize_detected_cage_points(
+            self._detected_cage_points.get(channel_id, [])
+        )
+        if points:
+            return points
+
+        trajectory_thread = getattr(self, "trajectory_thread", None)
+        if trajectory_thread is None:
+            return []
+        for attribute in ("fixed_corners_by_cage", "previous_corners_by_cage"):
+            corner_map = getattr(trajectory_thread, attribute, None)
+            if not isinstance(corner_map, Mapping):
+                continue
+            corner_value = corner_map.get(channel_id)
+            candidate = getattr(corner_value, "corners", corner_value)
+            points = self._normalize_detected_cage_points(candidate)
+            if points:
+                self._detected_cage_points[channel_id] = points
+                return points
+        return []
+
     def start_trajectory_thread(self) -> None:
         """Attach P5 to the exact shared worker/submitter used by old Tab4."""
         try:
@@ -2627,7 +2672,12 @@ class MachineVisionPage(_BaseWorkflowPage):
             trajectory_thread = tab_4.attach_shared_trajectory_service(self)
             if trajectory_thread is None:
                 return
+            # ``attach_shared_trajectory_service`` assigns the same reference
+            # to the consumer, but keep it explicit here so P5 can read the
+            # legacy worker's last-good corner cache during a refresh.
+            self.trajectory_thread = trajectory_thread
             self._connect_trajectory_signal(trajectory_thread)
+            self._sync_detected_cage_points_from_service(self.selected_channel)
             self._apply_selected_cage_calibration_to_service()
         except Exception as exc:  # pragma: no cover - model/hardware dependent
             logger.exception("启动旧版轨迹服务失败: %s", exc)
@@ -2654,19 +2704,13 @@ class MachineVisionPage(_BaseWorkflowPage):
             return
         if channel <= 0:
             return
-        corners = result.get("corners")
-        if isinstance(corners, (list, tuple)) and len(corners) >= 4:
-            parsed: list[dict[str, float]] = []
-            for point in corners[:4]:
-                try:
-                    parsed.append({"x": float(point["x"]), "y": float(point["y"])})
-                except (KeyError, TypeError, ValueError):
-                    parsed = []
-                    break
-            if len(parsed) == 4:
-                self._detected_cage_points[channel] = parsed
-                if channel == self.selected_channel and hasattr(self, "frame_label"):
-                    self.frame_label.set_detected_cage_points(parsed)
+        corners = self._normalize_detected_cage_points(result.get("corners"))
+        if corners:
+            # Match legacy Tab4: retain the latest valid frame and reuse it
+            # when the next result is a blank/failed sample.
+            self._detected_cage_points[channel] = corners
+            if channel == self.selected_channel and hasattr(self, "frame_label"):
+                self.frame_label.set_detected_cage_points(corners)
 
         # A normal frame result always carries ``solved``.  A missing solution
         # is a real blank sample and therefore terminates the current line;
@@ -2968,7 +3012,8 @@ class MachineVisionPage(_BaseWorkflowPage):
         self._cancel_cage_calibration(update_status=False)
         self.selected_channel = channel
         for index, button in enumerate(self.channel_buttons, 1): button.setChecked(index == channel)
-        self.frame_label.set_detected_cage_points(self._detected_cage_points.get(channel, []))
+        detected_points = self._sync_detected_cage_points_from_service(channel)
+        self.frame_label.set_detected_cage_points(detected_points)
         self._load_cage_calibration_overlay()
         self.refresh()
 
@@ -3040,6 +3085,8 @@ class MachineVisionPage(_BaseWorkflowPage):
         # 250 ms; replacing those points here with the persisted calibration
         # made every refresh erase the previous click, so the UI could never
         # advance beyond 1/4.
+        detected_points = self._sync_detected_cage_points_from_service(self.selected_channel)
+        self.frame_label.set_detected_cage_points(detected_points)
         if self._cage_calibration_mode:
             return
         width, height = self._last_frame_size
