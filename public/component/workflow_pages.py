@@ -1879,11 +1879,9 @@ class TrajectoryComparisonPlot(QWidget):
 
     def _update_adaptive_size(self) -> None:
         count = max(1, len(self.series))
-        if self.mode in {"xy", "dwell"}:
-            # Keep one cage card per row; the cage drawing itself is horizontal.
-            rows = count
-            height = max(460, rows * 360 + 48)
-        elif self.mode in self._PER_CAGE_MODES:
+        if self.mode in self._PER_CAGE_MODES:
+            # All cage-based views use the same compact grid: four columns
+            # for up to eight cages, matching the 3D comparison layout.
             _columns, rows = self._grid_shape(count)
             height = max(340, rows * 250 + 48)
         elif self.mode == "sleep":
@@ -1899,9 +1897,7 @@ class TrajectoryComparisonPlot(QWidget):
 
     def sizeHint(self) -> QSize:
         count = max(1, len(self.series))
-        if self.mode in {"xy", "dwell"}:
-            width = 980
-        elif self.mode in self._PER_CAGE_MODES:
+        if self.mode in self._PER_CAGE_MODES:
             columns, _rows = self._grid_shape(count)
             width = 760 if columns == 1 else 980
         else:
@@ -1910,10 +1906,7 @@ class TrajectoryComparisonPlot(QWidget):
 
     @classmethod
     def _tile_rects(cls, rect, count: int, mode: str = "") -> list[QRect]:
-        if mode in {"xy", "dwell"}:
-            columns, rows = 1, count
-        else:
-            columns, rows = cls._grid_shape(count)
+        columns, rows = cls._grid_shape(count)
         gap = 12
         tile_width = max(1, int((rect.width() - gap * (columns - 1)) / columns))
         tile_height = max(1, int((rect.height() - gap * (rows - 1)) / rows))
@@ -3764,6 +3757,8 @@ class DataAnalysisPage(_BaseWorkflowPage):
         self._trajectory_selection_user_set = False
         self.selected_channel = 1; self._history_points: list[tuple[float, float, float]] = []; self._animation_index = 0
         self._trajectory_animation_active = False; self._trajectory_animation_index = 1
+        self._trajectory_playback_speed = 1
+        self._trajectory_base_interval_ms = 120
         self._trajectory_animation_states: dict[str, dict[str, Any]] = {
             module: {"active": False, "index": 1, "finished": False}
             for module in ("3d", "xy", "height", "sleep", "cumulative", "total", "minute", "dwell", "recognition", "infrared")
@@ -3782,6 +3777,8 @@ class DataAnalysisPage(_BaseWorkflowPage):
         self._live_snapshot_worker: Optional[LiveDatabaseSnapshotLoader] = None
         self._live_snapshot_error = ""
         self._trajectory_records_cache: dict[int, list[dict[str, Any]]] = {}
+        # Playback uses one immutable snapshot so every selected cage advances with the same frame index.
+        self._trajectory_animation_records: dict[int, list[dict[str, Any]]] = {}
         self._legacy_trajectory_cache_key: Optional[tuple[Any, ...]] = None
         self._legacy_trajectory_cache: Any = None
         self._legacy_comparison_cache_key: Optional[tuple[Any, ...]] = None
@@ -3985,6 +3982,14 @@ class DataAnalysisPage(_BaseWorkflowPage):
         self.trajectory_play_button = QPushButton("播放轨迹动画")
         self.trajectory_play_button.clicked.connect(self._toggle_trajectory_animation)
         export_row.addWidget(self.trajectory_play_button)
+        self.trajectory_speed_label = QLabel("播放倍速")
+        export_row.addWidget(self.trajectory_speed_label)
+        self.trajectory_speed_combo = QComboBox()
+        self.trajectory_speed_combo.setObjectName("trajectoryPlaybackSpeedCombo")
+        for speed in (1, 2, 5, 10):
+            self.trajectory_speed_combo.addItem(f"{speed}倍", speed)
+        self.trajectory_speed_combo.currentIndexChanged.connect(self._set_trajectory_playback_speed)
+        export_row.addWidget(self.trajectory_speed_combo)
         self._update_trajectory_play_visibility()
         self.export_trajectory_csv_button = QPushButton("导出轨迹对比数据")
         self.export_trajectory_csv_button.clicked.connect(self._export_trajectory_csv); export_row.addWidget(self.export_trajectory_csv_button)
@@ -4669,15 +4674,33 @@ class DataAnalysisPage(_BaseWorkflowPage):
         self._relayout_trajectory_comparison()
         self._refresh_trajectory_comparison()
 
+    def _set_trajectory_playback_speed(self, index: int) -> None:
+        """Change playback cadence without changing the current frame."""
+        if not hasattr(self, "trajectory_speed_combo"):
+            return
+        value = self.trajectory_speed_combo.itemData(index)
+        try:
+            speed = int(value)
+        except (TypeError, ValueError):
+            speed = 1
+        self._trajectory_playback_speed = speed if speed in (1, 2, 5, 10) else 1
+        if hasattr(self, "_animation_timer"):
+            interval = max(1, int(round(self._trajectory_base_interval_ms / self._trajectory_playback_speed)))
+            self._animation_timer.setInterval(interval)
+
     def _update_trajectory_play_visibility(self) -> None:
         """Only trajectory views with a time-ordered path expose playback."""
         if not hasattr(self, "trajectory_play_button"):
             return
         selected = next(iter(self._trajectory_modules), "3d")
         # The legacy height view is redrawn from the selected trajectory samples.
-        # Activity heatmaps remain direct grid renderings and do not animate.
-        visible = selected in {"3d", "xy", "height", "cumulative", "minute"}
+        # Summary charts, heatmaps, recognition and infrared views remain static.
+        visible = selected in {"3d", "xy", "height"}
         self.trajectory_play_button.setVisible(visible)
+        if hasattr(self, "trajectory_speed_label"):
+            self.trajectory_speed_label.setVisible(visible)
+        if hasattr(self, "trajectory_speed_combo"):
+            self.trajectory_speed_combo.setVisible(visible)
         if not visible:
             return
         state = self._trajectory_animation_states.setdefault(
@@ -4702,6 +4725,7 @@ class DataAnalysisPage(_BaseWorkflowPage):
             state.update(active=False, index=1, finished=False)
         self._trajectory_animation_active = False
         self._trajectory_animation_index = 1
+        self._trajectory_animation_records = {}
         self._update_trajectory_play_visibility()
 
     def _selected_trajectory_animation_state(self) -> Optional[dict[str, Any]]:
@@ -5550,7 +5574,13 @@ class DataAnalysisPage(_BaseWorkflowPage):
                 self._trajectory_animation_active = False
                 self._animation_timer.stop()
                 return
-            records_by_channel = self._trajectory_records_cache or self._trajectory_records_for_channels()
+            records_by_channel = self._trajectory_animation_records
+            if not records_by_channel:
+                records_by_channel = self._trajectory_records_for_channels()
+                self._trajectory_animation_records = {
+                    channel: list(records)
+                    for channel, records in records_by_channel.items()
+                }
             if not any(records_by_channel.values()):
                 state.update(active=False, index=1, finished=False)
                 self._trajectory_animation_active = False
@@ -5590,6 +5620,12 @@ class DataAnalysisPage(_BaseWorkflowPage):
         if not any(records_by_channel.values()):
             self.compare_export_status.setText("当前没有可播放的真实轨迹数据")
             return
+        # Capture every selected cage when playback starts. The timer then
+        # slices one shared snapshot, so all cage cards advance together.
+        self._trajectory_animation_records = {
+            channel: list(records)
+            for channel, records in records_by_channel.items()
+        }
         maximum = max((len(records) for records in records_by_channel.values()), default=0)
         if state["finished"] or state["index"] >= maximum:
             state.update(index=1, finished=False)
