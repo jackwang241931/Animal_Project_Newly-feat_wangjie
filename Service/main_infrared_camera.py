@@ -1288,7 +1288,7 @@ def init_camera_and_image_handle_thread(serials):
 
         try:
             camera = Thermal_process(
-                path=path + f"{mouse_cage_prefix}{mouse_cage_number}/",
+                path=os.path.join(path, f"{mouse_cage_prefix}{mouse_cage_number}") + os.sep,
                 id=mouse_cage_number,
                 serial_number=serial_number,
             )
