@@ -3483,6 +3483,77 @@ class MachineVisionPage(_BaseWorkflowPage):
         self.refreshed.emit()
 
 
+class LegacyTrajectoryImageGrid(QWidget):
+    """Display the trajectory PNGs produced by the legacy worker.
+
+    The old export is the source of truth for these two views.  Do not redraw
+    them from a reduced in-memory series because that changes the smoothing,
+    axes, colour scale, and cage geometry used by the old version.
+    """
+
+    def __init__(self, empty_text: str, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.empty_text = str(empty_text)
+        self._grid = QGridLayout(self)
+        self._grid.setContentsMargins(0, 0, 0, 0)
+        self._grid.setSpacing(10)
+        self.setMinimumHeight(430)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+    def _clear(self) -> None:
+        while self._grid.count():
+            item = self._grid.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+    def set_image_paths(self, image_paths: Mapping[int, str]) -> None:
+        self._clear()
+        valid = [
+            (int(channel), str(path))
+            for channel, path in sorted((image_paths or {}).items())
+            if path and os.path.isfile(str(path))
+        ]
+        if not valid:
+            label = QLabel(self.empty_text)
+            label.setProperty("hint", True)
+            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._grid.addWidget(label, 0, 0)
+            return
+
+        columns = 1 if len(valid) == 1 else 2
+        for index, (channel, path) in enumerate(valid):
+            card = QFrame(self)
+            card.setProperty("card", True)
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(10, 8, 10, 8)
+            title = QLabel(f"CH{channel:02d}")
+            title.setProperty("title", True)
+            card_layout.addWidget(title)
+            image_label = QLabel()
+            image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            image_label.setMinimumHeight(320)
+            image_label.setSizePolicy(
+                QSizePolicy.Policy.Expanding,
+                QSizePolicy.Policy.Expanding,
+            )
+            pixmap = QPixmap(path)
+            if pixmap.isNull():
+                image_label.setText("图片读取失败")
+            else:
+                image_label.setPixmap(
+                    pixmap.scaled(
+                        860,
+                        480,
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
+                )
+            card_layout.addWidget(image_label, 1)
+            self._grid.addWidget(card, index // columns, index % columns)
+        for column in range(columns):
+            self._grid.setColumnStretch(column, 1)
+
 class DataAnalysisPage(_BaseWorkflowPage):
     """P6 behaviour analysis and historical trajectory view."""
 
@@ -3634,10 +3705,10 @@ class DataAnalysisPage(_BaseWorkflowPage):
         self.trajectory_module_buttons: dict[str, QPushButton] = {}
         self.trajectory_module_group = QButtonGroup(self); self.trajectory_module_group.setExclusive(True)
         module_definitions = (
-            ("3d", "三维轨迹图对比"), ("xy", "二维轨迹平面对比"), ("height", "高度平面对比"),
+            ("3d", "三维轨迹图对比"), ("xy", "二维轨迹平面对比"), ("height", "高度图"),
             ("sleep", "睡眠热力图对比"), ("cumulative", "累计二维轨迹距离对比"),
             ("total", "二维总路程对比"), ("minute", "每分钟运动量对比"),
-            ("dwell", "笼子停留时间热力图"), ("recognition", "行为识别统计"),
+            ("dwell", "活动热力图"), ("recognition", "行为识别统计"),
             ("infrared", "红外温度折线图对比"),
         )
         for index, (key, title) in enumerate(module_definitions):
@@ -3682,6 +3753,10 @@ class DataAnalysisPage(_BaseWorkflowPage):
                 self.analysis_recognition_count_label.setProperty("hint", True)
                 self.analysis_recognition_count_label.setWordWrap(True)
                 card_layout.addWidget(self.analysis_recognition_count_label)
+            elif key == "height":
+                plot = LegacyTrajectoryImageGrid("暂无旧版高度图，请先选择有轨迹导出的实验")
+            elif key == "dwell":
+                plot = LegacyTrajectoryImageGrid("暂无旧版活动热力图，请先选择有轨迹导出的实验")
             else:
                 plot = TrajectoryComparisonPlot("minute" if key == "minute" else key)
             card_layout.addWidget(plot, 1)
@@ -4152,7 +4227,9 @@ class DataAnalysisPage(_BaseWorkflowPage):
         if not hasattr(self, "trajectory_play_button"):
             return
         selected = next(iter(self._trajectory_modules), "3d")
-        visible = selected in self._trajectory_animation_states
+        # Height and occupancy views are legacy exported images, not animated
+        # re-plots.  Keep playback only for the point-series views.
+        visible = selected in {"3d", "xy", "cumulative", "minute"}
         self.trajectory_play_button.setVisible(visible)
         if not visible:
             return
@@ -4543,6 +4620,48 @@ class DataAnalysisPage(_BaseWorkflowPage):
             "minute": minute_series, "sleep": sleep_series, "dwell": dwell_series,
         }
 
+    def _legacy_trajectory_image_paths(self, module: str) -> dict[int, str]:
+        """Resolve the exact height/occupancy images from a legacy export."""
+        export_root = Path(self._selected_trajectory_export_path or "")
+        if not export_root.is_dir():
+            try:
+                analysis = self._legacy_trajectory_analysis()
+                source_path = getattr(analysis, "source_path", None)
+                if source_path:
+                    export_root = Path(source_path)
+            except (OSError, ValueError):
+                export_root = Path()
+        if not export_root.is_dir():
+            return {}
+
+        if str(module) == "height":
+            total_name = "height_trajectory.png"
+            latest_name = "latest_height_trajectory.png"
+        else:
+            total_name = "occupancy_heatmap.png"
+            latest_name = "latest_occupancy_heatmap.png"
+
+        paths: dict[int, str] = {}
+        for channel in sorted(self._trajectory_channels):
+            cage_dir = next(
+                (
+                    export_root / name
+                    for name in (f"cage_{int(channel)}", f"cage{int(channel)}")
+                    if (export_root / name).is_dir()
+                ),
+                None,
+            )
+            if cage_dir is None:
+                continue
+            candidates = (
+                cage_dir / "plots" / "total" / total_name,
+                cage_dir / "plots" / latest_name,
+                cage_dir / "plots" / total_name,
+            )
+            selected = next((path for path in candidates if path.is_file()), None)
+            if selected is not None:
+                paths[int(channel)] = str(selected)
+        return paths
     def _refresh_trajectory_comparison(self) -> None:
         if not hasattr(self, "trajectory_compare_plots"):
             return
@@ -4556,9 +4675,16 @@ class DataAnalysisPage(_BaseWorkflowPage):
             ])
             self._relayout_trajectory_comparison()
             return
+        selected = next(iter(self._trajectory_modules), "3d")
+        if selected in {"height", "dwell"}:
+            image_plot = self.trajectory_compare_plots.get(selected)
+            if isinstance(image_plot, LegacyTrajectoryImageGrid):
+                image_plot.set_image_paths(self._legacy_trajectory_image_paths(selected))
+            self._relayout_trajectory_comparison()
+            self.trajectory_compare_container.adjustSize()
+            return
         records_by_channel = self._trajectory_records_for_channels()
         payloads = self._trajectory_payload(records_by_channel)
-        selected = next(iter(self._trajectory_modules), "3d")
         state = self._trajectory_animation_states.get(selected)
         if state is not None and 1 < state["index"] and not state["finished"]:
             partial_records = {
