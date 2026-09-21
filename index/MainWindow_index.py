@@ -626,6 +626,7 @@ class MainWindow_Index(ThemedWindow):
         self._startup_progress_duration = None
         self._stop_progress_started_at = None
         self._stop_progress_duration = None
+        self._stop_progress_timer = None
         self._stop_timeout_timer = None
         self._stop_backend_complete = False
         self._stop_backend_grace_complete = False
@@ -990,6 +991,7 @@ class MainWindow_Index(ThemedWindow):
             self._set_workflow_run_state(ExperimentRunState.START_FAILED)
             status_text = "启动实验失败，请检查配置和连接后重试。"
         else:
+            self._stop_stop_progress()
             self._stop_operation_failed = True
             self._set_workflow_run_state(ExperimentRunState.STOP_FAILED)
             status_text = "停止流程存在错误，请查看系统健康与运行日志。"
@@ -1027,6 +1029,25 @@ class MainWindow_Index(ThemedWindow):
             timer.stop()
             timer.deleteLater()
             self._startup_progress_timer = None
+
+    def _stop_stop_progress(self):
+        timer = getattr(self, "_stop_progress_timer", None)
+        if timer is not None:
+            timer.stop()
+            timer.deleteLater()
+            self._stop_progress_timer = None
+
+    def _advance_stop_progress(self):
+        if self.workflow_run_state != ExperimentRunState.STOPPING:
+            self._stop_stop_progress()
+            return
+        page = getattr(self, "experiment_control_page", None)
+        if page is None or self._stop_progress_started_at is None:
+            return
+        duration = max(float(self._stop_progress_duration or 1), 1.0)
+        percent = min(99, int((time.monotonic() - self._stop_progress_started_at) / duration * 100))
+        if percent > page.operation_progress.value():
+            page.set_operation_progress(percent, "正在停止实验")
 
     def _advance_startup_progress(self):
         if self.workflow_run_state != ExperimentRunState.STARTING:
@@ -3241,6 +3262,10 @@ class MainWindow_Index(ThemedWindow):
         stop_wait_seconds = self.show_stop_dialog_sync()
         self._stop_progress_started_at = time.monotonic()
         self._stop_progress_duration = max(float(stop_wait_seconds), 1.0)
+        self._stop_stop_progress()
+        self._stop_progress_timer = QTimer(self)
+        self._stop_progress_timer.timeout.connect(self._advance_stop_progress)
+        self._stop_progress_timer.start(100)
         if page is not None:
             page.refresh()
         if self._stop_timeout_timer is not None:
@@ -3329,6 +3354,7 @@ class MainWindow_Index(ThemedWindow):
             self.stop_dialog.update_progress_value(self.stop_dialog.progress_max)
 
     def stop_update_gui_sync(self):
+        self._stop_stop_progress()
         logger.error("stop_update_gui")
         global_setting.set_setting("app_state", AppState.CONFIGURING)
         self._set_workflow_run_state(ExperimentRunState.STOPPED)
