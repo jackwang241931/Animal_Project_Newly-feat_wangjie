@@ -2584,7 +2584,7 @@ class MachineVisionPage(_BaseWorkflowPage):
             elif should_start:
                 loader.start()
         except Exception as exc:  # pragma: no cover - optional model dependency
-            logger.exception("加载旧版轨迹模块失败: %s", exc)
+            logger.exception("加载旧版轨迹模块失败: {}", exc)
             if hasattr(self, "cage_calibration_status"):
                 self.cage_calibration_status.setText("轨迹服务加载失败；仍可保存鼠笼框校准")
 
@@ -2594,7 +2594,7 @@ class MachineVisionPage(_BaseWorkflowPage):
 
     def _on_trajectory_module_load_failed(self, error_message: str) -> None:
         self._trajectory_module_loader = None
-        logger.error("旧版轨迹模块不可用: %s", error_message)
+        logger.error("旧版轨迹模块不可用: {}", error_message)
         if hasattr(self, "cage_calibration_status"):
             self.cage_calibration_status.setText("轨迹服务加载失败；仍可保存鼠笼框校准")
 

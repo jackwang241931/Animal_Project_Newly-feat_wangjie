@@ -13,6 +13,14 @@ from logging.handlers import RotatingFileHandler
 from multiprocessing import Process, freeze_support
 import os
 import time
+
+# Initialize the native ML runtime before worker modules import Qt/OpenCV.
+# This matches the legacy process-startup order and avoids WinError 1114
+# when the trajectory service is loaded later by the GUI.
+os.environ.setdefault('KMP_DUPLICATE_LIB_OK', 'TRUE')
+os.environ.setdefault('OMP_NUM_THREADS', '1')
+os.environ.setdefault('MKL_NUM_THREADS', '1')
+import torch  # noqa: F401,E402
 import psutil
 from loguru import logger
 from Service import main_response_Modbus, main_gui, main_monitor_data, main_deep_camera, main_infrared_camera
