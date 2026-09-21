@@ -174,9 +174,12 @@ class EpochTableModel(QAbstractTableModel):
     def _display_value(self, row, column):
         key = self._columns[column]
         value = self._rows[row].get(key)
-        if key == "remarks":
+        normalized_key = str(key).strip().lower()
+        if normalized_key in {"remarks", "remark", "备注"} or "备注" in normalized_key:
             # 正常采集没有备注时保持空白，不把 Python 的 None 暴露给用户。
-            return "" if value is None else str(value)
+            if value is None or (isinstance(value, str) and value.strip().lower() in {"", "none", "null"}):
+                return ""
+            return str(value)
         if key in RUNNING_WHEEL_COLUMN_KEYS:
             return format_running_wheel_distance(value)
         if key == "WM_weight_num":

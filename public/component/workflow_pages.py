@@ -1483,8 +1483,11 @@ class DataViewPage(_BaseWorkflowPage):
                     highlight_error = self._row_has_remark_error(headers, row)
                     for c, value in enumerate(row):
                         header = str(headers[c] if c < len(headers) else "").strip().lower()
-                        is_remarks = header in {"remarks", "备注"} or "备注" in header
-                        display_value = "" if is_remarks and value is None else _text(value, "None")
+                        is_remarks = header in {"remarks", "remark", "备注"} or "备注" in header
+                        if is_remarks:
+                            display_value = "" if value is None or (isinstance(value, str) and value.strip().lower() in {"", "none", "null"}) else str(value)
+                        else:
+                            display_value = _text(value, "None")
                         item = QTableWidgetItem(display_value)
                         if highlight_error:
                             item.setForeground(QBrush(QColor(255, 0, 0)))
