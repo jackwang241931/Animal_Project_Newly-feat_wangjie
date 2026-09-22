@@ -506,7 +506,7 @@ class MouseTrajectoryThread(MyQThread):
 
     def before_Runing_work(self):
         self._load_runtime_config()
-        self._load_manual_cage_calibrations()
+
         self._start_new_export_root()
         self._prepare_runtime()
 
@@ -3680,7 +3680,7 @@ class MouseTrajectoryThread(MyQThread):
             schema_version = int(json_data.get("schemaVersion", 1) or 1)
             source = str(json_data.get("source", "fixed_box_json") or "fixed_box_json")
             # Legacy cache files were generated from mask->minAreaRect and should be re-detected.
-            if schema_version < 2 or source == "fixed_box_json":
+            if schema_version < 2 or source in {"fixed_box_json", "manual_visible_light"}:
                 return None
             corners = BoxCorners(
                 [dict(point) for point in json_data.get("corners", [])],
