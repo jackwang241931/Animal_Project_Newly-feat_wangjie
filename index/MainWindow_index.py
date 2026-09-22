@@ -850,6 +850,16 @@ class MainWindow_Index(ThemedWindow):
         self._wheel_guard_installed = True
 
     def eventFilter(self, watched, event):
+        if event.type() == QEvent.Type.Show and self._is_legacy_top_level_window(watched):
+            # Filter the show event itself so the orphan never becomes visible
+            # for one frame. The queued pass also reparents module-owned
+            # windows if this object was created by a late legacy callback.
+            try:
+                watched.hide()
+            except RuntimeError:
+                pass
+            QTimer.singleShot(0, self._hide_legacy_module_windows)
+            return True
         if event.type() == QEvent.Type.Wheel and isinstance(
             watched,
             (QAbstractSpinBox, QComboBox, QDial, QSlider, QCheckBox, QRadioButton),
@@ -1556,9 +1566,10 @@ class MainWindow_Index(ThemedWindow):
     def _hide_legacy_module_windows(self):
         """Hide orphaned legacy windows without touching named dialogs."""
         # Some legacy module frames are top-level QMainWindow instances even
-        # though they are owned by a module. Keep their identities so the
-        # orphan sweep below does not close a live device-detection window
-        # when the user navigates to another workflow page mid-detection.
+        # though they are owned by a module. Convert those module-owned
+        # windows into hidden children of the persistent workflow shell. This
+        # prevents Qt from treating them as independent desktop windows when a
+        # workflow page is opened.
         protected_legacy_widget_ids = set()
         for module in getattr(self, "modules", []) or []:
             interface = getattr(module, "interface_widget", None)
@@ -1574,6 +1585,10 @@ class MainWindow_Index(ThemedWindow):
                     continue
                 protected_legacy_widget_ids.add(id(widget))
                 try:
+                    if widget.parentWidget() is None:
+                        widget.hide()
+                        widget.setParent(self)
+                        widget.setWindowFlag(Qt.WindowType.Window, False)
                     widget.hide()
                 except Exception as error:
                     logger.debug(f"failed to hide legacy frame {attr}: {error}")
@@ -1582,28 +1597,40 @@ class MainWindow_Index(ThemedWindow):
         if app is None:
             return
         for widget in list(app.topLevelWidgets()):
-            if widget is self:
+            if widget is self or not self._is_legacy_top_level_window(widget):
                 continue
             if id(widget) in protected_legacy_widget_ids:
                 continue
             try:
-                title = str(widget.windowTitle() or "").strip().lower()
-                # Restrict this sweep to legacy main windows. Qt also makes
-                # QComboBox popups and some hidden controls top-level QFrames;
-                # deleting those breaks cached workflow pages on navigation.
-                is_orphaned_untitled = (
-                    widget.inherits("QMainWindow")
-                    and widget.parentWidget() is None
-                    and title in {"", "python"}
-                )
-                if is_orphaned_untitled:
-                    widget.hide()
-                    widget.close()
-                    widget.deleteLater()
+                # Old modules leave both QMainWindow objects and their
+                # parentless child controls behind. Qt treats every one of
+                # those controls as a desktop window on Windows, which is the
+                # small blank "python" window seen when opening P3/P6.
+                widget.hide()
+                widget.close()
+                widget.deleteLater()
             except RuntimeError:
                 continue
             except Exception as error:
                 logger.debug(f"failed to close orphaned top-level window: {error}")
+
+    def _is_legacy_top_level_window(self, widget):
+        """Return whether a shown top-level widget is an old module window."""
+        if widget is None or widget is self or not isinstance(widget, QWidget):
+            return False
+        try:
+            if not widget.isWindow() or widget.parentWidget() is not None:
+                return False
+            # Real application dialogs and menus are also top-level widgets,
+            # but they are intentional and must remain usable.
+            if isinstance(widget, (QDialog, QMenu)):
+                return False
+            # Do not use the title or class here. Several legacy controls are
+            # plain QLabel/QPushButton/QComboBox instances and Windows gives
+            # their orphaned top-level window the executable title "python".
+            return True
+        except RuntimeError:
+            return False
 
     def show_system_status_page(self):
         if self.tab_widget is None:
@@ -1670,6 +1697,10 @@ class MainWindow_Index(ThemedWindow):
         start_refresh = getattr(page, "start_refresh", None)
         if callable(start_refresh):
             start_refresh()
+        # A legacy module can finish constructing a top-level window during
+        # the same event-loop turn as this page switch. Run the ownership
+        # sweep after that construction has completed as well.
+        QTimer.singleShot(0, self._hide_legacy_module_windows)
 
     def show_experiment_control_page(self):
         self._hide_legacy_module_windows()
