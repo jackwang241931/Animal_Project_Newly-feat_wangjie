@@ -808,6 +808,7 @@ def _load_trajectory_csv_export(
     interruption_requested: Callable[[], bool] | None = None,
     selected_channels: set[int] | None = None,
     include_comparison: bool = True,
+    time_range: tuple[float, float] | None = None,
 ) -> ExperimentAnalysis:
     raw_rows: dict[int, list[tuple[float, float, float]]] = {
         channel: [] for channel in range(1, 9)
@@ -837,6 +838,11 @@ def _load_trajectory_csv_export(
                         break
                 if timestamp is None:
                     timestamp = experiment_started_at.timestamp() + (row_number - 1) * 0.1
+
+                if time_range is not None and not (
+                    float(time_range[0]) <= timestamp <= float(time_range[1])
+                ):
+                    continue
 
                 status_allows = _status_allows_detection(row.get("status"))
                 x_value = _safe_float(row.get("X"))
@@ -891,6 +897,7 @@ def load_trajectory_experiment(
     interruption_requested: Callable[[], bool] | None = None,
     selected_channels: set[int] | None = None,
     include_comparison: bool = True,
+    time_range: tuple[float, float] | None = None,
 ) -> ExperimentAnalysis:
     """Load one trajectory export and attach its time-matched monitor data."""
     source_path = Path(export_path).expanduser().resolve()
@@ -911,6 +918,7 @@ def load_trajectory_experiment(
         interruption_requested=interruption_requested,
         selected_channels=selected_channels,
         include_comparison=include_comparison,
+        time_range=time_range,
     )
 
 

@@ -96,6 +96,12 @@ except Exception:  # pragma: no cover - optional calibration dependencies
 
 UNKNOWN = "未知"
 PENDING = "None / 公式待定"
+LIVE_ANALYSIS_WINDOW_SECONDS = 3600.0
+
+
+def _live_analysis_time_range() -> tuple[float, float]:
+    now = time.time()
+    return now - LIVE_ANALYSIS_WINDOW_SECONDS, now
 
 
 class _PhysicalMillimeterPoint(tuple):
@@ -4080,7 +4086,7 @@ class DataAnalysisPage(_BaseWorkflowPage):
         experiment_row.addWidget(self.live_analysis_status_label)
         experiment_row.addWidget(self.refresh_experiment_times_button)
         layout.addLayout(experiment_row)
-        self._header(layout, "DATA ANALYSIS", "数据分析 · 高级统计", "默认读取当前实验的实时数据库快照；历史实验仍按已保存 Excel / 轨迹 CSV 读取，实时快照允许有几秒延迟。")
+        self._header(layout, "DATA ANALYSIS", "数据分析 · 高级统计", "实时实验固定显示最近 1 小时数据；历史实验仍按已保存 Excel / 轨迹 CSV 读取，实时快照允许有几秒延迟。")
         summary = QGridLayout(); self.metric_labels = {}
         for index, (key, title) in enumerate((("patterns", "行为模式"), ("main_behavior", "主导行为"), ("night_day", "昼夜活动比"), ("coverage", "轨迹覆盖度"), ("heat", "平均活动"), ("alerts", "异常通道"))):
             card, value, _detail = self._card(title, PENDING if key not in {"patterns", "main_behavior", "alerts"} else UNKNOWN, "真实数据/公式待定")
@@ -4106,7 +4112,7 @@ class DataAnalysisPage(_BaseWorkflowPage):
         chart_title = QLabel("对比曲线（近 1 小时 · 左右双轴）"); chart_title.setProperty("title", True); chart_layout.addWidget(chart_title)
         chart_hint = QLabel("左轴使用蓝色，右轴使用橙色；只有左右通道都选中并存在真实采集数据时才绘制曲线。")
         chart_title.setText("对比曲线（所选实验全部数据 · 左右双轴）")
-        chart_hint.setText("显示所选实验从首条到最新一条的真实采集数据；滚轮放大/缩小，按住鼠标左键拖动查看，放大后会加载该时间段的更多原始点。")
+        chart_hint.setText("实时实验显示最近 1 小时真实采集数据；滚轮放大/缩小，按住鼠标左键拖动查看。历史实验显示所选实验数据。")
         chart_hint.setProperty("hint", True); chart_hint.setWordWrap(True); chart_layout.addWidget(chart_hint)
         export_row = QHBoxLayout()
         export_row.addStretch(1)
@@ -4153,7 +4159,7 @@ class DataAnalysisPage(_BaseWorkflowPage):
         trajectory_section = QFrame(); trajectory_section.setProperty("card", True)
         trajectory_layout = QVBoxLayout(trajectory_section); trajectory_layout.setContentsMargins(14, 12, 14, 12); trajectory_layout.setSpacing(8)
         trajectory_title = QLabel("行为、轨迹与红外温度对比"); trajectory_title.setProperty("title", True); trajectory_layout.addWidget(trajectory_title)
-        trajectory_hint = QLabel("先选择一个对比模块，再选择一个或多个通道；图表显示所选实验对应通道的真实轨迹或红外温度数据。")
+        trajectory_hint = QLabel("先选择一个对比模块，再选择一个或多个通道；实时实验显示最近 1 小时对应通道的真实数据；历史实验显示所选实验数据。")
         trajectory_hint.setProperty("hint", True); trajectory_hint.setWordWrap(True); trajectory_layout.addWidget(trajectory_hint)
         trajectory_experiment_row = QHBoxLayout(); trajectory_experiment_row.setSpacing(8)
         trajectory_experiment_row.addWidget(QLabel("轨迹实验"))
@@ -5135,9 +5141,15 @@ class DataAnalysisPage(_BaseWorkflowPage):
             export_path = Path(export)
             paths = sorted(export_path.glob("cage*/data/trajectory.csv"))
             signature = tuple((str(path), path.stat().st_size, path.stat().st_mtime_ns) for path in paths)
-            key = (str(db_path), str(export_path), signature)
+            # Refresh the live rolling window periodically even when the CSV
+            # writer has not changed its file metadata yet. Historical
+            # selections keep the original file-based cache key.
+            live_window_key = (
+                int(time.time() // 5) if self._live_analysis_mode else None
+            )
+            key = (str(db_path), str(export_path), signature, live_window_key)
             if key != self._legacy_trajectory_cache_key:
-                self._legacy_trajectory_cache = load_trajectory_experiment(export_path)
+                self._legacy_trajectory_cache = load_trajectory_experiment(export_path, time_range=_live_analysis_time_range() if self._live_analysis_mode else None)
                 self._legacy_trajectory_cache_key = key
             return self._legacy_trajectory_cache
         except (OSError, ValueError, csv.Error) as error:
@@ -5662,13 +5674,24 @@ class DataAnalysisPage(_BaseWorkflowPage):
                             continue
                         quoted_vo2 = '"' + vo2_column.replace('"', '""') + '"'
                         quoted_vco2 = '"' + vco2_column.replace('"', '""') + '"'
+                        query_params: tuple[str, ...] = ()
                         if "time" in lower:
                             quoted_time = '"' + lower["time"].replace('"', '""') + '"'
-                            query = f'SELECT {quoted_time}, {quoted_vo2}, {quoted_vco2} FROM "{table}" ORDER BY {quoted_time} ASC, rowid ASC'
+                            if time_range is not None:
+                                cutoff_start = datetime.fromtimestamp(time_range[0]).strftime("%Y-%m-%d %H:%M:%S")
+                                cutoff_end = datetime.fromtimestamp(time_range[1]).strftime("%Y-%m-%d %H:%M:%S")
+                                query = (
+                                    f'SELECT {quoted_time}, {quoted_vo2}, {quoted_vco2} '
+                                    f'FROM "{table}" WHERE {quoted_time} >= ? AND {quoted_time} <= ? '
+                                    f'ORDER BY {quoted_time} ASC, rowid ASC'
+                                )
+                                query_params = (cutoff_start, cutoff_end)
+                            else:
+                                query = f'SELECT {quoted_time}, {quoted_vo2}, {quoted_vco2} FROM "{table}" ORDER BY {quoted_time} ASC, rowid ASC'
                         else:
                             query = f'SELECT rowid, {quoted_vo2}, {quoted_vco2} FROM "{table}" ORDER BY rowid ASC'
                         series: list[tuple[str, float]] = []
-                        for row_index, (raw_time, raw_vo2, raw_vco2) in enumerate(connection.execute(query), 1):
+                        for row_index, (raw_time, raw_vo2, raw_vco2) in enumerate(connection.execute(query, query_params), 1):
                             interrupted = getattr(self, "_interrupted", None)
                             if row_index % 1000 == 0 and callable(interrupted) and interrupted():
                                 return []
@@ -5691,13 +5714,24 @@ class DataAnalysisPage(_BaseWorkflowPage):
                             channel_series.append((f"CH{channel:02d}", series))
                         continue
                     quoted_column = '"' + column.replace('"', '""') + '"'
+                    query_params: tuple[str, ...] = ()
                     if "time" in lower:
                         quoted_time = '"' + lower["time"].replace('"', '""') + '"'
-                        query = f'SELECT {quoted_time}, {quoted_column} FROM "{table}" ORDER BY {quoted_time} ASC, rowid ASC'
+                        if time_range is not None:
+                            cutoff_start = datetime.fromtimestamp(time_range[0]).strftime("%Y-%m-%d %H:%M:%S")
+                            cutoff_end = datetime.fromtimestamp(time_range[1]).strftime("%Y-%m-%d %H:%M:%S")
+                            query = (
+                                f'SELECT {quoted_time}, {quoted_column} '
+                                f'FROM "{table}" WHERE {quoted_time} >= ? AND {quoted_time} <= ? '
+                                f'ORDER BY {quoted_time} ASC, rowid ASC'
+                            )
+                            query_params = (cutoff_start, cutoff_end)
+                        else:
+                            query = f'SELECT {quoted_time}, {quoted_column} FROM "{table}" ORDER BY {quoted_time} ASC, rowid ASC'
                     else:
                         query = f'SELECT rowid, {quoted_column} FROM "{table}" ORDER BY rowid ASC'
                     series: list[tuple[str, float]] = []
-                    for row_index, (raw_time, raw_value) in enumerate(connection.execute(query), 1):
+                    for row_index, (raw_time, raw_value) in enumerate(connection.execute(query, query_params), 1):
                         interrupted = getattr(self, "_interrupted", None)
                         if row_index % 1000 == 0 and callable(interrupted) and interrupted():
                             return []
@@ -5915,11 +5949,13 @@ class DataAnalysisPage(_BaseWorkflowPage):
                              root / f"cage{channel}" / "data" / "trajectory.csv")
                 if path.is_file()
             )
+        live_window_key = int(time.time() // 5) if self._live_analysis_mode else None
         key = (
             self._analysis_file_signature(context.get("experiment_db_path")),
             self._analysis_file_signature(self._selected_experiment_excel_path),
             csv_signature,
             self._legacy_comparison_cache_key,
+            live_window_key,
             module,
             tuple(sorted(self._trajectory_channels)),
             self.selected_channel,
@@ -6058,6 +6094,7 @@ class _AnalysisWorkContext:
         self._selected_experiment_excel_path = request["excel_path"]
         self.selected_channel = int(request["bio_channel"])
         self._trajectory_records_cache: dict[int, list[dict[str, Any]]] = {}
+        self._analysis_time_range: tuple[float, float] | None = None
 
     def _legacy_comparison_series(self) -> tuple[float, dict[int, Any]]:
         return float(self._request["comparison_origin"]), self._request["comparison_cache"]
@@ -6089,6 +6126,7 @@ class _AnalysisWorkContext:
                 interruption_requested=self._interrupted,
                 selected_channels=self._requested_channels,
                 include_comparison=False,
+                time_range=self._analysis_time_range,
             )
         except (OSError, ValueError, csv.Error, InterruptedError) as error:
             if not self._interrupted():
@@ -6112,17 +6150,29 @@ class _AnalysisPreviewLoader(QThread):
             context = _AnalysisWorkContext(self.request, self.isInterruptionRequested)
             viewport = self.request.get("compare_viewport")
             requested_full_range = self.request.get("compare_full_x_range")
-            time_range = None
+            time_range = _live_analysis_time_range() if context._live_analysis_mode else None
             if (
                 viewport
                 and requested_full_range
                 and len(requested_full_range) == 2
             ):
                 full_low, full_high = map(float, requested_full_range)
-                time_range = (
+                viewport_range = (
                     full_low + (full_high - full_low) * float(viewport[0]),
                     full_low + (full_high - full_low) * float(viewport[1]),
                 )
+                if time_range is None:
+                    time_range = viewport_range
+                else:
+                    time_range = (
+                        max(time_range[0], viewport_range[0]),
+                        min(time_range[1], viewport_range[1]),
+                    )
+                    if time_range[0] > time_range[1]:
+                        # The live window moved beyond an old zoom/pan
+                        # viewport. Fall back to the current latest hour.
+                        time_range = _live_analysis_time_range()
+            context._analysis_time_range = time_range
             preview_limit = 20000 if time_range is not None else 3000
             left = context._metric_channel_series(
                 set(self.request["left_channels"]), int(self.request["left_metric"]),
@@ -6164,18 +6214,27 @@ class _AnalysisPreviewLoader(QThread):
             series: list[tuple[str, Any]] = []
             sleep_multiplier = 1
             if module == "infrared":
-                origin = float(self.request["comparison_origin"])
-                comparison = self.request["comparison_cache"]
-                for channel in sorted(self.request["trajectory_channels"]):
-                    temperature = comparison.get(channel, {}).get("temperature")
-                    if temperature is None:
-                        continue
-                    values = [
-                        (origin + float(elapsed), float(value))
-                        for elapsed, value in zip(temperature.elapsed_seconds, temperature.values)
-                        if math.isfinite(float(elapsed)) and math.isfinite(float(value))
-                    ]
-                    series.append((f"CH{channel:02d}", extrema_preview(values, 3000)))
+                if self._live_analysis_mode:
+                    live_temperature = context._metric_channel_series(
+                        set(self.request["trajectory_channels"]),
+                        2,
+                        3000,
+                        time_range,
+                    )
+                    series.extend(live_temperature)
+                else:
+                    origin = float(self.request["comparison_origin"])
+                    comparison = self.request["comparison_cache"]
+                    for channel in sorted(self.request["trajectory_channels"]):
+                        temperature = comparison.get(channel, {}).get("temperature")
+                        if temperature is None:
+                            continue
+                        values = [
+                            (origin + float(elapsed), float(value))
+                            for elapsed, value in zip(temperature.elapsed_seconds, temperature.values)
+                            if math.isfinite(float(elapsed)) and math.isfinite(float(value))
+                        ]
+                        series.append((f"CH{channel:02d}", extrema_preview(values, 3000)))
             elif module != "recognition":
                 for channel in sorted(self.request["trajectory_channels"]):
                     records = records_by_channel.get(channel, [])
@@ -6224,7 +6283,10 @@ class _AnalysisPreviewLoader(QThread):
                 min(_plot_time_value(point[0]) for point in current_points),
                 max(_plot_time_value(point[0]) for point in current_points),
             ) if current_points else (0.0, 1.0)
-            compare_full_x_range = requested_full_range or current_x_range
+            compare_full_x_range = (
+                current_x_range if context._live_analysis_mode
+                else (requested_full_range or current_x_range)
+            )
             self.loaded.emit(self.key, {
                 "compare": compare,
                 "compare_full_x_range": compare_full_x_range,
