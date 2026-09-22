@@ -40,24 +40,16 @@ import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection
 from matplotlib.colors import Normalize
 from matplotlib.patches import Polygon as MplPolygon
+from mpl_toolkits.mplot3d.art3d import Line3DCollection
 import numpy as np
 
 sys.path.insert(0, str(YOLO_ROOT))
 from ultralytics import YOLO
 
-from Module.mouse_trajectory.trajectory_tuning import (
-    TrajectoryStabilizer,
-    trajectory_tuning_store,
-)
-
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 CORNER_SMOOTH_ALPHA = 0.25
 CORNER_MAX_STEP_PX = 18.0
-TRAJECTORY_MEDIAN_WINDOW = 5
-TRAJECTORY_SMOOTH_ALPHA = 0.38
-TRAJECTORY_MAX_STEP_MM = 38.0
-RUN_SIZE_Y_WEIGHT = 0.0
 
 
 Point = Dict[str, Any]
@@ -89,12 +81,18 @@ def load_calibration_module() -> Any:
 
 
 from Module.mouse_trajectory.utils import animal_box_calibration as CAL
+from Module.mouse_trajectory.trajectory_tuning import (
+    DEFAULT_TRAJECTORY_TUNING,
+    TrajectoryTemporalStabilizer,
+    normalize_trajectory_tuning,
+)
 
 
 class HeadlessCalibration(CAL.AnimalBoxCalibrationApp):
     """Minimal non-GUI shell around the calibration app's compute methods."""
 
     def __init__(self, grid_data: Sequence[Point], image_meta: Dict[str, Any]) -> None:
+        tuning = normalize_trajectory_tuning(DEFAULT_TRAJECTORY_TUNING)
         self.points: List[Point] = []
         self.computed_points: List[Point] = []
         self.grid_data: List[Point] = list(grid_data)
@@ -104,6 +102,30 @@ class HeadlessCalibration(CAL.AnimalBoxCalibrationApp):
         self.image_meta = dict(image_meta)
         self.test_image_meta: Dict[str, Any] = {}
         self.lines_map: Dict[str, Any] = {}
+        self.y_size_fusion_weight = float(tuning["bbox_size_weight"])
+        self.y_center_fusion_weight = float(tuning["volume_center_weight"])
+        self.y_bottom_fusion_weight = float(tuning["bottom_grid_weight"])
+        self.y_bottom_fusion_far_weight = float(tuning["bottom_grid_far_weight"])
+        self.y_center_disagreement_max_delta = float(tuning["center_disagreement_mm"])
+        self.y_bottom_acceptance_max_delta = float(tuning["bottom_acceptance_mm"])
+        self.bbox_scale_near_px = float(tuning["bbox_scale_near_px"])
+        self.bbox_scale_mid_px = float(tuning["bbox_scale_mid_px"])
+        self.bbox_scale_far_px = float(tuning["bbox_scale_far_px"])
+        self.nominal_ground_center_height_mm = float(
+            tuning["nominal_ground_center_height_mm"]
+        )
+        self.ground_center_acceptance_px = float(tuning["ground_center_acceptance_px"])
+        self.ground_y_anchor_weight = float(tuning["ground_y_anchor_weight"])
+        self.ground_y_anchor_max_volume_z_mm = float(
+            tuning["ground_y_anchor_max_volume_z_mm"]
+        )
+        self.ground_y_support_max_pixel_error_px = float(
+            tuning["ground_y_support_max_pixel_error_px"]
+        )
+        self.ground_contact_margin_mm = float(tuning["ground_contact_margin_mm"])
+        self.front_contact_threshold_mm = float(tuning["front_contact_threshold_mm"])
+        self.front_x_anchor_threshold_mm = float(tuning["front_x_anchor_threshold_mm"])
+        self.front_x_boundary_overrun_mm = float(tuning["front_x_boundary_overrun_mm"])
 
 
 def read_json(path: Path) -> Dict[str, Any]:
@@ -439,7 +461,6 @@ def solve_mouse_location(
     solver: HeadlessCalibration,
     frame_box: DetectionBox,
     frame_name: str,
-    trajectory_tuning: Optional[Dict[str, Any]] = None,
 ) -> Optional[Point]:
     x1, y1, x2, y2 = frame_box.xyxy
     solver.yolo_boxes = [
@@ -455,7 +476,6 @@ def solve_mouse_location(
             "class": frame_box.cls,
         }
     ]
-    solver.trajectory_tuning = dict(trajectory_tuning or trajectory_tuning_store.snapshot())
     solved = solver.compute_solved_yolo_boxes()
     return solved[0] if solved else None
 
@@ -496,6 +516,7 @@ TRAJECTORY_CSV_FIELDS = [
         "windowIndex",
         "windowStart",
         "windowEnd",
+        "tuningRevision",
         "status",
         "effectiveSubmitFps",
         "effectiveYoloFps",
@@ -539,23 +560,55 @@ TRAJECTORY_CSV_FIELDS = [
         "medianX",
         "medianY",
         "medianZ",
-        "stableX",
-        "stableY",
-        "stableZ",
-        "bboxSizeY",
-        "volumeKnnY",
-        "bottomGridY",
-        "bboxEffectiveWeight",
-        "volumeEffectiveWeight",
-        "bottomEffectiveWeight",
-        "planarSpeedMmS",
-        "heightSpeedMmS",
-        "motionState",
-        "jumpRejected",
-        "stabilizationAlpha",
-        "parameterVersion",
         "runSizeDepthY",
+        "groundCenterX",
+        "groundCenterY",
+        "groundCenterZ",
+        "groundCenterMatchError",
+        "volumeCenterX",
+        "volumeCenterY",
+        "volumeCenterZ",
+        "projectedHeight",
+        "heightProjectionIntercept",
+        "heightProjectionSlope",
+        "bottomGridX",
+        "bottomGridY",
+        "bottomGridRawX",
+        "bottomGridRawY",
+        "groundFootprintRawLeftX",
+        "groundFootprintRawRightX",
+        "footprintMinX",
+        "footprintMaxX",
+        "footprintCenterX",
+        "touchesLeftWall",
+        "touchesRightWall",
+        "fusionBBoxWeight",
+        "fusionCenterWeight",
+        "fusionBottomWeight",
         "trajectorySmoothed",
+        "trajectoryJumpRejected",
+        "trajectoryFilterAlpha",
+        "trajectoryHeightAlpha",
+        "trajectoryFilterDt",
+        "trajectoryPlanarSpeed",
+        "measurementX",
+        "measurementY",
+        "measurementZ",
+        "bboxCenterMotionPx",
+        "bboxLogGeometryChange",
+        "bboxLogAspectChange",
+        "poseChangeDetected",
+        "climbingMode",
+        "heightEvidenceMm",
+        "dynamicBBoxWeight",
+        "dynamicCenterWeight",
+        "dynamicPriorWeight",
+        "dynamicFrontContactWeight",
+        "dynamicBottomWeight",
+        "groundContactXWeight",
+        "groundContactValid",
+        "groundedMode",
+        "frontContactDetected",
         "X",
         "Y",
         "Z",
@@ -649,12 +702,10 @@ def occupancy_points(
     in_instrument_gap = False
 
     for row in rows:
-        raw_x = row.get("rawX") if row.get("rawX") is not None else row.get("X")
-        raw_y = row.get("rawY") if row.get("rawY") is not None else row.get("Y")
-        is_valid = row.get("status") == "ok" and raw_x is not None and raw_y is not None
+        is_valid = row.get("status") == "ok" and row.get("X") is not None and row.get("Y") is not None
         if is_valid:
-            xs.append(float(raw_x))
-            ys.append(float(raw_y))
+            xs.append(float(row["X"]))
+            ys.append(float(row["Y"]))
             previous_valid = True
             in_instrument_gap = False
         elif row.get("status") == "no_mouse" and instrument_polygon and (previous_valid or in_instrument_gap):
@@ -666,7 +717,6 @@ def occupancy_points(
 
 
 def save_plots(output_dir: Path, rows: Sequence[Dict[str, Any]], instrument_polygon: Optional[Sequence[Point]] = None) -> None:
-    output_dir.mkdir(parents=True, exist_ok=True)
     valid = [r for r in rows if r.get("status") == "ok" and r.get("X") is not None and r.get("Y") is not None]
     fig, ax = plt.subplots(figsize=(9.8, 6.2))
     fig.patch.set_facecolor("#ffffff")
@@ -679,12 +729,32 @@ def save_plots(output_dir: Path, rows: Sequence[Dict[str, Any]], instrument_poly
     progress_denominator = max(1, len(rows) - 1)
     trajectory_segments: List[Tuple[Tuple[float, float], Tuple[float, float], float]] = []
     inferred_segments: List[Tuple[Tuple[float, float], Tuple[float, float], float]] = []
+    trajectory_gap_seconds = 5.0
     for row in rows:
         is_valid = row.get("status") == "ok" and row.get("X") is not None and row.get("Y") is not None
         progress = (int(row.get("frameIndex", 1)) - 1) / progress_denominator
         if is_valid:
             x = float(row["X"])
             y = float(row["Y"])
+            previous_timestamp = (
+                float(previous_valid.get("timestamp"))
+                if previous_valid is not None and previous_valid.get("timestamp") is not None
+                else None
+            )
+            current_timestamp = (
+                float(row.get("timestamp"))
+                if row.get("timestamp") is not None
+                else None
+            )
+            long_gap = bool(
+                previous_timestamp is not None
+                and current_timestamp is not None
+                and current_timestamp - previous_timestamp > trajectory_gap_seconds
+            )
+            if long_gap:
+                previous_valid = None
+                waiting_from_instrument = False
+                gap_started = False
             if waiting_from_instrument and instrument_polygon:
                 inferred_segments.append(((instrument_center["x"], instrument_center["y"]), (x, y), progress))
             elif previous_valid:
@@ -700,12 +770,43 @@ def save_plots(output_dir: Path, rows: Sequence[Dict[str, Any]], instrument_poly
             gap_started = True
 
     progress_norm = Normalize(vmin=0.0, vmax=1.0)
+    cage_outline = [
+        (-CAL.BOTTOM_W / 2.0, 0.0),
+        (CAL.BOTTOM_W / 2.0, 0.0),
+        (CAL.BOTTOM_W / 2.0, CAL.BOTTOM_L),
+        (-CAL.BOTTOM_W / 2.0, CAL.BOTTOM_L),
+    ]
+    ax.add_patch(
+        MplPolygon(
+            cage_outline,
+            closed=True,
+            fill=False,
+            edgecolor="#334155",
+            linewidth=1.25,
+            linestyle=(0, (5, 3)),
+            label="cage boundary",
+            zorder=0,
+        )
+    )
     if valid:
         xs = [float(r["X"]) for r in valid]
         ys = [float(r["Y"]) for r in valid]
-        raw_xs = [float(r.get("rawX", r["X"])) for r in valid]
-        raw_ys = [float(r.get("rawY", r["Y"])) for r in valid]
-        ax.plot(raw_xs, raw_ys, color="#94a3b8", linewidth=1.0, alpha=0.55, label="raw")
+        raw_xy_rows = [
+            r
+            for r in valid
+            if r.get("rawX") is not None and r.get("rawY") is not None
+        ]
+        if len(raw_xy_rows) > 1:
+            ax.plot(
+                [float(r["rawX"]) for r in raw_xy_rows],
+                [float(r["rawY"]) for r in raw_xy_rows],
+                color="#94a3b8",
+                linewidth=1.0,
+                alpha=0.42,
+                linestyle=(0, (3, 3)),
+                label="raw",
+                zorder=1,
+            )
         if trajectory_segments:
             segments = np.asarray([(start, end) for start, end, _progress in trajectory_segments], dtype=float)
             progress_values = np.asarray([progress for _start, _end, progress in trajectory_segments], dtype=float)
@@ -715,7 +816,7 @@ def save_plots(output_dir: Path, rows: Sequence[Dict[str, Any]], instrument_poly
             cbar = fig.colorbar(line, ax=ax, pad=0.015, fraction=0.045)
             cbar.set_label("trajectory progress")
             cbar.outline.set_visible(False)
-        ax.scatter(xs, ys, c="#0f172a", s=10, alpha=0.45, linewidths=0, label="stable", zorder=3)
+        ax.scatter(xs, ys, c="#0f172a", s=10, alpha=0.45, linewidths=0, zorder=3)
         ax.scatter(xs[0], ys[0], c="#16a34a", s=62, edgecolors="white", linewidths=1.3, label="start", zorder=4)
         ax.scatter(xs[-1], ys[-1], c="#dc2626", s=62, edgecolors="white", linewidths=1.3, label="end", zorder=4)
 
@@ -751,8 +852,8 @@ def save_plots(output_dir: Path, rows: Sequence[Dict[str, Any]], instrument_poly
     ax.set_title("Mouse X-Y Trajectory")
     ax.set_xlabel("X")
     ax.set_ylabel("Y")
-    ax.set_xlim(-CAL.BOTTOM_W / 2.0, CAL.BOTTOM_W / 2.0)
-    ax.set_ylim(0.0, CAL.BOTTOM_L)
+    ax.set_xlim(-CAL.BOTTOM_W / 2.0 - 10.0, CAL.BOTTOM_W / 2.0 + 10.0)
+    ax.set_ylim(-12.0, CAL.BOTTOM_L + 12.0)
     ax.grid(True, color="#cbd5e1", alpha=0.38, linewidth=0.8)
     for spine in ax.spines.values():
         spine.set_color("#cbd5e1")
@@ -761,31 +862,86 @@ def save_plots(output_dir: Path, rows: Sequence[Dict[str, Any]], instrument_poly
     fig.savefig(output_dir / "xy_trajectory.png", dpi=160)
     plt.close(fig)
 
-    fig = plt.figure(figsize=(9.2, 6.6))
-    ax3d = fig.add_subplot(111, projection="3d")
+    valid_xyz = [
+        r
+        for r in rows
+        if r.get("status") == "ok"
+        and r.get("X") is not None
+        and r.get("Y") is not None
+        and r.get("Z") is not None
+    ]
+    fig = plt.figure(figsize=(9.6, 6.6))
     fig.patch.set_facecolor("#ffffff")
+    ax3d = fig.add_subplot(111, projection="3d")
     ax3d.set_facecolor("#f8fafc")
-    valid_3d = [row for row in valid if row.get("Z") is not None]
-    if valid_3d:
-        stable_x = [float(row["X"]) for row in valid_3d]
-        stable_y = [float(row["Y"]) for row in valid_3d]
-        stable_z = [float(row["Z"]) for row in valid_3d]
-        raw_x = [float(row.get("rawX", row["X"])) for row in valid_3d]
-        raw_y = [float(row.get("rawY", row["Y"])) for row in valid_3d]
-        raw_z = [float(row.get("rawZ", row["Z"])) for row in valid_3d]
-        ax3d.plot(raw_x, raw_y, raw_z, color="#94a3b8", linewidth=1.0, alpha=0.60, label="raw")
-        ax3d.plot(stable_x, stable_y, stable_z, color="#2563eb", linewidth=2.1, alpha=0.95, label="stable")
-        ax3d.scatter(stable_x[0], stable_y[0], stable_z[0], c="#16a34a", s=42, label="start")
-        ax3d.scatter(stable_x[-1], stable_y[-1], stable_z[-1], c="#dc2626", s=42, label="end")
-        ax3d.legend(loc="upper right", frameon=False)
-    ax3d.set_title("Mouse X-Y-Z Trajectory")
+    if valid_xyz:
+        xyz = np.asarray(
+            [[float(r["X"]), float(r["Y"]), float(r["Z"])] for r in valid_xyz],
+            dtype=float,
+        )
+        raw_xyz_rows = [
+            r
+            for r in valid_xyz
+            if r.get("rawX") is not None
+            and r.get("rawY") is not None
+            and r.get("rawZ") is not None
+        ]
+        if len(raw_xyz_rows) > 1:
+            raw_xyz = np.asarray(
+                [
+                    [float(r["rawX"]), float(r["rawY"]), float(r["rawZ"])]
+                    for r in raw_xyz_rows
+                ],
+                dtype=float,
+            )
+            ax3d.plot(
+                raw_xyz[:, 0],
+                raw_xyz[:, 1],
+                raw_xyz[:, 2],
+                color="#94a3b8",
+                linewidth=1.0,
+                alpha=0.42,
+                linestyle=(0, (3, 3)),
+                label="raw",
+            )
+        if len(xyz) > 1:
+            segments3d = np.stack([xyz[:-1], xyz[1:]], axis=1)
+            progress3d = np.linspace(0.0, 1.0, len(segments3d))
+            line3d = Line3DCollection(
+                segments3d,
+                cmap="viridis",
+                norm=progress_norm,
+                linewidths=2.4,
+                alpha=0.94,
+                label="stabilized",
+            )
+            line3d.set_array(progress3d)
+            ax3d.add_collection3d(line3d)
+            cbar3d = fig.colorbar(line3d, ax=ax3d, pad=0.08, fraction=0.035)
+            cbar3d.set_label("trajectory progress")
+            cbar3d.outline.set_visible(False)
+        ax3d.scatter(
+            xyz[:, 0],
+            xyz[:, 1],
+            xyz[:, 2],
+            c="#0f172a",
+            s=9,
+            alpha=0.38,
+            depthshade=False,
+        )
+        ax3d.scatter(*xyz[0], c="#16a34a", s=58, edgecolors="white", linewidths=1.1, label="start")
+        ax3d.scatter(*xyz[-1], c="#dc2626", s=58, edgecolors="white", linewidths=1.1, label="end")
+        ax3d.legend(loc="upper left", frameon=False)
+    ax3d.set_title("Mouse X-Y-Z Trajectory (raw vs stabilized)")
     ax3d.set_xlabel("X (mm)")
     ax3d.set_ylabel("Y (mm)")
-    ax3d.set_zlabel("Z (mm)")
+    ax3d.set_zlabel("Z height (mm)")
     ax3d.set_xlim(-CAL.BOTTOM_W / 2.0, CAL.BOTTOM_W / 2.0)
     ax3d.set_ylim(0.0, CAL.BOTTOM_L)
     ax3d.set_zlim(0.0, CAL.HEIGHT_EST)
-    ax3d.view_init(elev=25, azim=-58)
+    ax3d.set_box_aspect((CAL.BOTTOM_W, CAL.BOTTOM_L, CAL.HEIGHT_EST))
+    ax3d.view_init(elev=24.0, azim=-58.0)
+    ax3d.grid(True, color="#cbd5e1", alpha=0.35, linewidth=0.7)
     fig.tight_layout()
     fig.savefig(output_dir / "xyz_trajectory.png", dpi=160)
     plt.close(fig)
@@ -822,25 +978,62 @@ def save_plots(output_dir: Path, rows: Sequence[Dict[str, Any]], instrument_poly
     fig.savefig(output_dir / "occupancy_heatmap.png", dpi=160)
     plt.close(fig)
 
-    valid_h = []
-    for row in rows:
-        raw_x = row.get("rawX") if row.get("rawX") is not None else row.get("X")
-        raw_z = row.get("rawZ") if row.get("rawZ") is not None else row.get("Z")
-        if row.get("status") == "ok" and raw_x is not None and raw_z is not None:
-            plot_row = dict(row)
-            plot_row["X"] = raw_x
-            plot_row["Z"] = raw_z
-            valid_h.append(plot_row)
+    valid_h = [
+        r
+        for r in rows
+        if r.get("status") == "ok" and r.get("Z") is not None
+    ]
     fig, ax = plt.subplots(figsize=(9.2, 5.2))
     fig.patch.set_facecolor("#ffffff")
     ax.set_facecolor("#f8fafc")
     if valid_h:
-        xs = [float(r["X"]) for r in valid_h]
+        first_timestamp = float(valid_h[0].get("timestamp", 0.0) or 0.0)
+        if first_timestamp > 0.0:
+            xs = [
+                max(float(r.get("timestamp", first_timestamp) or first_timestamp) - first_timestamp, 0.0)
+                for r in valid_h
+            ]
+            x_label = "time (s)"
+        else:
+            xs = [float(r.get("frameIndex", index + 1) or index + 1) for index, r in enumerate(valid_h)]
+            x_label = "frame"
         heights = [float(r["Z"]) for r in valid_h]
+        height_extent_values = list(heights)
+        raw_height_rows = [r for r in valid_h if r.get("rawZ") is not None]
+        if raw_height_rows:
+            if first_timestamp > 0.0:
+                raw_xs = [
+                    max(float(r.get("timestamp", first_timestamp) or first_timestamp) - first_timestamp, 0.0)
+                    for r in raw_height_rows
+                ]
+            else:
+                raw_xs = [
+                    float(r.get("frameIndex", index + 1) or index + 1)
+                    for index, r in enumerate(raw_height_rows)
+                ]
+            raw_heights = [float(r["rawZ"]) for r in raw_height_rows]
+            height_extent_values.extend(raw_heights)
+            ax.plot(
+                raw_xs,
+                raw_heights,
+                color="#94a3b8",
+                linewidth=1.1,
+                alpha=0.58,
+                linestyle=(0, (3, 3)),
+                label="raw Z",
+                zorder=1,
+            )
         if len(xs) > 1:
             points = np.column_stack([xs, heights]).reshape(-1, 1, 2)
             segments = np.concatenate([points[:-1], points[1:]], axis=1)
-            line = LineCollection(segments, cmap="plasma", linewidths=2.4, alpha=0.94, zorder=2)
+            line = LineCollection(
+                segments,
+                cmap="plasma",
+                linewidths=2.4,
+                alpha=0.94,
+                label="stabilized Z",
+                zorder=2,
+            )
             line.set_array(np.linspace(0.0, 1.0, len(segments)))
             ax.add_collection(line)
             cbar = fig.colorbar(line, ax=ax, pad=0.018, fraction=0.045)
@@ -849,8 +1042,8 @@ def save_plots(output_dir: Path, rows: Sequence[Dict[str, Any]], instrument_poly
         ax.scatter(xs, heights, c="#0f172a", s=12, alpha=0.42, linewidths=0, zorder=3)
         ax.scatter(xs[0], heights[0], c="#16a34a", s=58, edgecolors="white", linewidths=1.3, label="start", zorder=4)
         ax.scatter(xs[-1], heights[-1], c="#dc2626", s=58, edgecolors="white", linewidths=1.3, label="end", zorder=4)
-        raw_min = min(heights)
-        raw_max = max(heights)
+        raw_min = min(height_extent_values)
+        raw_max = max(height_extent_values)
         value_range = 20.0 if abs(raw_max - raw_min) < 1e-8 else raw_max - raw_min
         min_h = max(0.0, raw_min - value_range * 0.2)
         max_h = min(CAL.HEIGHT_EST, raw_max + value_range * 0.2)
@@ -858,10 +1051,11 @@ def save_plots(output_dir: Path, rows: Sequence[Dict[str, Any]], instrument_poly
             max_h = min(CAL.HEIGHT_EST, min_h + 20.0)
         ax.set_ylim(min_h, max_h)
         ax.legend(loc="upper right", frameon=False)
-    ax.set_title("Mouse Height by X")
-    ax.set_xlabel("X")
-    ax.set_ylabel("Z total")
-    ax.set_xlim(-CAL.BOTTOM_W / 2.0, CAL.BOTTOM_W / 2.0)
+    else:
+        x_label = "time (s)"
+    ax.set_title("Mouse Height over Time (raw vs stabilized)")
+    ax.set_xlabel(x_label)
+    ax.set_ylabel("Z height (mm)")
     ax.grid(True, color="#cbd5e1", alpha=0.38, linewidth=0.8)
     for spine in ax.spines.values():
         spine.set_color("#cbd5e1")
@@ -942,9 +1136,6 @@ def build_row(
         box_w = abs(x2 - x1)
         box_h = abs(y2 - y1)
         box_area = box_w * box_h
-        y_fusion = solved.get("yFusion") or {}
-        y_sources = y_fusion.get("sources") or {}
-        y_weights = y_fusion.get("effectiveWeights") or {}
         row.update(
             {
                 "mouseX1": x1,
@@ -962,6 +1153,12 @@ def build_row(
         raw_cy = solved.get("rawBBoxCenterY")
         mapped_cx = solved.get("mappedCenterX")
         mapped_cy = solved.get("mappedCenterY")
+        center3d = solved.get("center3D") or {}
+        y_fusion = solved.get("yFusion") or center3d.get("yFusion") or {}
+        effective_weights = y_fusion.get("effectiveWeights") or {}
+        bbox_size_y = solved.get("bboxScaleY")
+        if bbox_size_y is None:
+            bbox_size_y = center3d.get("sizeDepthY")
         mapped_delta = None
         if raw_cx is not None and raw_cy is not None and mapped_cx is not None and mapped_cy is not None:
             mapped_delta = math.hypot(float(mapped_cx) - float(raw_cx), float(mapped_cy) - float(raw_cy))
@@ -977,17 +1174,33 @@ def build_row(
                 "mappedBottomX": solved.get("mappedBottomX"),
                 "mappedBottomY": solved.get("mappedBottomY"),
                 "mappedDeltaPx": mapped_delta,
-                "runSizeDepthY": (
-                    solved.get("bboxScaleY")
-                    if solved.get("bboxScaleY") is not None
-                    else (solved.get("center3D") or {}).get("sizeDepthY")
+                "runSizeDepthY": bbox_size_y,
+                "groundCenterX": solved.get("groundCenterX"),
+                "groundCenterY": solved.get("groundCenterY"),
+                "groundCenterZ": solved.get("groundCenterZ"),
+                "groundCenterMatchError": solved.get("groundCenterMatchError"),
+                "volumeCenterX": solved.get("volumeCenterX"),
+                "volumeCenterY": solved.get("volumeCenterY", center3d.get("rawVolumeY")),
+                "volumeCenterZ": solved.get("volumeCenterZ", center3d.get("Z")),
+                "projectedHeight": solved.get("projectedHeight"),
+                "heightProjectionIntercept": solved.get("heightProjectionIntercept"),
+                "heightProjectionSlope": solved.get("heightProjectionSlope"),
+                "bottomGridX": solved.get("groundGridX"),
+                "bottomGridY": solved.get("groundGridY"),
+                "bottomGridRawX": solved.get("groundGridRawX"),
+                "bottomGridRawY": solved.get("groundGridRawY"),
+                "groundFootprintRawLeftX": solved.get("groundFootprintRawLeftX"),
+                "groundFootprintRawRightX": solved.get("groundFootprintRawRightX"),
+                "fusionBBoxWeight": effective_weights.get("bboxSize"),
+                "fusionCenterWeight": effective_weights.get("volumeCenter"),
+                "fusionBottomWeight": effective_weights.get("bottomGrid"),
+                "groundYAnchorUsed": solved.get("groundYAnchorUsed"),
+                "groundYAnchor": solved.get("groundYAnchor"),
+                "groundYAnchorSource": solved.get("groundYAnchorSource"),
+                "groundYSupportY": solved.get("groundYSupportY"),
+                "groundYSupportPixelError": solved.get(
+                    "groundYSupportPixelError"
                 ),
-                "bboxSizeY": y_sources.get("bbox", solved.get("bboxScaleY")),
-                "volumeKnnY": y_sources.get("volume", solved.get("volumeKnnY")),
-                "bottomGridY": y_sources.get("bottom", solved.get("bottomGridY")),
-                "bboxEffectiveWeight": y_weights.get("bbox", 0.0),
-                "volumeEffectiveWeight": y_weights.get("volume", 0.0),
-                "bottomEffectiveWeight": y_weights.get("bottom", 0.0),
                 "X": solved.get("X"),
                 "Y": solved.get("Y"),
                 "Z": solved.get("Z_total", solved.get("Z")),
@@ -1016,29 +1229,12 @@ def median(values: Sequence[float]) -> float:
 
 def stabilize_trajectory_rows(
     rows: Sequence[Dict[str, Any]],
-    stabilizer: Optional[TrajectoryStabilizer] = None,
-    settings: Optional[Dict[str, Any]] = None,
+    tuning: Optional[Dict[str, Any]] = None,
 ) -> None:
-    active_stabilizer = stabilizer or TrajectoryStabilizer()
-    active_settings = dict(settings or trajectory_tuning_store.snapshot())
+    stabilizer = TrajectoryTemporalStabilizer()
+    settings = normalize_trajectory_tuning(tuning or DEFAULT_TRAJECTORY_TUNING)
     for row in rows:
-        if row.get("status") != "ok" or row.get("X") is None or row.get("Y") is None:
-            continue
-        raw_x = float(row["X"])
-        raw_y = float(row["Y"])
-        raw_z = float(row.get("Z") or 0.0)
-        timestamp_value = row.get("timestamp")
-        if timestamp_value is None:
-            timestamp_value = row.get("captureTimestamp")
-        if timestamp_value is None:
-            timestamp_value = row.get("frameIndex", time.time())
-        timestamp = float(timestamp_value)
-        stabilized = active_stabilizer.update(raw_x, raw_y, raw_z, timestamp, active_settings)
-        row.update(stabilized)
-        row["X"] = clamp(float(stabilized["stableX"]), -CAL.BOTTOM_W / 2.0, CAL.BOTTOM_W / 2.0)
-        row["Y"] = clamp(float(stabilized["stableY"]), 0.0, CAL.BOTTOM_L)
-        row["Z"] = clamp(float(stabilized["stableZ"]), 0.0, CAL.HEIGHT_EST)
-        row["trajectorySmoothed"] = True
+        stabilizer.apply(row, settings)
 
 
 def main(

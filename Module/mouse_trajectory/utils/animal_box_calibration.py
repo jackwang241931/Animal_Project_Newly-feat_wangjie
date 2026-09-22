@@ -53,8 +53,9 @@ BOTTOM_CONTACT_MAX_PIXEL_ERROR = 25.0
 Y_BOTTOM_FUSION_WEIGHT = 0.10
 Y_BOTTOM_FUSION_MAX_DELTA = 120.0
 Y_BOTTOM_FUSION_FAR_WEIGHT = 0.03
-BBOX_SCALE_NEAR_PX = 560.0
-BBOX_SCALE_FAR_PX = 125.0
+BBOX_SCALE_NEAR_PX = 390.0
+BBOX_SCALE_MID_PX = 185.0
+BBOX_SCALE_FAR_PX = 85.0
 Y_SIZE_FUSION_WEIGHT = 4.0
 Y_CENTER_FUSION_WEIGHT = 0.25
 
@@ -92,21 +93,42 @@ def clamp(value: float, min_value: float, max_value: float) -> float:
     return max(min_value, min(max_value, value))
 
 
-def estimate_y_from_bbox_scale(width: float, height: float) -> Optional[float]:
+def estimate_y_from_bbox_scale(
+    width: float,
+    height: float,
+    near_px: float = BBOX_SCALE_NEAR_PX,
+    far_px: float = BBOX_SCALE_FAR_PX,
+    mid_px: Optional[float] = None,
+) -> Optional[float]:
     if width <= 0.0 or height <= 0.0:
         return None
     area_scale = math.sqrt(width * height)
     width_scale = width * 1.15
     scale = max(width_scale, area_scale * 0.85)
-    near = max(BBOX_SCALE_NEAR_PX, BBOX_SCALE_FAR_PX + 1.0)
-    far = max(1.0, BBOX_SCALE_FAR_PX)
+    near = max(float(near_px), float(far_px) + 2.0)
+    far = max(1.0, float(far_px))
+    if mid_px is None:
+        mid = math.sqrt(near * far)
+    else:
+        mid = clamp(float(mid_px), far + 1.0, near - 1.0)
     scale = clamp(scale, far, near)
-    # Apparent size changes roughly multiplicatively with depth, so interpolate in log-space.
-    denom = math.log(near) - math.log(far)
+    # Perspective is strongly non-linear through the middle of the cage.  A
+    # calibrated middle anchor prevents the two endpoint model from pushing
+    # middle-row animals towards the far wall.  Log interpolation inside each
+    # half remains monotone and is stable outside the sampled scales.
+    middle_y = BOTTOM_L / 2.0
+    if scale >= mid:
+        denom = math.log(near) - math.log(mid)
+        if abs(denom) < 1e-9:
+            return 0.0
+        ratio = (math.log(near) - math.log(scale)) / denom
+        return clamp(ratio * middle_y, 0.0, middle_y)
+
+    denom = math.log(mid) - math.log(far)
     if abs(denom) < 1e-9:
-        return None
-    depth_ratio = (math.log(near) - math.log(scale)) / denom
-    return clamp(depth_ratio * BOTTOM_L, 0.0, BOTTOM_L)
+        return BOTTOM_L
+    ratio = (math.log(mid) - math.log(scale)) / denom
+    return clamp(middle_y + ratio * middle_y, middle_y, BOTTOM_L)
 
 
 def blend_hex_color(color: str, alpha: float, bg: str = "#020617") -> str:
@@ -1977,6 +1999,25 @@ class AnimalBoxCalibrationApp:
         P = self.compute_camera_matrix()
         volume_candidates = self.volume_locator_candidates()
         ground_candidates = self.ground_locator_candidates()
+        nominal_center_height = clamp(
+            float(getattr(self, "nominal_ground_center_height_mm", 28.0)),
+            5.0,
+            HEIGHT_EST,
+        )
+        available_heights = sorted(
+            {float(point["z3"]) for point in volume_candidates if point.get("z3") is not None}
+        )
+        center_height_layer = (
+            min(available_heights, key=lambda value: abs(value - nominal_center_height))
+            if available_heights
+            else nominal_center_height
+        )
+        ground_center_candidates = [
+            point
+            for point in volume_candidates
+            if point.get("z3") is not None
+            and abs(float(point["z3"]) - center_height_layer) < 1e-6
+        ]
         if not ground and not volume_candidates and not ground_candidates:
             return []
 
@@ -2051,8 +2092,41 @@ class AnimalBoxCalibrationApp:
                 mapped_bbox_area = mapped_bbox_width * mapped_bbox_height
                 bbox_width_for_scale = mapped_bbox_width
                 bbox_height_for_scale = mapped_bbox_height
-            bbox_scale_y = estimate_y_from_bbox_scale(bbox_width_for_scale, bbox_height_for_scale)
+            bbox_scale_near_px = max(
+                float(getattr(self, "bbox_scale_near_px", BBOX_SCALE_NEAR_PX)),
+                2.0,
+            )
+            bbox_scale_far_px = clamp(
+                float(getattr(self, "bbox_scale_far_px", BBOX_SCALE_FAR_PX)),
+                1.0,
+                bbox_scale_near_px - 1.0,
+            )
+            bbox_scale_mid_px = clamp(
+                float(
+                    getattr(
+                        self,
+                        "bbox_scale_mid_px",
+                        BBOX_SCALE_MID_PX,
+                    )
+                ),
+                bbox_scale_far_px + 1.0,
+                bbox_scale_near_px - 1.0,
+            )
+            bbox_scale_y = estimate_y_from_bbox_scale(
+                bbox_width_for_scale,
+                bbox_height_for_scale,
+                bbox_scale_near_px,
+                bbox_scale_far_px,
+                bbox_scale_mid_px,
+            )
             center3d = self.knn_locate_3d(volume_candidates, u, v_center, VOLUME_KNN, "label5_volume_knn")
+            ground_center3d = self.knn_locate_3d(
+                ground_center_candidates,
+                u,
+                v_center,
+                VOLUME_KNN,
+                "label5_ground_center_height_knn",
+            )
             support3d = self.knn_locate_3d(
                 ground_candidates,
                 u_bottom,
@@ -2064,11 +2138,234 @@ class AnimalBoxCalibrationApp:
             Z_base = 0.0
 
             raw_phys = apply_homography(ground["H_Pix_to_XY"], {"x": u_bottom, "y": v_bottom}) if ground else None
+            raw_ground_left = None
+            raw_ground_right = None
+            if ground and mapped_box_corners:
+                raw_ground_left = apply_homography(
+                    ground["H_Pix_to_XY"], mapped_box_corners[3]
+                )
+                raw_ground_right = apply_homography(
+                    ground["H_Pix_to_XY"], mapped_box_corners[2]
+                )
             X_base = float(raw_phys["x"]) if raw_phys else float((support3d or center3d or {}).get("X", 0.0))
             Y_base = float(raw_phys["y"]) if raw_phys else float((support3d or center3d or {}).get("Y", 0.0))
+            raw_ground_x = X_base
+            raw_ground_y = Y_base
             front_back_source = "bbox_bottom_ground" if raw_phys else ("bbox_bottom_label1_knn" if support3d else "volume_center")
+            ground_contact_margin = max(
+                0.0,
+                float(getattr(self, "ground_contact_margin_mm", 20.0)),
+            )
+            front_contact_threshold = max(
+                0.0,
+                float(getattr(self, "front_contact_threshold_mm", 35.0)),
+            )
+            front_x_anchor_threshold = max(
+                front_contact_threshold,
+                float(getattr(self, "front_x_anchor_threshold_mm", 90.0)),
+            )
+            front_x_boundary_overrun = max(
+                0.0,
+                float(getattr(self, "front_x_boundary_overrun_mm", 5.0)),
+            )
+            ground_y_anchor_weight = clamp(
+                float(getattr(self, "ground_y_anchor_weight", 0.80)),
+                0.0,
+                1.0,
+            )
+            ground_y_anchor_max_volume_z = max(
+                10.0,
+                float(getattr(self, "ground_y_anchor_max_volume_z_mm", 45.0)),
+            )
+            ground_y_support_max_pixel_error = max(
+                10.0,
+                float(
+                    getattr(
+                        self,
+                        "ground_y_support_max_pixel_error_px",
+                        80.0,
+                    )
+                ),
+            )
+            front_floor_contact = bool(
+                raw_phys
+                and -BOTTOM_W / 2.0 - ground_contact_margin
+                <= raw_ground_x
+                <= BOTTOM_W / 2.0 + ground_contact_margin
+                and -ground_contact_margin
+                <= raw_ground_y
+                <= front_contact_threshold
+            )
+            front_floor_y = clamp(raw_ground_y, 0.0, BOTTOM_L)
 
-            X_final = clamp(X_base, -BOTTOM_W / 2.0, BOTTOM_W / 2.0)
+            # The bbox-bottom homography is a floor-contact measurement.  At
+            # the camera-facing edge it is the only cue that directly
+            # represents the mouse's lateral support point.  The free-volume
+            # KNN centre can move to an extreme left/right cell when the
+            # mouse curls, stretches, or changes posture while remaining near
+            # the middle of the cage.  Do not apply any artificial spread;
+            # use the floor X only for a validated front-floor contact and
+            # keep the existing volume/box path everywhere else.
+            front_x_ground_anchor_used = bool(
+                raw_phys
+                and math.isfinite(raw_ground_x)
+                and math.isfinite(raw_ground_y)
+                and -BOTTOM_W / 2.0 - ground_contact_margin
+                <= raw_ground_x
+                <= BOTTOM_W / 2.0 + ground_contact_margin
+                and -ground_contact_margin
+                <= raw_ground_y
+                <= front_x_anchor_threshold
+            )
+            # A bottom-edge projection can be slightly outside the physical
+            # cage because the detector box includes bedding/blur and the
+            # floor homography is only an approximation at the side wall.
+            # Clamping such a projection directly to +/-90 mm makes several
+            # consecutive frames look as if the mouse is glued to the wall.
+            # Keep the bottom anchor for small excursions, but for a clear
+            # overrun use the interior calibrated centre estimate, which is
+            # still available from the same frame and remains inside the
+            # cage.  This corrects the boundary only; it does not stretch X.
+            front_x_boundary_corrected = False
+            front_x_raw_before_clamp = float(raw_ground_x) if raw_phys else None
+            front_x_anchor = raw_ground_x
+            if front_x_ground_anchor_used:
+                boundary_overrun = abs(float(raw_ground_x)) - BOTTOM_W / 2.0
+                if boundary_overrun > front_x_boundary_overrun:
+                    interior_x = None
+                    if ground_center3d is not None:
+                        interior_x = ground_center3d.get("X")
+                    if interior_x is None and center3d is not None:
+                        interior_x = center3d.get("X")
+                    if interior_x is None and support3d is not None:
+                        interior_x = support3d.get("X")
+                    try:
+                        interior_x = float(interior_x)
+                    except (TypeError, ValueError):
+                        interior_x = None
+                    if interior_x is not None and math.isfinite(interior_x):
+                        front_x_anchor = interior_x
+                        front_x_boundary_corrected = True
+            volume_z_for_ground = None
+            if center3d is not None:
+                volume_z_for_ground = center3d.get("Z")
+            elif support3d is not None:
+                volume_z_for_ground = support3d.get("Z")
+            try:
+                volume_z_for_ground = float(volume_z_for_ground)
+            except (TypeError, ValueError):
+                volume_z_for_ground = None
+            support_ground_y = None
+            support_ground_x = None
+            support_ground_pixel_error = None
+            if support3d is not None and str(support3d.get("label", "1")) == "1":
+                try:
+                    support_ground_y = float(support3d.get("Y"))
+                    support_ground_x = float(support3d.get("X"))
+                    support_ground_pixel_error = float(support3d.get("pixelError"))
+                except (TypeError, ValueError):
+                    support_ground_y = None
+                    support_ground_x = None
+                    support_ground_pixel_error = None
+                if not all(
+                    value is not None and math.isfinite(value)
+                    for value in (
+                        support_ground_x,
+                        support_ground_y,
+                        support_ground_pixel_error,
+                    )
+                ):
+                    support_ground_y = None
+                    support_ground_x = None
+                    support_ground_pixel_error = None
+
+            support_ground_valid = bool(
+                support_ground_y is not None
+                and 0.0 <= support_ground_y <= BOTTOM_L
+                and support_ground_pixel_error is not None
+                and support_ground_pixel_error <= ground_y_support_max_pixel_error
+            )
+            raw_ground_valid = bool(
+                raw_phys
+                and math.isfinite(raw_ground_x)
+                and math.isfinite(raw_ground_y)
+                and -BOTTOM_W / 2.0 - ground_contact_margin
+                <= raw_ground_x
+                <= BOTTOM_W / 2.0 + ground_contact_margin
+                and -ground_contact_margin
+                <= raw_ground_y
+                <= BOTTOM_L + ground_contact_margin
+            )
+            # The label-1 KNN is a monotonic floor grid across the whole cage.
+            # It remains well behaved at the rear boundary, where the inverse
+            # four-corner homography can extrapolate to huge negative/positive
+            # values because the bbox bottom is above the annotated floor edge.
+            # Prefer it for Y; retain homography as the fallback when KNN is
+            # not close enough to the floor grid.
+            if support_ground_valid:
+                ground_y_anchor_candidate = float(support_ground_y)
+                ground_y_anchor_source = "bottom_label1_knn"
+            elif raw_ground_valid:
+                ground_y_anchor_candidate = float(raw_ground_y)
+                ground_y_anchor_source = "bottom_homography"
+            else:
+                ground_y_anchor_candidate = None
+                ground_y_anchor_source = "none"
+            ground_y_anchor_used = bool(
+                ground_y_anchor_candidate is not None
+                and volume_z_for_ground is not None
+                and volume_z_for_ground <= ground_y_anchor_max_volume_z
+            )
+            ground_y_anchor = (
+                clamp(ground_y_anchor_candidate, 0.0, BOTTOM_L)
+                if ground_y_anchor_candidate is not None
+                else None
+            )
+            # A valid bottom-floor match is normally the best ground-plane
+            # cue, but it can become over-confident in the middle of the
+            # perspective view: a small lateral change of the bbox bottom
+            # can move the label-1 KNN several grid rows in Y.  When the
+            # grounded bbox-scale depth strongly disagrees with that anchor,
+            # retain the anchor as a correction rather than letting it pull
+            # the whole point to the rear edge.  A stable rear mouse (where
+            # the two cues agree) keeps the full configured anchor weight.
+            ground_y_anchor_effective_weight = ground_y_anchor_weight
+            ground_y_anchor_bbox_delta = None
+            if ground_y_anchor_used and ground_y_anchor is not None and bbox_scale_y is not None:
+                ground_y_anchor_bbox_delta = abs(
+                    float(ground_y_anchor) - float(bbox_scale_y)
+                )
+                disagreement_soft = max(
+                    20.0,
+                    float(
+                        getattr(
+                            self,
+                            "y_center_disagreement_max_delta",
+                            Y_BOTTOM_FUSION_MAX_DELTA,
+                        )
+                    ),
+                )
+                disagreement_hard = max(
+                    disagreement_soft + 1.0,
+                    disagreement_soft * 2.0,
+                )
+                disagreement_ratio = clamp(
+                    (ground_y_anchor_bbox_delta - disagreement_soft)
+                    / max(disagreement_hard - disagreement_soft, 1.0),
+                    0.0,
+                    1.0,
+                )
+                min_anchor_weight = min(ground_y_anchor_weight, 0.20)
+                ground_y_anchor_effective_weight = (
+                    ground_y_anchor_weight
+                    + (min_anchor_weight - ground_y_anchor_weight)
+                    * disagreement_ratio
+                )
+            X_final = clamp(
+                front_x_anchor if front_x_ground_anchor_used else X_base,
+                -BOTTOM_W / 2.0,
+                BOTTOM_W / 2.0,
+            )
             Y_final = clamp(Y_base, 0.0, BOTTOM_L)
             Y_for_height = clamp(Y_base, 0.0, BOTTOM_L)
             mouse_height = solve_height_with_xyzv(P, X_final, Y_for_height, Z_base, v_center)
@@ -2083,9 +2380,22 @@ class AnimalBoxCalibrationApp:
                 "method": "ground_dlt" if ground else "fallback",
             }
 
+            y_fusion_result: Optional[Dict[str, Any]] = None
+            locator_method_fallback = "ground_dlt"
             if center3d:
-                X_final = clamp(float(center3d["X"]), -BOTTOM_W / 2.0, BOTTOM_W / 2.0)
+                geometry3d = ground_center3d or center3d
+                # X used to come from the free-volume centre.  Replacing it
+                # with the fixed-height centre layer distorted the near-edge
+                # left/right coordinate.  Keep the fixed-height layer for Y
+                # geometry only and restore the original X definition.
+                if not front_x_ground_anchor_used:
+                    X_final = clamp(
+                        float(center3d["X"]),
+                        -BOTTOM_W / 2.0,
+                        BOTTOM_W / 2.0,
+                    )
                 raw_volume_y = float(center3d["Y"])
+                geometry_center_y = float(geometry3d["Y"])
                 if False:
                     # 底边有约束时，融合中心值（主）和底边值（辅）
                     # 而不是强制用底边值覆盖中心值
@@ -2105,43 +2415,193 @@ class AnimalBoxCalibrationApp:
                 else:
                     # KNN成功但无底部接触：直接使用KNN的Y值
                     Y_final = clamp(raw_volume_y, 0.0, BOTTOM_L)
-                y_values: List[Tuple[float, float]] = []
-                y_fusion_parts: Dict[str, Any] = {"center": raw_volume_y}
+                size_weight = max(
+                    0.0,
+                    float(getattr(self, "y_size_fusion_weight", Y_SIZE_FUSION_WEIGHT)),
+                )
+                center_weight_base = max(
+                    0.0,
+                    float(getattr(self, "y_center_fusion_weight", Y_CENTER_FUSION_WEIGHT)),
+                )
+                if front_floor_contact:
+                    # At the wide camera-facing edge, bbox scale and a valid
+                    # floor contact are more trustworthy than projecting the
+                    # bbox centre onto a nominal-height layer.
+                    center_weight_base = min(
+                        center_weight_base,
+                        max(0.03, size_weight * 0.15),
+                    )
+                geometry_match_limit = max(
+                    1.0,
+                    float(getattr(self, "ground_center_acceptance_px", 60.0)),
+                )
+                geometry_match_error = float(geometry3d.get("pixelError", 0.0))
+                if geometry_match_error > geometry_match_limit:
+                    center_weight_base *= max(
+                        0.10,
+                        geometry_match_limit / geometry_match_error * 0.50,
+                    )
+                bottom_weight_near = max(
+                    0.0,
+                    float(getattr(self, "y_bottom_fusion_weight", Y_BOTTOM_FUSION_WEIGHT)),
+                )
+                bottom_weight_far = max(
+                    0.0,
+                    float(getattr(self, "y_bottom_fusion_far_weight", Y_BOTTOM_FUSION_FAR_WEIGHT)),
+                )
+                center_disagreement_limit = max(
+                    0.0,
+                    float(
+                        getattr(
+                            self,
+                            "y_center_disagreement_max_delta",
+                            Y_BOTTOM_FUSION_MAX_DELTA,
+                        )
+                    ),
+                )
+                bottom_acceptance_limit = max(
+                    0.0,
+                    float(getattr(self, "y_bottom_acceptance_max_delta", 60.0)),
+                )
+
+                y_fusion_parts: Dict[str, Any] = {
+                    "center": geometry_center_y,
+                    "rawVolumeCenter": raw_volume_y,
+                    "bboxSize": bbox_scale_y,
+                    "bottomGrid": Y_base,
+                    "configuredWeights": {
+                        "bboxSize": size_weight,
+                        "volumeCenter": center_weight_base,
+                        "bottomGridNear": bottom_weight_near,
+                        "bottomGridFar": bottom_weight_far,
+                        "groundYAnchor": ground_y_anchor_weight,
+                    },
+                    "bboxScaleNearPx": bbox_scale_near_px,
+                    "bboxScaleMidPx": bbox_scale_mid_px,
+                    "bboxScaleFarPx": bbox_scale_far_px,
+                    "geometryMatchErrorPx": geometry_match_error,
+                    "geometryMatchLimitPx": geometry_match_limit,
+                    "frontFloorContact": front_floor_contact,
+                    "groundYAnchorUsed": ground_y_anchor_used,
+                    "groundYAnchor": ground_y_anchor if ground_y_anchor_used else None,
+                    "groundYAnchorSource": ground_y_anchor_source,
+                    "groundYSupportY": support_ground_y,
+                    "groundYSupportPixelError": support_ground_pixel_error,
+                    "groundYAnchorConfiguredWeight": ground_y_anchor_weight,
+                    "groundYAnchorEffectiveWeight": ground_y_anchor_effective_weight,
+                    "groundYAnchorBBoxDelta": ground_y_anchor_bbox_delta,
+                }
+                if ground_y_anchor_used:
+                    non_anchor_weight_scale = 1.0 - ground_y_anchor_effective_weight
+                    y_values = [
+                        (ground_y_anchor, ground_y_anchor_effective_weight)
+                    ]
+                else:
+                    non_anchor_weight_scale = 1.0
+                    y_values = []
+                size_weight *= non_anchor_weight_scale
+                center_weight_base *= non_anchor_weight_scale
                 if bbox_scale_y is not None:
-                    y_values.append((bbox_scale_y, Y_SIZE_FUSION_WEIGHT))
                     y_fusion_parts["bboxSizePrimary"] = bbox_scale_y
-                    center_delta = abs(raw_volume_y - bbox_scale_y)
-                    center_weight = Y_CENTER_FUSION_WEIGHT
-                    if center_delta > Y_BOTTOM_FUSION_MAX_DELTA:
-                        center_weight *= 0.35
-                    y_values.append((raw_volume_y, center_weight))
+                    center_delta = abs(geometry_center_y - bbox_scale_y)
+                    center_weight = center_weight_base
+                    if center_delta > center_disagreement_limit:
+                        # Bbox size is the requested primary depth cue.  A
+                        # large one-frame disagreement therefore reduces the
+                        # centre-layer correction; posture jumps are handled by
+                        # the following temporal stage rather than by swapping
+                        # spatial authority here.
+                        center_weight *= max(
+                            0.05,
+                            center_disagreement_limit / max(center_delta, 1.0) * 0.25,
+                        )
+                        y_fusion_parts["centerWeightReducedByDisagreement"] = True
+                    y_values.append((bbox_scale_y, size_weight))
+                    y_values.append((geometry_center_y, center_weight))
                     y_fusion_parts["centerWeight"] = center_weight
                 else:
-                    y_values.append((raw_volume_y, 1.0))
-                if front_back_source != "volume_center":
-                    reference_y = bbox_scale_y if bbox_scale_y is not None else raw_volume_y
-                    delta_y = abs(reference_y - Y_base)
-                    bottom_limit = 60.0 if bbox_scale_y is not None else Y_BOTTOM_FUSION_MAX_DELTA
-                    if delta_y <= bottom_limit:
-                        bottom_weight = Y_BOTTOM_FUSION_WEIGHT
-                        if reference_y > BOTTOM_L / 2.0:
-                            bottom_weight = Y_BOTTOM_FUSION_FAR_WEIGHT
+                    center_weight = center_weight_base if ground_y_anchor_used else 1.0
+                    y_values.append((geometry_center_y, center_weight))
+                if front_back_source != "volume_center" and not ground_y_anchor_used:
+                    bottom_candidate_y = (
+                        front_floor_y if front_floor_contact else Y_base
+                    )
+                    reference_y = (
+                        bbox_scale_y
+                        if front_floor_contact and bbox_scale_y is not None
+                        else geometry_center_y
+                    )
+                    delta_y = abs(reference_y - bottom_candidate_y)
+                    bottom_limit = (
+                        bottom_acceptance_limit
+                        if bbox_scale_y is not None
+                        else center_disagreement_limit
+                    )
+                    if front_floor_contact or delta_y <= bottom_limit:
+                        bottom_depth_ratio = clamp(reference_y / BOTTOM_L, 0.0, 1.0)
+                        bottom_weight = (
+                            bottom_weight_near * (1.0 - bottom_depth_ratio)
+                            + bottom_weight_far * bottom_depth_ratio
+                        )
+                        y_fusion_parts["bottomDepthRatio"] = bottom_depth_ratio
                         if bbox_scale_y is not None:
                             bottom_weight *= max(0.15, 1.0 - delta_y / max(bottom_limit, 1.0))
-                        bottom_weight = clamp(bottom_weight, 0.0, Y_BOTTOM_FUSION_WEIGHT)
+                        bottom_weight = clamp(
+                            bottom_weight,
+                            0.0,
+                            max(bottom_weight_near, bottom_weight_far),
+                        )
                         if bottom_weight > 0.0:
-                            y_values.append((Y_base, bottom_weight))
-                            y_fusion_parts["bottom"] = Y_base
+                            y_values.append((bottom_candidate_y, bottom_weight))
+                            y_fusion_parts["bottom"] = bottom_candidate_y
                             y_fusion_parts["bottomWeight"] = bottom_weight
                     else:
                         y_fusion_parts["bottomRejected"] = Y_base
-                total_y_weight = sum(weight for _value, weight in y_values) or 1.0
+                total_y_weight = sum(weight for _value, weight in y_values)
+                if total_y_weight <= 0.0:
+                    y_values = [(geometry_center_y, 1.0)]
+                    total_y_weight = 1.0
+                    center_weight = 1.0
+                    size_weight = 0.0
+                    y_fusion_parts["zeroWeightFallback"] = "volumeCenter"
+                effective_weights = {
+                    "bboxSize": 0.0,
+                    "volumeCenter": 0.0,
+                    "bottomGrid": 0.0,
+                    "groundYAnchor": 0.0,
+                }
+                if bbox_scale_y is not None:
+                    effective_weights["bboxSize"] = size_weight / total_y_weight
+                    effective_weights["volumeCenter"] = center_weight / total_y_weight
+                else:
+                    effective_weights["volumeCenter"] = 1.0 / total_y_weight
+                if "bottomWeight" in y_fusion_parts:
+                    effective_weights["bottomGrid"] = (
+                        float(y_fusion_parts["bottomWeight"]) / total_y_weight
+                    )
+                if ground_y_anchor_used:
+                    effective_weights["groundYAnchor"] = (
+                        ground_y_anchor_effective_weight / total_y_weight
+                    )
+                y_fusion_parts["effectiveWeights"] = effective_weights
+                y_fusion_parts["bottomAcceptanceMm"] = bottom_acceptance_limit
+                y_fusion_parts["centerDisagreementMm"] = center_disagreement_limit
+                y_fusion_result = y_fusion_parts
                 Y_final = clamp(
                     sum(value * weight for value, weight in y_values) / total_y_weight,
                     0.0,
                     BOTTOM_L,
                 )
-                Z_total = clamp(float(center3d["Z"]), 0.0, HEIGHT_EST)
+                volume_height = clamp(float(center3d["Z"]), 0.0, HEIGHT_EST)
+                projected_height = clamp(
+                    solve_height_with_xyzv(P, X_final, Y_final, Z_base, v_center),
+                    0.0,
+                    HEIGHT_EST,
+                )
+                if volume_height >= 50.0:
+                    Z_total = clamp(0.50 * volume_height + 0.50 * projected_height, 0.0, HEIGHT_EST)
+                else:
+                    Z_total = clamp(0.35 * volume_height + 0.65 * projected_height, 0.0, HEIGHT_EST)
                 Z_base = clamp(Z_base, 0.0, HEIGHT_EST)
                 mouse_height = max(0.0, Z_total - Z_base)
                 X_base = X_final
@@ -2151,12 +2611,156 @@ class AnimalBoxCalibrationApp:
                     {
                         "Y": Y_final,
                         "rawVolumeY": raw_volume_y,
+                        "geometryCenterY": geometry_center_y,
                         "sizeDepthY": bbox_scale_y,
                         "yFusion": y_fusion_parts,
                         "frontBackSource": front_back_source,
-                        "method": "bbox_size_depth_primary",
+                        "method": "ground_center_height_geometry_fusion",
                     }
                 )
+            elif bbox_scale_y is not None:
+                # If the volume KNN fails, retain the bbox-size estimate as the
+                # primary source.  The increasingly dense far-end ground grid
+                # remains only a low-weight correction, never the fallback main
+                # coordinate.
+                size_weight = max(
+                    0.0,
+                    float(getattr(self, "y_size_fusion_weight", Y_SIZE_FUSION_WEIGHT)),
+                )
+                if size_weight <= 0.0:
+                    size_weight = 1.0
+                bottom_weight_near = max(
+                    0.0,
+                    float(getattr(self, "y_bottom_fusion_weight", Y_BOTTOM_FUSION_WEIGHT)),
+                )
+                bottom_weight_far = max(
+                    0.0,
+                    float(getattr(self, "y_bottom_fusion_far_weight", Y_BOTTOM_FUSION_FAR_WEIGHT)),
+                )
+                bottom_acceptance_limit = max(
+                    0.0,
+                    float(getattr(self, "y_bottom_acceptance_max_delta", 60.0)),
+                )
+                fallback_values: List[Tuple[float, float]] = [
+                    (
+                        bbox_scale_y,
+                        size_weight * (1.0 - ground_y_anchor_effective_weight)
+                        if ground_y_anchor_used
+                        else size_weight,
+                    )
+                ]
+                fallback_bottom_weight = 0.0
+                if ground_y_anchor_used:
+                    fallback_values.insert(
+                        0,
+                        (ground_y_anchor, ground_y_anchor_effective_weight),
+                    )
+                fallback_bottom_y = (
+                    front_floor_y if front_floor_contact else Y_base
+                )
+                bottom_delta = abs(bbox_scale_y - fallback_bottom_y)
+                if (
+                    front_back_source != "volume_center"
+                    and not ground_y_anchor_used
+                    and (
+                        front_floor_contact
+                        or bottom_delta <= bottom_acceptance_limit
+                    )
+                ):
+                    bottom_depth_ratio = clamp(bbox_scale_y / BOTTOM_L, 0.0, 1.0)
+                    fallback_bottom_weight = (
+                        bottom_weight_near * (1.0 - bottom_depth_ratio)
+                        + bottom_weight_far * bottom_depth_ratio
+                    )
+                    fallback_bottom_weight *= max(
+                        0.15,
+                        1.0
+                        - bottom_delta / max(bottom_acceptance_limit, 1.0),
+                    )
+                    if fallback_bottom_weight > 0.0:
+                        fallback_values.append(
+                            (fallback_bottom_y, fallback_bottom_weight)
+                        )
+                fallback_total_weight = sum(
+                    weight for _value, weight in fallback_values
+                ) or 1.0
+                Y_final = clamp(
+                    sum(value * weight for value, weight in fallback_values)
+                    / fallback_total_weight,
+                    0.0,
+                    BOTTOM_L,
+                )
+                mouse_height = solve_height_with_xyzv(
+                    P,
+                    X_final,
+                    Y_final,
+                    Z_base,
+                    v_center,
+                )
+                mouse_height = clamp(
+                    mouse_height,
+                    0.0,
+                    max(0.0, HEIGHT_EST - Z_base),
+                )
+                Z_total = clamp(Z_base + mouse_height, 0.0, HEIGHT_EST)
+                y_fusion_result = {
+                    "bboxSize": bbox_scale_y,
+                    "bottomGrid": fallback_bottom_y,
+                    "frontFloorContact": front_floor_contact,
+                    "groundYAnchorUsed": ground_y_anchor_used,
+                    "groundYAnchor": ground_y_anchor if ground_y_anchor_used else None,
+                    "groundYAnchorSource": ground_y_anchor_source,
+                    "groundYSupportY": support_ground_y,
+                    "groundYSupportPixelError": support_ground_pixel_error,
+                    "volumeCenterUnavailable": True,
+                    "bottomRejected": (
+                        Y_base if fallback_bottom_weight <= 0.0 else None
+                    ),
+                    "configuredWeights": {
+                        "bboxSize": size_weight,
+                        "volumeCenter": 0.0,
+                        "bottomGridNear": bottom_weight_near,
+                        "bottomGridFar": bottom_weight_far,
+                        "groundYAnchor": ground_y_anchor_weight,
+                    },
+                    "effectiveWeights": {
+                        "bboxSize": size_weight / fallback_total_weight,
+                        "volumeCenter": 0.0,
+                        "bottomGrid": fallback_bottom_weight
+                        / fallback_total_weight,
+                        "groundYAnchor": (
+                            ground_y_anchor_weight / fallback_total_weight
+                            if ground_y_anchor_used
+                            else 0.0
+                        ),
+                    },
+                    "bottomAcceptanceMm": bottom_acceptance_limit,
+                    "bboxScaleNearPx": bbox_scale_near_px,
+                    "bboxScaleMidPx": bbox_scale_mid_px,
+                    "bboxScaleFarPx": bbox_scale_far_px,
+                }
+                locator_method_fallback = "bbox_size_depth_fallback"
+            # Keep the height projection consistent with the final lateral
+            # coordinate.  In front-floor mode X may intentionally come from
+            # the ground-contact anchor instead of the volume centre.
+            projection_x = float(X_final)
+            height_projection_intercept = solve_height_with_xyzv(
+                P,
+                projection_x,
+                0.0,
+                Z_base,
+                v_center,
+            )
+            height_projection_at_one = solve_height_with_xyzv(
+                P,
+                projection_x,
+                1.0,
+                Z_base,
+                v_center,
+            )
+            height_projection_slope = (
+                height_projection_at_one - height_projection_intercept
+            )
             new_box = dict(box)
             new_box.update(
                 {
@@ -2174,6 +2778,46 @@ class AnimalBoxCalibrationApp:
                     "mappedBBoxHeight": mapped_bbox_height,
                     "mappedBBoxArea": mapped_bbox_area,
                     "bboxScaleY": bbox_scale_y,
+                    "bboxScaleNearPx": bbox_scale_near_px,
+                    "bboxScaleMidPx": bbox_scale_mid_px,
+                    "bboxScaleFarPx": bbox_scale_far_px,
+                    "groundGridX": float(legacy3d.get("X", X_base)),
+                    "groundGridY": float(legacy3d.get("Y", Y_base)),
+                    "groundGridRawX": float(raw_ground_x),
+                    "groundGridRawY": float(raw_ground_y),
+                    "groundFootprintRawLeftX": (
+                        float(raw_ground_left["x"]) if raw_ground_left else None
+                    ),
+                    "groundFootprintRawRightX": (
+                        float(raw_ground_right["x"]) if raw_ground_right else None
+                    ),
+                    "volumeCenterX": float(center3d.get("X", X_final)) if center3d else None,
+                    "volumeCenterY": (
+                        float(center3d.get("rawVolumeY", center3d.get("Y", Y_final)))
+                        if center3d
+                        else None
+                    ),
+                    "volumeCenterZ": float(center3d.get("Z", Z_total)) if center3d else None,
+                    "groundCenterX": (
+                        float(ground_center3d.get("X")) if ground_center3d else None
+                    ),
+                    "groundCenterY": (
+                        float(ground_center3d.get("Y")) if ground_center3d else None
+                    ),
+                    "groundCenterZ": center_height_layer if ground_center3d else None,
+                    "groundCenterMatchError": (
+                        float(ground_center3d.get("pixelError", 0.0))
+                        if ground_center3d
+                        else None
+                    ),
+                    "heightProjectionIntercept": height_projection_intercept,
+                    "heightProjectionSlope": height_projection_slope,
+                    "projectedHeight": clamp(
+                        height_projection_intercept + height_projection_slope * Y_final,
+                        0.0,
+                        HEIGHT_EST,
+                    ),
+                    "yFusion": y_fusion_result,
                     "bboxBottomX": u_bottom,
                     "bboxBottomY": v_bottom,
                     "sourceImage": source_image,
@@ -2192,7 +2836,25 @@ class AnimalBoxCalibrationApp:
                     "support3D": support3d,
                     "legacy3D": legacy3d,
                     "frontBackSource": front_back_source,
-                    "locatorMethod": str(center3d.get("method")) if center3d else "ground_dlt",
+                    "frontXGroundAnchorUsed": front_x_ground_anchor_used,
+                    "frontXBoundaryCorrected": front_x_boundary_corrected,
+                    "frontXRawBeforeClamp": front_x_raw_before_clamp,
+                    "frontXSource": (
+                        "ground_center_boundary_correction"
+                        if front_x_boundary_corrected
+                        else ("bbox_bottom_ground" if front_x_ground_anchor_used else "volume_center")
+                    ),
+                    "groundYAnchorUsed": ground_y_anchor_used,
+                    "groundYAnchor": ground_y_anchor if ground_y_anchor_used else None,
+                    "groundYAnchorSource": ground_y_anchor_source,
+                    "groundYSupportY": support_ground_y,
+                    "groundYSupportPixelError": support_ground_pixel_error,
+                    "frontFloorContact": front_floor_contact,
+                    "locatorMethod": (
+                        str(center3d.get("method"))
+                        if center3d
+                        else locator_method_fallback
+                    ),
                     "centerMatchError": float(center3d.get("pixelError", 0.0)) if center3d else None,
                     "registrationMeanError": self.registration.get("meanError") if registration_applied else None,
                     "registrationMaxError": self.registration.get("maxError") if registration_applied else None,

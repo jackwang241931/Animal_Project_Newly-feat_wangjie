@@ -26,12 +26,20 @@ from Module.mouse_trajectory.paths import (
     DEFAULT_MOUSE_MODEL_PATH,
     DEFAULT_REFERENCE_IMAGE_PATH,
     EXPORT_DIR,
+    PROJECT_ROOT,
     create_experiment_export_dir,
     get_cage_annotated_history_dir,
     get_cage_annotated_latest_dir,
     get_cage_data_dir,
     get_cage_export_dir,
     get_cage_plots_dir,
+)
+from Module.mouse_trajectory.trajectory_tuning import (
+    DEFAULT_TRAJECTORY_TUNING,
+    TrajectoryTemporalStabilizer,
+    load_trajectory_tuning,
+    normalize_trajectory_tuning,
+    save_trajectory_tuning,
 )
 from Module.mouse_trajectory.service.auto_mouse_trajectory import (
     CAL,
@@ -54,14 +62,8 @@ from Module.mouse_trajectory.service.auto_mouse_trajectory import (
     save_csv,
     save_plots,
     solve_mouse_location,
-    stabilize_trajectory_rows,
-)
-from Module.mouse_trajectory.trajectory_tuning import (
-    TrajectoryStabilizer,
-    trajectory_tuning_store,
 )
 from public.config_class.global_setting import global_setting
-from public.util.project_paths import resolve_project_path
 from public.entity.MyQThread import MyQThread
 
 
@@ -105,9 +107,8 @@ class MouseTrajectoryThread(MyQThread):
         self.last_claimed_frame_versions: dict[int, tuple[int, int]] = {}
         self.last_processed_frame_versions: dict[int, tuple[int, int]] = {}
         self.fixed_corners_by_cage: dict[int, BoxCorners] = {}
-        # Normalized manual cage-frame points saved by P5.  They are applied
-        # before YOLO cage-frame detection and therefore become the source of
-        # the image-to-cage homography for the selected channel.
+        # Normalized manual cage-frame points saved by the calibration UI.
+        # They must take precedence over automatic cage-frame detection.
         self.manual_cage_calibrations: dict[int, dict[str, Any]] = {}
         self.previous_corners_by_cage: dict[int, list[dict[str, Any]]] = {}
         self.window_rows_by_cage: dict[int, list[dict[str, Any]]] = {}
@@ -120,9 +121,6 @@ class MouseTrajectoryThread(MyQThread):
         self.shift_logs: dict[int, list[dict[str, Any]]] = {}
         self.latest_plot_paths: dict[int, dict[str, str]] = {}
         self.latest_plot_title_by_cage: dict[int, str] = {}
-        self.trajectory_stabilizers_by_cage: dict[int, TrajectoryStabilizer] = {}
-        self.selected_preview_cage_number: int | None = None
-        self.last_preview_plot_timestamp_by_cage: dict[int, float] = {}
         self.plot_state_lock = threading.RLock()
         self.plot_revision_by_cage: dict[int, int] = {}
         self.last_output_flush_by_cage: dict[int, float] = {}
@@ -161,6 +159,24 @@ class MouseTrajectoryThread(MyQThread):
         self.latest_annotated_path_by_cage: dict[int, Path] = {}
         self.annotated_history_retention_seconds = 300.0
         self.annotated_history_cleanup_interval_seconds = 60.0
+        self.tuning_lock = threading.RLock()
+        self.tuning_config_path = PROJECT_ROOT / "config" / "mouse_trajectory_tuning.json"
+        self.runtime_tuning = normalize_trajectory_tuning(DEFAULT_TRAJECTORY_TUNING)
+        self.pending_runtime_tuning_overrides: dict[str, Any] = {}
+        self.tuning_revision = 0
+        self.tuning_history: list[dict[str, Any]] = [
+            {
+                "revision": 0,
+                "timestamp": time.time(),
+                "settings": dict(self.runtime_tuning),
+            }
+        ]
+        self.temporal_stabilizers_by_cage: dict[int, TrajectoryTemporalStabilizer] = {}
+        self.last_live_plot_schedule_by_cage: dict[int, float] = {}
+        self.live_preview_cage_number: int | None = None
+        self.live_plot_interval_seconds = float(
+            self.runtime_tuning["live_plot_interval_seconds"]
+        )
 
         self.reference_image_path = DEFAULT_REFERENCE_IMAGE_PATH
         self.grid_json_path = DEFAULT_GRID_JSON_PATH
@@ -170,14 +186,13 @@ class MouseTrajectoryThread(MyQThread):
         self.mouse_model_path = DEFAULT_MOUSE_MODEL_PATH
 
         self.conf_box = 0.4
-        self.conf_mouse = 0.4
+        self.conf_mouse = float(self.runtime_tuning["mouse_confidence"])
         self.imgsz = 640
         self.batch_size = 8
         self.shift_threshold_px = 10.0
         self.output_flush_interval_seconds = 10.0
         self.max_unflushed_rows_per_cage = 5000
         self.plot_window_seconds = 60.0
-        self.preview_plot_refresh_seconds = 3.0
         self.total_plot_sample_interval_seconds = 0.5
         self.max_total_plot_points_per_cage = 20000
         self.max_pending_frames_per_cage = 1
@@ -232,11 +247,193 @@ class MouseTrajectoryThread(MyQThread):
         self.mouse_model: YOLO | None = None
         self.ref_corners: BoxCorners | None = None
         self.last_cleanup_time = time.time()
-        self.trajectory_tuning = trajectory_tuning_store.snapshot()
 
     @staticmethod
     def _build_model(model_path: Path | str, task: str) -> YOLO:
         return YOLO(str(model_path), task=task)
+
+    def _apply_tuning_to_solver(self) -> None:
+        solver = self.solver
+        if solver is None:
+            return
+        with self.tuning_lock:
+            tuning = dict(self.runtime_tuning)
+        solver.y_size_fusion_weight = float(tuning["bbox_size_weight"])
+        solver.y_center_fusion_weight = float(tuning["volume_center_weight"])
+        solver.y_bottom_fusion_weight = float(tuning["bottom_grid_weight"])
+        solver.y_bottom_fusion_far_weight = float(tuning["bottom_grid_far_weight"])
+        solver.y_center_disagreement_max_delta = float(
+            tuning["center_disagreement_mm"]
+        )
+        solver.y_bottom_acceptance_max_delta = float(tuning["bottom_acceptance_mm"])
+        solver.bbox_scale_near_px = float(tuning["bbox_scale_near_px"])
+        solver.bbox_scale_mid_px = float(tuning["bbox_scale_mid_px"])
+        solver.bbox_scale_far_px = float(tuning["bbox_scale_far_px"])
+        solver.nominal_ground_center_height_mm = float(
+            tuning["nominal_ground_center_height_mm"]
+        )
+        solver.ground_center_acceptance_px = float(tuning["ground_center_acceptance_px"])
+        solver.ground_y_anchor_weight = float(tuning["ground_y_anchor_weight"])
+        solver.ground_y_anchor_max_volume_z_mm = float(
+            tuning["ground_y_anchor_max_volume_z_mm"]
+        )
+        solver.ground_y_support_max_pixel_error_px = float(
+            tuning["ground_y_support_max_pixel_error_px"]
+        )
+        solver.ground_contact_margin_mm = float(tuning["ground_contact_margin_mm"])
+        solver.front_contact_threshold_mm = float(tuning["front_contact_threshold_mm"])
+        solver.front_x_anchor_threshold_mm = float(tuning["front_x_anchor_threshold_mm"])
+        solver.front_x_boundary_overrun_mm = float(tuning["front_x_boundary_overrun_mm"])
+
+    def get_runtime_tuning(self) -> dict[str, Any]:
+        with self.tuning_lock:
+            return dict(self.runtime_tuning)
+
+    def get_tuning_history(self) -> list[dict[str, Any]]:
+        with self.tuning_lock:
+            return [
+                {
+                    "revision": int(item.get("revision", 0)),
+                    "timestamp": float(item.get("timestamp", 0.0)),
+                    "settings": dict(item.get("settings") or {}),
+                }
+                for item in self.tuning_history
+            ]
+
+    def set_live_preview_cage(self, cage_number: int | None) -> None:
+        with self.tuning_lock:
+            self.live_preview_cage_number = (
+                int(cage_number) if cage_number is not None else None
+            )
+
+    # Backward-compatible names used by the existing monitor-camera page.
+    def set_preview_cage_number(self, cage_number: int | None) -> None:
+        self.set_live_preview_cage(cage_number)
+
+    def apply_trajectory_tuning(self, values: dict[str, Any]) -> dict[str, Any]:
+        return self.update_runtime_tuning(values)
+    def update_runtime_tuning(
+        self,
+        values: dict[str, Any],
+        *,
+        reset_temporal: bool = True,
+    ) -> dict[str, Any]:
+        with self.tuning_lock:
+            previous = dict(self.runtime_tuning)
+            merged = dict(self.runtime_tuning)
+            merged.update(dict(values or {}))
+            normalized = normalize_trajectory_tuning(merged)
+            changed = normalized != previous
+            self.runtime_tuning = normalized
+            self.pending_runtime_tuning_overrides.update(dict(values or {}))
+            self.conf_mouse = float(normalized["mouse_confidence"])
+            self.live_plot_interval_seconds = float(
+                normalized["live_plot_interval_seconds"]
+            )
+            if changed:
+                self.tuning_revision += 1
+                self.tuning_history.append(
+                    {
+                        "revision": self.tuning_revision,
+                        "timestamp": time.time(),
+                        "settings": dict(normalized),
+                    }
+                )
+        self._apply_tuning_to_solver()
+        if changed and reset_temporal:
+            for stabilizer in self.temporal_stabilizers_by_cage.values():
+                stabilizer.reset()
+        logger.info(
+            "mouse trajectory runtime tuning applied: "
+            f"mouse_conf={normalized['mouse_confidence']:.2f}, "
+            f"weights={normalized['bbox_size_weight']:.3f}/"
+            f"{normalized['volume_center_weight']:.3f}/"
+            f"{normalized['bottom_grid_weight']:.3f}, "
+            f"temporal={normalized['temporal_enabled']}"
+        )
+        return dict(normalized)
+
+    def save_runtime_tuning(self, values: dict[str, Any] | None = None) -> dict[str, Any]:
+        if values is not None:
+            normalized = self.update_runtime_tuning(values)
+        else:
+            normalized = self.get_runtime_tuning()
+        saved = save_trajectory_tuning(self.tuning_config_path, normalized)
+        logger.info(f"mouse trajectory tuning saved: {self.tuning_config_path}")
+        return saved
+
+    def restore_recommended_tuning(self) -> dict[str, Any]:
+        return self.update_runtime_tuning(dict(DEFAULT_TRAJECTORY_TUNING))
+
+    def _stabilize_trajectory_row(self, cage_number: int, row: dict[str, Any]) -> None:
+        with self.tuning_lock:
+            tuning = dict(self.runtime_tuning)
+        stabilizer = self.temporal_stabilizers_by_cage.setdefault(
+            int(cage_number),
+            TrajectoryTemporalStabilizer(),
+        )
+        stabilizer.apply(row, tuning)
+
+    def _build_trajectory_diagnostics(
+        self,
+        row: dict[str, Any],
+        mouse_box: DetectionBox | None,
+    ) -> dict[str, Any]:
+        with self.tuning_lock:
+            tuning = dict(self.runtime_tuning)
+        return {
+            "rawX": row.get("rawX", row.get("X")),
+            "rawY": row.get("rawY", row.get("Y")),
+            "rawZ": row.get("rawZ", row.get("Z")),
+            "filteredX": row.get("X"),
+            "filteredY": row.get("Y"),
+            "filteredZ": row.get("Z"),
+            "bboxSizeY": row.get("runSizeDepthY"),
+            "groundCenterY": row.get("groundCenterY"),
+            "volumeCenterY": row.get("volumeCenterY"),
+            "volumeCenterZ": row.get("volumeCenterZ"),
+            "projectedHeight": row.get("projectedHeightAtMeasurement", row.get("projectedHeight")),
+            "bottomGridX": row.get("bottomGridX"),
+            "bottomGridY": row.get("bottomGridY"),
+            "bottomGridRawX": row.get("bottomGridRawX"),
+            "bottomGridRawY": row.get("bottomGridRawY"),
+            "effectiveWeights": {
+                "bboxSize": row.get("dynamicBBoxWeight", row.get("fusionBBoxWeight")),
+                "volumeCenter": row.get("dynamicCenterWeight", row.get("fusionCenterWeight")),
+                "bottomGrid": row.get("fusionBottomWeight"),
+                "dynamicBottomGrid": row.get("dynamicBottomWeight"),
+                "frontContact": row.get("dynamicFrontContactWeight"),
+                "temporalPrior": row.get("dynamicPriorWeight"),
+            },
+            "mouseConfidence": float(mouse_box.conf) if mouse_box else None,
+            "bboxWidth": row.get("mouseBoxWidth"),
+            "bboxHeight": row.get("mouseBoxHeight"),
+            "bboxArea": row.get("mouseBoxArea"),
+            "medianX": row.get("medianX"),
+            "medianY": row.get("medianY"),
+            "medianZ": row.get("medianZ"),
+            "filterAlpha": row.get("trajectoryFilterAlpha"),
+            "heightAlpha": row.get("trajectoryHeightAlpha"),
+            "jumpRejected": row.get("trajectoryJumpRejected", False),
+            "poseChangeDetected": row.get("poseChangeDetected", False),
+            "climbingMode": row.get("climbingMode", False),
+            "groundedMode": row.get("groundedMode", False),
+            "groundContactValid": row.get("groundContactValid", False),
+            "groundContactXWeight": row.get("groundContactXWeight"),
+            "frontContactDetected": row.get("frontContactDetected", False),
+            "frontYScaleFactor": row.get("frontYScaleFactor", 1.0),
+            "frontXStretchFactor": row.get("frontXStretchFactor", 1.0),
+            "bboxCenterMotionPx": row.get("bboxCenterMotionPx"),
+            "bboxLogGeometryChange": row.get("bboxLogGeometryChange"),
+            "bboxLogAspectChange": row.get("bboxLogAspectChange"),
+            "measurementX": row.get("measurementX"),
+            "measurementY": row.get("measurementY"),
+            "measurementZ": row.get("measurementZ"),
+            "dynamicFrontContactWeight": row.get("dynamicFrontContactWeight"),
+            "planarSpeed": row.get("trajectoryPlanarSpeed"),
+            "tuningRevision": row.get("tuningRevision"),
+            "tuning": tuning,
+        }
 
     def _record_stage_timing(
         self,
@@ -309,6 +506,7 @@ class MouseTrajectoryThread(MyQThread):
 
     def before_Runing_work(self):
         self._load_runtime_config()
+        self._load_manual_cage_calibrations()
         self._start_new_export_root()
         self._prepare_runtime()
 
@@ -353,7 +551,11 @@ class MouseTrajectoryThread(MyQThread):
         return None
 
     @staticmethod
-    def _points_to_box_corners(points: Any, frame_size: tuple[int, int], source: str) -> BoxCorners | None:
+    def _points_to_box_corners(
+        points: Any,
+        frame_size: tuple[int, int],
+        source: str,
+    ) -> BoxCorners | None:
         width, height = frame_size
         if not isinstance(points, (list, tuple)) or len(points) != 4:
             return None
@@ -361,31 +563,43 @@ class MouseTrajectoryThread(MyQThread):
         try:
             for point in points:
                 x, y = point
-                x = float(x)
-                y = float(y)
-                corners.append({"x": x * width, "y": y * height})
+                corners.append(
+                    {
+                        "x": float(x) * width,
+                        "y": float(y) * height,
+                    }
+                )
         except (TypeError, ValueError):
             return None
         try:
-            corners = order_corners([[point["x"], point["y"]] for point in corners])
+            ordered = order_corners(
+                [[point["x"], point["y"]] for point in corners]
+            )
         except (TypeError, ValueError):
             return None
-        return BoxCorners(corners, 1.0, source)
+        return BoxCorners(ordered, 1.0, source)
 
     def _load_manual_cage_calibrations(self) -> None:
         setting = global_setting.get_setting("experiment_setting", None)
-        data = getattr(setting, "channel_data_config", {}) if setting is not None else {}
+        data = (
+            getattr(setting, "channel_data_config", {})
+            if setting is not None
+            else {}
+        )
         if not isinstance(data, dict):
-            data = dict(data) if isinstance(data, dict) else {}
+            data = {}
+
         persisted = global_setting.get_setting("cage_frame_calibrations", {})
         if isinstance(persisted, dict):
             for channel, value in persisted.items():
                 key = str(channel)
-                if key not in data and channel in data:
-                    data[key] = data[channel]
                 data.setdefault(key, {})
-                if isinstance(data[key], dict) and "cage_frame_calibration" not in data[key]:
+                if (
+                    isinstance(data[key], dict)
+                    and "cage_frame_calibration" not in data[key]
+                ):
                     data[key]["cage_frame_calibration"] = value
+
         self.manual_cage_calibrations.clear()
         for channel, channel_data in data.items():
             if not isinstance(channel_data, dict):
@@ -393,22 +607,27 @@ class MouseTrajectoryThread(MyQThread):
             calibration = channel_data.get("cage_frame_calibration")
             if not isinstance(calibration, dict):
                 continue
-            points = calibration.get("points_normalized", calibration.get("points"))
+            points = calibration.get(
+                "points_normalized",
+                calibration.get("points"),
+            )
             try:
-                parsed = [[float(point[0]), float(point[1])] for point in points]
+                parsed = [
+                    [float(point[0]), float(point[1])] for point in points
+                ]
+                if len(parsed) != 4:
+                    continue
+                ordered = order_corners(parsed)
+                self.manual_cage_calibrations[int(channel)] = {
+                    "points_normalized": [
+                        [point["x"], point["y"]] for point in ordered
+                    ],
+                    "source": str(
+                        calibration.get("source", "manual_visible_light")
+                    ),
+                }
             except (TypeError, ValueError, IndexError):
                 continue
-            if len(parsed) == 4:
-                try:
-                    ordered = order_corners(parsed)
-                    self.manual_cage_calibrations[int(channel)] = {
-                        "points_normalized": [
-                            [point["x"], point["y"]] for point in ordered
-                        ],
-                        "source": str(calibration.get("source", "manual_visible_light")),
-                    }
-                except (TypeError, ValueError):
-                    continue
 
     def set_manual_cage_corners(
         self,
@@ -418,12 +637,7 @@ class MouseTrajectoryThread(MyQThread):
         *,
         source: str = "manual_visible_light",
     ) -> bool:
-        """Apply four user-selected visible-light corners immediately.
-
-        The normalized form is retained for future frames; the current pixel
-        coordinates are installed in ``fixed_corners_by_cage`` so frames
-        already queued do not fall back to YOLO detection.
-        """
+        """Apply four user-selected visible-light corners immediately."""
         try:
             cage_number = int(cage_number)
             width, height = int(frame_size[0]), int(frame_size[1])
@@ -436,7 +650,11 @@ class MouseTrajectoryThread(MyQThread):
             ]
         except (TypeError, ValueError, IndexError):
             return False
-        calibration = {"points_normalized": normalized, "source": str(source)}
+
+        calibration = {
+            "points_normalized": normalized,
+            "source": str(source),
+        }
         with self.pending_lock:
             self.manual_cage_calibrations[cage_number] = calibration
             corners = BoxCorners(
@@ -445,12 +663,25 @@ class MouseTrajectoryThread(MyQThread):
                 str(source),
             )
             self.fixed_corners_by_cage[cage_number] = corners
-            self.previous_corners_by_cage[cage_number] = [dict(point) for point in corners.corners]
-        self._save_fixed_corners_json(cage_number, Path("manual_visible_light.jpg"), corners)
-        logger.info(f"manual cage frame calibration applied: cage={cage_number}, source={source}")
+            self.previous_corners_by_cage[cage_number] = [
+                dict(point) for point in corners.corners
+            ]
+        self._save_fixed_corners_json(
+            cage_number,
+            Path("manual_visible_light.jpg"),
+            corners,
+        )
+        logger.info(
+            f"manual cage frame calibration applied: cage={cage_number}, "
+            f"source={source}"
+        )
         return True
 
-    def _manual_corners_for_frame(self, cage_number: int, source_frame: Any) -> BoxCorners | None:
+    def _manual_corners_for_frame(
+        self,
+        cage_number: int,
+        source_frame: Any,
+    ) -> BoxCorners | None:
         calibration = self.manual_cage_calibrations.get(int(cage_number))
         if not calibration:
             return None
@@ -828,7 +1059,6 @@ class MouseTrajectoryThread(MyQThread):
             trajectory_config = {}
             if camera_config and "MOUSE_TRAJECTORY" in camera_config:
                 trajectory_config = camera_config["MOUSE_TRAJECTORY"]
-            trajectory_tuning_store.apply_ini_defaults(dict(trajectory_config))
             self.imgsz = int(float(trajectory_config.get("yolo_imgsz", self.imgsz) or self.imgsz))
             self.batch_size = max(
                 int(float(trajectory_config.get("yolo_batch_size", self.batch_size) or self.batch_size)),
@@ -1058,21 +1288,30 @@ class MouseTrajectoryThread(MyQThread):
                 ),
                 0.0,
             )
-            self.apply_trajectory_tuning()
+
+            tuning_values = dict(self.runtime_tuning)
+            for tuning_key in DEFAULT_TRAJECTORY_TUNING:
+                if tuning_key in trajectory_config:
+                    tuning_values[tuning_key] = trajectory_config.get(tuning_key)
+            if self.tuning_config_path.exists():
+                tuning_values.update(load_trajectory_tuning(self.tuning_config_path))
+            with self.tuning_lock:
+                tuning_values.update(self.pending_runtime_tuning_overrides)
+                self.runtime_tuning = normalize_trajectory_tuning(tuning_values)
+                self.conf_mouse = float(self.runtime_tuning["mouse_confidence"])
+                self.live_plot_interval_seconds = float(
+                    self.runtime_tuning["live_plot_interval_seconds"]
+                )
+                self.tuning_revision = 0
+                self.tuning_history = [
+                    {
+                        "revision": 0,
+                        "timestamp": time.time(),
+                        "settings": dict(self.runtime_tuning),
+                    }
+                ]
         except Exception as error:
             logger.warning(f"load mouse trajectory runtime config failed, use defaults: {error}")
-
-    def apply_trajectory_tuning(self, settings: dict[str, Any] | None = None) -> dict[str, Any]:
-        self.trajectory_tuning = dict(settings or trajectory_tuning_store.snapshot())
-        self.conf_mouse = float(self.trajectory_tuning.get("detection_confidence", self.conf_mouse))
-        self.preview_plot_refresh_seconds = max(
-            float(self.trajectory_tuning.get("plot_refresh_seconds", 3.0) or 3.0),
-            0.5,
-        )
-        return dict(self.trajectory_tuning)
-
-    def set_preview_cage_number(self, cage_number: int | None) -> None:
-        self.selected_preview_cage_number = int(cage_number) if cage_number else None
 
     def _pop_pending_frame(self) -> tuple[int, dict[str, Any]] | None:
         frame_items = self._pop_pending_frames(1)
@@ -1274,6 +1513,7 @@ class MouseTrajectoryThread(MyQThread):
 
         grid_data, image_meta = parse_grid_json(Path(self.grid_json_path))
         self.solver = HeadlessCalibration(grid_data, image_meta)
+        self._apply_tuning_to_solver()
         self.static_registration = parse_image_registration_json(self.registration_json_path)
 
         instrument_outer_img, self.instrument_polygon_img = parse_topdown_instrument_polygons(self.instrument_area_json_path)
@@ -1368,7 +1608,7 @@ class MouseTrajectoryThread(MyQThread):
             fold_path = str(storage_config.get("fold_path", "./data/") or "./data/")
             base_dir = Path(fold_path)
             if not base_dir.is_absolute():
-                base_dir = resolve_project_path(base_dir)
+                base_dir = Path.cwd() / base_dir
 
             deep_path = str(deep_config.get("path", "deep_camera/") or "deep_camera/").strip("/\\")
             cage_prefix = str(deep_config.get("mouse_cage_prefix", "mouse_cage_") or "mouse_cage_")
@@ -1722,38 +1962,41 @@ class MouseTrajectoryThread(MyQThread):
 
             prepare_start = time.perf_counter()
             try:
-                manual_corners = self._manual_corners_for_frame(cage_number, source_frame)
+                manual_corners = self._manual_corners_for_frame(
+                    cage_number,
+                    source_frame,
+                )
                 if manual_corners is not None:
                     corners = manual_corners
                     self.fixed_corners_by_cage[cage_number] = manual_corners
-                    self.previous_corners_by_cage[cage_number] = [dict(point) for point in manual_corners.corners]
+                    self.previous_corners_by_cage[cage_number] = [
+                        dict(point) for point in manual_corners.corners
+                    ]
+                    item["corner_shift"] = 0.0
                 else:
                     corners = self.fixed_corners_by_cage.get(cage_number)
-                if corners is None:
-                    corner_load_start = time.perf_counter()
-                    corners = self._load_fixed_corners_json(cage_number)
-                    self._record_stage_timing(
-                        "box_corner_json_load",
-                        (time.perf_counter() - corner_load_start) * 1000.0,
-                    )
-                if corners is None:
-                    corner_detect_start = time.perf_counter()
-                    corners = self._detect_and_cache_fixed_corners(
-                        cage_number=cage_number,
-                        image_file=image_file,
-                        frame_index=frame_index,
-                        shift_log=shift_log,
-                        source_frame=source_frame,
-                    )
-                    self._record_stage_timing(
-                        "box_corner_detect",
-                        (time.perf_counter() - corner_detect_start) * 1000.0,
-                    )
+                    if corners is None:
+                        corner_load_start = time.perf_counter()
+                        corners = self._load_fixed_corners_json(cage_number)
+                        self._record_stage_timing(
+                            "box_corner_json_load",
+                            (time.perf_counter() - corner_load_start) * 1000.0,
+                        )
+                    if corners is None:
+                        corner_detect_start = time.perf_counter()
+                        corners = self._detect_and_cache_fixed_corners(
+                            cage_number=cage_number,
+                            image_file=image_file,
+                            frame_index=frame_index,
+                            shift_log=shift_log,
+                            source_frame=source_frame,
+                        )
+                        self._record_stage_timing(
+                            "box_corner_detect",
+                            (time.perf_counter() - corner_detect_start) * 1000.0,
+                        )
                     if corners is None:
                         item["status"] = "no_box_corners"
-                else:
-                    item["corner_shift"] = 0.0
-
                 item["corners"] = corners
                 h_test_to_ref = None
                 registration_source = ""
@@ -2133,14 +2376,13 @@ class MouseTrajectoryThread(MyQThread):
                             "source": item.get("registration_source", ""),
                         }
                         xyz_start = time.perf_counter()
-                        tuning_snapshot = trajectory_tuning_store.snapshot()
-                        self.apply_trajectory_tuning(tuning_snapshot)
-                        solved = solve_mouse_location(
-                            self.solver,
-                            mouse_box,
-                            image_file.name,
-                            trajectory_tuning=tuning_snapshot,
-                        )
+                        with self.tuning_lock:
+                            self._apply_tuning_to_solver()
+                            solved = solve_mouse_location(
+                                self.solver,
+                                mouse_box,
+                                image_file.name,
+                            )
                         self._record_stage_timing(
                             "xyz_solve",
                             (time.perf_counter() - xyz_start) * 1000.0,
@@ -2241,6 +2483,8 @@ class MouseTrajectoryThread(MyQThread):
         row["effectiveProcessingFps"] = (
             self.processing_fps_ema if self.processing_fps_ema > 0 else None
         )
+        with self.tuning_lock:
+            row["tuningRevision"] = int(self.tuning_revision)
         row["droppedFramesForCage"] = self.dropped_frame_count_by_cage.get(cage_number, 0)
         row["busySkipCount"] = self.busy_skip_count_by_cage.get(cage_number, 0)
         row["sourceFrameDropCount"] = self.source_frame_drop_count_by_cage.get(cage_number, 0)
@@ -2271,35 +2515,7 @@ class MouseTrajectoryThread(MyQThread):
         self.processing_started_at_by_cage.setdefault(cage_number, time.time())
         self.processed_frame_count_by_cage[cage_number] = processed_count_for_cage
         stabilize_start = time.perf_counter()
-        tuning_snapshot = dict(self.trajectory_tuning)
-        cage_stabilizer = self.trajectory_stabilizers_by_cage.setdefault(
-            cage_number,
-            TrajectoryStabilizer(),
-        )
-        stabilize_trajectory_rows(
-            [row],
-            stabilizer=cage_stabilizer,
-            settings=tuning_snapshot,
-        )
-        if solved is not None and row.get("status") == "ok":
-            solved.update(
-                {
-                    "rawX": row.get("rawX"),
-                    "rawY": row.get("rawY"),
-                    "rawZ": row.get("rawZ"),
-                    "medianX": row.get("medianX"),
-                    "medianY": row.get("medianY"),
-                    "medianZ": row.get("medianZ"),
-                    "stableX": row.get("stableX"),
-                    "stableY": row.get("stableY"),
-                    "stableZ": row.get("stableZ"),
-                    "planarSpeedMmS": row.get("planarSpeedMmS"),
-                    "heightSpeedMmS": row.get("heightSpeedMmS"),
-                    "motionState": row.get("motionState"),
-                    "jumpRejected": row.get("jumpRejected"),
-                    "parameterVersion": row.get("parameterVersion"),
-                }
-            )
+        self._stabilize_trajectory_row(cage_number, row)
         self._record_stage_timing(
             "trajectory_stabilize",
             (time.perf_counter() - stabilize_start) * 1000.0,
@@ -2350,6 +2566,7 @@ class MouseTrajectoryThread(MyQThread):
             cage_number,
             self._build_processing_title(cage_number, window_start, window_end),
         )
+        trajectory_diagnostics = self._build_trajectory_diagnostics(row, mouse_box)
 
         self.trajectory_ready.emit(
             {
@@ -2375,34 +2592,7 @@ class MouseTrajectoryThread(MyQThread):
                 "mouse_box": _serialize_detection_box(mouse_box),
                 "corners": _serialize_corners(corners),
                 "solved": solved,
-                "trajectory_diagnostics": {
-                    key: row.get(key)
-                    for key in (
-                        "bboxSizeY",
-                        "volumeKnnY",
-                        "bottomGridY",
-                        "bboxEffectiveWeight",
-                        "volumeEffectiveWeight",
-                        "bottomEffectiveWeight",
-                        "rawX",
-                        "rawY",
-                        "rawZ",
-                        "medianX",
-                        "medianY",
-                        "medianZ",
-                        "stableX",
-                        "stableY",
-                        "stableZ",
-                        "mouseBoxWidth",
-                        "mouseBoxHeight",
-                        "mouseConf",
-                        "planarSpeedMmS",
-                        "heightSpeedMmS",
-                        "motionState",
-                        "jumpRejected",
-                        "parameterVersion",
-                    )
-                },
+                "trajectory_diagnostics": trajectory_diagnostics,
                 "mouse_annotated_path": str(mouse_annotated_path) if mouse_annotated_path else "",
                 "mouse_annotated_history_path": str(mouse_annotated_history_path) if mouse_annotated_history_path else "",
             }
@@ -2536,6 +2726,8 @@ class MouseTrajectoryThread(MyQThread):
             "instrumentAreaJson": str(self.instrument_area_json_path) if self.instrument_area_json_path else "",
             "imageRegistrationJson": str(self.registration_json_path) if self.registration_json_path else "",
             "imageRegistration": self.static_registration,
+            "trajectoryTuning": self.get_runtime_tuning(),
+            "trajectoryTuningHistory": self.get_tuning_history(),
             "frameCount": int(frame_count),
             "okCount": int(ok_count),
             "effectiveYoloFps": self.yolo_fps_ema,
@@ -2893,12 +3085,6 @@ class MouseTrajectoryThread(MyQThread):
             "rawX",
             "rawY",
             "rawZ",
-            "medianX",
-            "medianY",
-            "medianZ",
-            "stableX",
-            "stableY",
-            "stableZ",
         )
         return {field: row.get(field) for field in plot_fields}
 
@@ -3220,7 +3406,7 @@ class MouseTrajectoryThread(MyQThread):
         if completed_window is not None:
             window_index, rows_snapshot = completed_window
             submitted = self._submit_async_job(
-                ("window_plot", int(cage_number)),
+                ("window_plot", int(cage_number), int(window_index), "final"),
                 self.plot_executor,
                 self._save_window_plot,
                 cage_number,
@@ -3242,34 +3428,35 @@ class MouseTrajectoryThread(MyQThread):
                     f"cage={cage_number}, window={window_index}"
                 )
 
-        last_preview_timestamp = self.last_preview_plot_timestamp_by_cage.get(
-            cage_number,
-            float("-inf"),
-        )
-        should_refresh_preview = (
-            self.selected_preview_cage_number == int(cage_number)
-            and timestamp - last_preview_timestamp >= self.preview_plot_refresh_seconds
-        )
-        if should_refresh_preview:
-            active_window_index = self.active_window_index_by_cage.get(cage_number)
-            preview_rows = [
-                dict(plot_row)
-                for plot_row in self.window_rows_by_cage.get(cage_number, [])
-            ]
-            if active_window_index is not None and preview_rows:
-                submitted = self._submit_async_job(
-                    ("live_plot", int(cage_number)),
-                    self.plot_executor,
-                    self._save_window_plot,
-                    cage_number,
-                    image_file,
-                    preview_rows,
-                    [dict(event) for event in shift_log],
-                    active_window_index,
-                    mark_final=False,
-                )
-                if submitted:
-                    self.last_preview_plot_timestamp_by_cage[cage_number] = timestamp
+        live_plot_interval = max(float(self.live_plot_interval_seconds), 0.5)
+        last_live_plot = self.last_live_plot_schedule_by_cage.get(cage_number, 0.0)
+        current_window_index = self.active_window_index_by_cage.get(cage_number)
+        current_window_rows = self.window_rows_by_cage.get(cage_number, [])
+        if (
+            self.live_preview_cage_number == int(cage_number)
+            and current_window_index is not None
+            and len(current_window_rows) >= 2
+            and timestamp - last_live_plot >= live_plot_interval
+        ):
+            preview_rows = [dict(plot_row) for plot_row in current_window_rows]
+            preview_submitted = self._submit_async_job(
+                (
+                    "window_plot",
+                    int(cage_number),
+                    int(current_window_index),
+                    "preview",
+                ),
+                self.plot_executor,
+                self._save_window_plot,
+                cage_number,
+                image_file,
+                preview_rows,
+                [dict(event) for event in shift_log],
+                int(current_window_index),
+                mark_final=False,
+            )
+            if preview_submitted:
+                self.last_live_plot_schedule_by_cage[cage_number] = timestamp
 
         should_flush_data = (
             self.processed_frame_count_by_cage.get(cage_number, 0) <= 1
@@ -3493,20 +3680,7 @@ class MouseTrajectoryThread(MyQThread):
             schema_version = int(json_data.get("schemaVersion", 1) or 1)
             source = str(json_data.get("source", "fixed_box_json") or "fixed_box_json")
             # Legacy cache files were generated from mask->minAreaRect and should be re-detected.
-            # A previous workflow-page build injected its persisted manual
-            # overlay during service startup. That bypassed the legacy YOLO
-            # cage-frame calibration entirely. Only accept a manual cache
-            # when the operator explicitly calibrated this cage in the
-            # current service session; otherwise let the old automatic
-            # detector run and replace the stale cache.
-            if (
-                schema_version < 2
-                or source == "fixed_box_json"
-                or (
-                    source == "manual_visible_light"
-                    and int(cage_number) not in self.manual_cage_calibrations
-                )
-            ):
+            if schema_version < 2 or source == "fixed_box_json":
                 return None
             corners = BoxCorners(
                 [dict(point) for point in json_data.get("corners", [])],
@@ -3581,7 +3755,6 @@ class MouseTrajectoryThread(MyQThread):
             "trajectory_latest.json",
             "trajectory_latest.png",
             "xy_trajectory.png",
-            "xyz_trajectory.png",
         ]
         for file_name in legacy_file_names:
             file_path = export_dir / file_name
