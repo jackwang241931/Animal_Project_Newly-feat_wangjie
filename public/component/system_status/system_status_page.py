@@ -116,6 +116,14 @@ def _health_state(value: Any) -> str:
     return str(raw or "unknown").strip().lower()
 
 
+_IGNORED_ALERT_REASONS = frozenset({"stale_data", "stale_frame"})
+
+
+def _is_ignored_alert(item: Mapping[str, Any]) -> bool:
+    reason = str(item.get("reason_code") or "").strip().lower()
+    return reason in _IGNORED_ALERT_REASONS
+
+
 def derive_channel_status_issues(
     context: Mapping[str, Any],
     components: list[Mapping[str, Any]],
@@ -131,8 +139,13 @@ def derive_channel_status_issues(
         channel = f"CH{index:02d}"
         scoped = [
             item for item in [*components, *alerts]
-            if str(item.get("scope", "")).upper() == channel
-            or str(item.get("channel", item.get("channel_id", ""))).upper() == channel
+            if (
+                not _is_ignored_alert(item)
+                and (
+                    str(item.get("scope", "")).upper() == channel
+                    or str(item.get("channel", item.get("channel_id", ""))).upper() == channel
+                )
+            )
         ]
         states = [_health_state(item.get("status", item.get("state"))) for item in scoped]
         if any(state in {"warning", "fault"} for state in states):
@@ -301,8 +314,14 @@ class SystemStatusPage(QWidget):
     def refresh(self) -> None:
         context = self._as_mapping(self._read_provider(self._context_provider))
         health = self._as_mapping(self._read_provider(self._health_source))
-        components = self._normalise_items(health.get("components"))
-        alerts = self._normalise_items(health.get("alerts"))
+        components = [
+            item for item in self._normalise_items(health.get("components"))
+            if not _is_ignored_alert(item)
+        ]
+        alerts = [
+            item for item in self._normalise_items(health.get("alerts"))
+            if not _is_ignored_alert(item)
+        ]
 
         # A provider may omit an explicit alerts list.  Derive it only from
         # active structured health states; never inspect an unrelated log.
@@ -884,8 +903,13 @@ class SystemStatusPage(QWidget):
             data_label.show()
             scoped = [
                 item for item in [*components, *alerts]
-                if str(item.get("scope", "")).upper() == channel
-                or str(item.get("channel", item.get("channel_id", ""))).upper() == channel
+                if (
+                    not _is_ignored_alert(item)
+                    and (
+                        str(item.get("scope", "")).upper() == channel
+                        or str(item.get("channel", item.get("channel_id", ""))).upper() == channel
+                    )
+                )
             ]
             data_label.setText(self._render_channel_data(channel, context, scoped))
             issue_states = [
