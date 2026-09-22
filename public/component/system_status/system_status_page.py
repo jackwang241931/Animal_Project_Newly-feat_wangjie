@@ -430,8 +430,13 @@ class SystemStatusPage(QWidget):
             card, value, _detail = self._make_value_card(title)
             self._environment_values[key] = value
             environment_grid.addWidget(card, index // 3, index % 3)
-        # Environment values remain available to other pages/providers; the
-        # dedicated ENV block is not rendered on the compact P1 landing page.
+        # Keep the hidden environment cards owned by the page.  They are not
+        # rendered on P1, but providers and existing tests still use their
+        # labels as the real-time environment value sink.
+        environment_host = QWidget(canvas)
+        environment_host.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        environment_host.setLayout(environment_grid)
+        environment_host.hide()
 
         # P1-F: keep the eight cage/channel view visible on the landing page.
         # Channel health is derived only from structured snapshots/alerts; an
@@ -1136,8 +1141,16 @@ class SystemStatusPage(QWidget):
 
     @classmethod
     def _set_value(cls, label: Optional[QLabel], value: Any) -> None:
-        if label is not None:
+        if label is None:
+            return
+        try:
             label.setText(cls._safe_text(value))
+        except RuntimeError as exc:
+            # A queued refresh may overlap Qt teardown of a hidden/replaced
+            # widget. Ignore only the stale-wrapper case.
+            message = str(exc)
+            if "wrapped C/C++ object" not in message or "deleted" not in message:
+                raise
 
     @staticmethod
     def _safe_text(value: Any) -> str:
