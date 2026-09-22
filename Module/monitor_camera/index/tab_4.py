@@ -182,11 +182,13 @@ class ImageLoaderThread(MyQThread):
                 str(resolve_project_path(camera_config["STORAGE"]["fold_path"]) / str(camera_config["INFRARED_CAMERA"]["path"]).strip("/\\"))
             )
 
+            infrared_root = (
+                resolve_project_path(camera_config["STORAGE"]["fold_path"])
+                / str(camera_config["INFRARED_CAMERA"]["path"]).strip("/\\")
+            )
+            infrared_pic_dir = str(camera_config["INFRARED_CAMERA"]["pic_dir"]).strip("/\\")
             self.infrared_path = [
-                str(resolve_project_path(camera_config["STORAGE"]["fold_path"]))
-                + camera_config["INFRARED_CAMERA"]["path"]
-                + f"{folder_name}/"
-                + camera_config["INFRARED_CAMERA"]["pic_dir"]
+                str(infrared_root / folder_name / infrared_pic_dir)
                 for folder_name in infrared_folder_list
             ]
         self.images = {"deep_camera_frames": {}, "trajectory_frames": {}, "infrared_camera": []}
