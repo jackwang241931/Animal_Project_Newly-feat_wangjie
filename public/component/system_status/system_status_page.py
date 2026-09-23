@@ -116,7 +116,12 @@ def _health_state(value: Any) -> str:
     return str(raw or "unknown").strip().lower()
 
 
-_IGNORED_ALERT_REASONS = frozenset({"stale_data", "stale_frame"})
+_IGNORED_ALERT_REASONS = frozenset({
+    "data_stale",
+    "frame_stale",
+    "stale_data",
+    "stale_frame",
+})
 
 
 def _is_ignored_alert(item: Mapping[str, Any]) -> bool:
