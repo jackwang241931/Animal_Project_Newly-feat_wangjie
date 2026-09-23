@@ -171,6 +171,8 @@ def health_summary_text(
     channel_status_issues: Iterable[str] = (),
 ) -> str:
     """Return the single health summary wording shared by P1 and P3."""
+    components = [item for item in components if not _is_ignored_alert(item)]
+    alerts = [item for item in alerts if not _is_ignored_alert(item)]
     affected = sorted({
         str(item.get("scope", item.get("channel", ""))).upper()
         for item in alerts
@@ -178,9 +180,11 @@ def health_summary_text(
     })
     issue_channels = list(dict.fromkeys(str(item).upper() for item in channel_status_issues))
     if alerts or issue_channels:
-        issue_count = len(alerts) + len(issue_channels)
+        issue_count = len(alerts) + sum(
+            1 for channel in issue_channels if channel not in affected
+        )
         value = f"{issue_count}项异常"
-        affected_channels = affected or issue_channels
+        affected_channels = sorted(set(affected) | set(issue_channels))
         if affected_channels:
             value += " · " + ", ".join(affected_channels)
         return value
@@ -191,6 +195,14 @@ def health_summary_text(
         for item in components
         if bool(item.get("enabled", True))
     }
+    if "fault" in component_states:
+        return "故障"
+    if "warning" in component_states:
+        return "告警"
+    if "unavailable" in component_states:
+        return "部分不可用"
+    if component_states and component_states <= {"normal"}:
+        return "在线"
     if health_state == "normal" or (health_state == "unknown" and component_states and component_states <= {"normal"}):
         return "在线"
     if health_state == "unavailable":
