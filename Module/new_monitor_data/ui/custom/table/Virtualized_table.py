@@ -323,6 +323,17 @@ class VirtualizedFrozenTable(QWidget):
 
     def set_result(self, columns, titles, rows):
         headers_changed = list(titles or columns or []) != self.model._titles
+        scroll_bar = self.main_view.verticalScrollBar()
+        previous_scroll_value = scroll_bar.value()
+        top_row = self.main_view.rowAt(0)
+        anchor_identity = None
+        if 0 <= top_row < len(self.model._rows):
+            anchor_row = self.model._rows[top_row]
+            if anchor_row.get("id") is not None:
+                anchor_identity = ("id", anchor_row.get("id"))
+            elif anchor_row.get("time") is not None:
+                anchor_identity = ("time", anchor_row.get("time"))
+
         self.setUpdatesEnabled(False)
         try:
             self.model.set_result(columns, titles, rows)
@@ -333,6 +344,22 @@ class VirtualizedFrozenTable(QWidget):
             self.setUpdatesEnabled(True)
             self.update()
             self._schedule_frozen_geometry_update()
+            self._restore_view_position(anchor_identity, previous_scroll_value)
+
+    def _restore_view_position(self, anchor_identity, previous_scroll_value):
+        """Keep the row being inspected fixed while live data refreshes."""
+        if anchor_identity is not None:
+            key, value = anchor_identity
+            for row_index, row in enumerate(self.model._rows):
+                if row.get(key) == value:
+                    self.main_view.scrollTo(
+                        self.model.index(row_index, 0),
+                        QAbstractItemView.ScrollHint.PositionAtTop,
+                    )
+                    return
+
+        scroll_bar = self.main_view.verticalScrollBar()
+        scroll_bar.setValue(min(previous_scroll_value, scroll_bar.maximum()))
 
     def _configure_columns(self):
         titles = self.model._titles

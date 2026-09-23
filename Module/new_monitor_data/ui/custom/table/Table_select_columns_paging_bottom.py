@@ -422,6 +422,10 @@ class Table_select_columns_paging_bottom(ThemedWindow):
             result.get("columns_title", []),
             result.get("rows", []),
         )
+        # The query keeps the newest page first for efficient live monitoring,
+        # but rows within that page are shown chronologically. New samples are
+        # therefore appended at the bottom instead of pushing the view upward.
+        display_rows.reverse()
         self.all_columns = display_titles
         self.table.set_result(
             display_columns,
