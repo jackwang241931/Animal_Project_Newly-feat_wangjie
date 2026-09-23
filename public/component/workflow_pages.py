@@ -1282,6 +1282,10 @@ class DataViewPage(_BaseWorkflowPage):
         self.table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.table.cellClicked.connect(self._show_cell_detail)
         layout.addWidget(self.table, 1)
+        self._pending_table_restore = None
+        self._table_restore_timer = QTimer(self)
+        self._table_restore_timer.setSingleShot(True)
+        self._table_restore_timer.timeout.connect(self._apply_pending_table_restore)
 
     def _show_cell_detail(self, row: int, column: int) -> None:
         item = self.table.item(row, column)
@@ -1532,14 +1536,22 @@ class DataViewPage(_BaseWorkflowPage):
 
     def _capture_table_anchor(
         self,
-    ) -> tuple[Optional[tuple[str, ...]], int, int, int, bool]:
+    ) -> tuple[Optional[tuple[str, ...]], int, int, int, bool, bool]:
         vertical_scroll_bar = self.table.verticalScrollBar()
         horizontal_scroll_bar = self.table.horizontalScrollBar()
         vertical_value = vertical_scroll_bar.value()
         horizontal_value = horizontal_scroll_bar.value()
         was_at_top = vertical_value <= vertical_scroll_bar.minimum()
+        was_at_bottom = vertical_scroll_bar.maximum() - vertical_value <= 2
         if self.table.rowCount() <= 0:
-            return None, vertical_value, horizontal_value, 0, was_at_top
+            return (
+                None,
+                vertical_value,
+                horizontal_value,
+                0,
+                was_at_top,
+                was_at_bottom,
+            )
         top_row = self.table.rowAt(0)
         if top_row < 0:
             top_row = 0
@@ -1561,6 +1573,7 @@ class DataViewPage(_BaseWorkflowPage):
             horizontal_value,
             anchor_pixel_offset,
             was_at_top,
+            was_at_bottom,
         )
 
     def _restore_table_anchor(
@@ -1570,10 +1583,18 @@ class DataViewPage(_BaseWorkflowPage):
         previous_horizontal_scroll_value: int,
         anchor_pixel_offset: int,
         was_at_top: bool,
+        was_at_bottom: bool,
     ) -> None:
         vertical_scroll_bar = self.table.verticalScrollBar()
         if was_at_top:
             vertical_scroll_bar.setValue(vertical_scroll_bar.minimum())
+            horizontal_scroll_bar = self.table.horizontalScrollBar()
+            horizontal_scroll_bar.setValue(
+                min(previous_horizontal_scroll_value, horizontal_scroll_bar.maximum())
+            )
+            return
+        if was_at_bottom:
+            vertical_scroll_bar.setValue(vertical_scroll_bar.maximum())
             horizontal_scroll_bar = self.table.horizontalScrollBar()
             horizontal_scroll_bar.setValue(
                 min(previous_horizontal_scroll_value, horizontal_scroll_bar.maximum())
@@ -1595,15 +1616,22 @@ class DataViewPage(_BaseWorkflowPage):
                             item,
                             QAbstractItemView.ScrollHint.PositionAtTop,
                         )
-                        vertical_scroll_bar.setValue(
-                            max(
+                        for _attempt in range(2):
+                            current_offset = self.table.visualItemRect(item).top()
+                            correction = current_offset - anchor_pixel_offset
+                            if correction == 0:
+                                break
+                            current_value = vertical_scroll_bar.value()
+                            corrected_value = max(
                                 vertical_scroll_bar.minimum(),
                                 min(
-                                    vertical_scroll_bar.value() - anchor_pixel_offset,
+                                    current_value + correction,
                                     vertical_scroll_bar.maximum(),
                                 ),
                             )
-                        )
+                            if corrected_value == current_value:
+                                break
+                            vertical_scroll_bar.setValue(corrected_value)
                         anchor_restored = True
                     break
         if not anchor_restored:
@@ -1615,6 +1643,31 @@ class DataViewPage(_BaseWorkflowPage):
             min(previous_horizontal_scroll_value, horizontal_scroll_bar.maximum())
         )
 
+    def _queue_table_anchor_restore(
+        self,
+        signature: Optional[tuple[str, ...]],
+        previous_vertical_scroll_value: int,
+        previous_horizontal_scroll_value: int,
+        anchor_pixel_offset: int,
+        was_at_top: bool,
+        was_at_bottom: bool,
+    ) -> None:
+        self._pending_table_restore = (
+            signature,
+            previous_vertical_scroll_value,
+            previous_horizontal_scroll_value,
+            anchor_pixel_offset,
+            was_at_top,
+            was_at_bottom,
+        )
+        self._table_restore_timer.start(0)
+
+    def _apply_pending_table_restore(self) -> None:
+        pending = self._pending_table_restore
+        self._pending_table_restore = None
+        if pending is not None:
+            self._restore_table_anchor(*pending)
+
     def refresh(self) -> None:
         (
             anchor_signature,
@@ -1622,6 +1675,7 @@ class DataViewPage(_BaseWorkflowPage):
             previous_horizontal_scroll_value,
             anchor_pixel_offset,
             was_at_top,
+            was_at_bottom,
         ) = self._capture_table_anchor()
         db_path = self._db_path()
         if not db_path:
@@ -1660,12 +1714,13 @@ class DataViewPage(_BaseWorkflowPage):
                 self.table.resizeColumnsToContents()
                 self.table.horizontalHeader().setSortIndicator(-1, Qt.SortOrder.AscendingOrder)
                 self.table.setSortingEnabled(True)
-                self._restore_table_anchor(
+                self._queue_table_anchor_restore(
                     anchor_signature,
                     previous_vertical_scroll_value,
                     previous_horizontal_scroll_value,
                     anchor_pixel_offset,
                     was_at_top,
+                    was_at_bottom,
                 )
                 selected_label = "全部" if selected in (None, -1) else f"CH{int(selected):02d}"
                 self.status_label.setText(f"当前筛选：{selected_label}；读取 {len(rows)} 条监测记录，数据源：{db_path}")
