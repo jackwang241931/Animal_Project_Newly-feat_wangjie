@@ -71,6 +71,7 @@ from public.function.cage_control_commands import configurable_cages
 from public.util.shared_video_frames import shared_video_frame_store
 from public.util.project_paths import resolve_project_path
 from Module.mouse_trajectory.paths import EXPORT_DIR as TRAJECTORY_EXPORT_DIR
+from Module.new_monitor_data.ui.custom.table.TableCellDetailDialog import CellDetailDialog
 from Module.mouse_trajectory_analysis.analysis_core import (
     find_matching_trajectory_export,
     find_matching_monitor_workbook,
@@ -1277,7 +1278,27 @@ class DataViewPage(_BaseWorkflowPage):
         self.fill_note.setProperty("hint", True); filter_box.addWidget(self.fill_note, 1)
         layout.addWidget(filter_card)
         self.status_label = QLabel("暂无本地数据"); self.status_label.setProperty("hint", True); layout.addWidget(self.status_label)
-        self.table = QTableWidget(0, 0); self.table.setAlternatingRowColors(True); self.table.setSortingEnabled(True); layout.addWidget(self.table, 1)
+        self.table = QTableWidget(0, 0); self.table.setAlternatingRowColors(False); self.table.setSortingEnabled(True)
+        self.table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.table.cellClicked.connect(self._show_cell_detail)
+        layout.addWidget(self.table, 1)
+
+    def _show_cell_detail(self, row: int, column: int) -> None:
+        item = self.table.item(row, column)
+        cell_value = item.text() if item is not None else ""
+        header_item = self.table.horizontalHeaderItem(column)
+        column_name = header_item.text() if header_item is not None else f"列{column + 1}"
+        try:
+            CellDetailDialog(
+                cell_value,
+                row,
+                column,
+                column_name,
+                self.table,
+            ).exec()
+        finally:
+            self.table.clearSelection()
+            self.table.setCurrentCell(-1, -1)
 
     def _select_channel_filter(self, channel: int) -> None:
         self._selected_channel_filter = channel
@@ -1384,6 +1405,17 @@ class DataViewPage(_BaseWorkflowPage):
             value = row[index]
             return value is not None and len(str(value).strip()) > 3
         return False
+
+    @staticmethod
+    def _stable_row_band(row: Sequence[Any]) -> int:
+        """Keep a record's stripe colour stable when newer rows are prepended."""
+        if not row:
+            return 0
+        identity = str(row[0] if row[0] is not None else "")
+        try:
+            return int(float(identity)) & 1
+        except (TypeError, ValueError):
+            return sum((index + 1) * ord(char) for index, char in enumerate(identity)) & 1
 
     @staticmethod
     def _epoch_rows(connection: sqlite3.Connection, selected: int, db_path: Optional[str] = None) -> tuple[list[str], list[tuple[Any, ...]]]:
@@ -1498,11 +1530,16 @@ class DataViewPage(_BaseWorkflowPage):
                 configured[group_name] = weight
         return configured
 
-    def _capture_table_anchor(self) -> tuple[Optional[tuple[str, ...]], int, int]:
+    def _capture_table_anchor(
+        self,
+    ) -> tuple[Optional[tuple[str, ...]], int, int, int, bool]:
         vertical_scroll_bar = self.table.verticalScrollBar()
         horizontal_scroll_bar = self.table.horizontalScrollBar()
+        vertical_value = vertical_scroll_bar.value()
+        horizontal_value = horizontal_scroll_bar.value()
+        was_at_top = vertical_value <= vertical_scroll_bar.minimum()
         if self.table.rowCount() <= 0:
-            return None, vertical_scroll_bar.value(), horizontal_scroll_bar.value()
+            return None, vertical_value, horizontal_value, 0, was_at_top
         top_row = self.table.rowAt(0)
         if top_row < 0:
             top_row = 0
@@ -1512,14 +1549,36 @@ class DataViewPage(_BaseWorkflowPage):
             else ""
             for column in range(self.table.columnCount())
         )
-        return signature, vertical_scroll_bar.value(), horizontal_scroll_bar.value()
+        anchor_item = self.table.item(top_row, 0)
+        anchor_pixel_offset = (
+            self.table.visualItemRect(anchor_item).top()
+            if anchor_item is not None
+            else 0
+        )
+        return (
+            signature,
+            vertical_value,
+            horizontal_value,
+            anchor_pixel_offset,
+            was_at_top,
+        )
 
     def _restore_table_anchor(
         self,
         signature: Optional[tuple[str, ...]],
         previous_vertical_scroll_value: int,
         previous_horizontal_scroll_value: int,
+        anchor_pixel_offset: int,
+        was_at_top: bool,
     ) -> None:
+        vertical_scroll_bar = self.table.verticalScrollBar()
+        if was_at_top:
+            vertical_scroll_bar.setValue(vertical_scroll_bar.minimum())
+            horizontal_scroll_bar = self.table.horizontalScrollBar()
+            horizontal_scroll_bar.setValue(
+                min(previous_horizontal_scroll_value, horizontal_scroll_bar.maximum())
+            )
+            return
         anchor_restored = False
         if signature is not None:
             for row in range(self.table.rowCount()):
@@ -1536,10 +1595,18 @@ class DataViewPage(_BaseWorkflowPage):
                             item,
                             QAbstractItemView.ScrollHint.PositionAtTop,
                         )
+                        vertical_scroll_bar.setValue(
+                            max(
+                                vertical_scroll_bar.minimum(),
+                                min(
+                                    vertical_scroll_bar.value() - anchor_pixel_offset,
+                                    vertical_scroll_bar.maximum(),
+                                ),
+                            )
+                        )
                         anchor_restored = True
                     break
         if not anchor_restored:
-            vertical_scroll_bar = self.table.verticalScrollBar()
             vertical_scroll_bar.setValue(
                 min(previous_vertical_scroll_value, vertical_scroll_bar.maximum())
             )
@@ -1553,6 +1620,8 @@ class DataViewPage(_BaseWorkflowPage):
             anchor_signature,
             previous_vertical_scroll_value,
             previous_horizontal_scroll_value,
+            anchor_pixel_offset,
+            was_at_top,
         ) = self._capture_table_anchor()
         db_path = self._db_path()
         if not db_path:
@@ -1568,9 +1637,14 @@ class DataViewPage(_BaseWorkflowPage):
             with sqlite3.connect(db_path) as connection:
                 selected = self._selected_channel_filter
                 headers, rows = self._epoch_rows(connection, selected, db_path)
-                self.table.setSortingEnabled(False); self.table.clear(); self.table.setColumnCount(len(headers)); self.table.setHorizontalHeaderLabels(headers); self.table.setRowCount(len(rows))
+                self.table.setSortingEnabled(False); self.table.clearSelection(); self.table.setCurrentCell(-1, -1); self.table.clear(); self.table.setColumnCount(len(headers)); self.table.setHorizontalHeaderLabels(headers); self.table.setRowCount(len(rows))
                 for r, row in enumerate(rows):
                     highlight_error = self._row_has_remark_error(headers, row)
+                    row_background = (
+                        self.table.palette().alternateBase()
+                        if self._stable_row_band(row)
+                        else self.table.palette().base()
+                    )
                     for c, value in enumerate(row):
                         header = str(headers[c] if c < len(headers) else "").strip().lower()
                         is_remarks = header in {"remarks", "remark", "备注"} or "备注" in header
@@ -1579,6 +1653,7 @@ class DataViewPage(_BaseWorkflowPage):
                         else:
                             display_value = _text(value, "None")
                         item = QTableWidgetItem(display_value)
+                        item.setBackground(row_background)
                         if highlight_error:
                             item.setForeground(QBrush(QColor(255, 0, 0)))
                         self.table.setItem(r, c, item)
@@ -1589,6 +1664,8 @@ class DataViewPage(_BaseWorkflowPage):
                     anchor_signature,
                     previous_vertical_scroll_value,
                     previous_horizontal_scroll_value,
+                    anchor_pixel_offset,
+                    was_at_top,
                 )
                 selected_label = "全部" if selected in (None, -1) else f"CH{int(selected):02d}"
                 self.status_label.setText(f"当前筛选：{selected_label}；读取 {len(rows)} 条监测记录，数据源：{db_path}")

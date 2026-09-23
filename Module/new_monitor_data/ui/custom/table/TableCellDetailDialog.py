@@ -72,6 +72,10 @@ class CellDetailDialog(ThemedDialog):
 
     def __init__(self, cell_value, row, column, column_name, parent=None):
         super().__init__()
+        # BaseDialog creates a floating help button for tutorial-enabled dialogs.
+        # Cell details have no tutorial, so the orphaned "..." button is useless.
+        if self.buttonBox is not None:
+            self.buttonBox.hide()
         self.setWindowTitle(f"单元格详情 - 行{row + 1}, 列{column_name}")
         # self.setModal(True)
         self.resize(600, 450)
