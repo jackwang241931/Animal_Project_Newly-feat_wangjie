@@ -2214,11 +2214,28 @@ class Add_message_thread(MyQThread):
 
 
 
-def _get_monitor_data_experiment_name():
-    experiment_setting_file = global_setting.get_setting("experiment_setting_file", None)
+DEFAULT_EXPERIMENT_CONFIG_STEM = "last_experiment_config"
+
+
+def get_monitor_data_experiment_name(experiment_setting_file):
     if experiment_setting_file is not None and os.path.exists(experiment_setting_file):
-        return os.path.splitext(os.path.basename(experiment_setting_file))[0]
+        experiment_name = os.path.splitext(os.path.basename(experiment_setting_file))[0]
+        if experiment_name == DEFAULT_EXPERIMENT_CONFIG_STEM:
+            return ""
+        return experiment_name
     return ""
+
+
+def build_monitor_data_experiment_folder_name(experiment_setting_file, start_time):
+    experiment_name = get_monitor_data_experiment_name(experiment_setting_file)
+    timestamp = time_util.get_format_file_from_time(start_time)
+    return f"{experiment_name}_{timestamp}" if experiment_name else timestamp
+
+
+def _get_monitor_data_experiment_name():
+    return get_monitor_data_experiment_name(
+        global_setting.get_setting("experiment_setting_file", None)
+    )
 
 
 def get_monitor_data_experiment_dir():
@@ -2228,9 +2245,9 @@ def get_monitor_data_experiment_dir():
     monitor_data_config = global_setting.get_setting('monitor_data')
     storage_config = monitor_data_config['STORAGE']
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    folder_name = (
-        f"{_get_monitor_data_experiment_name()}_"
-        f"{time_util.get_format_file_from_time(global_setting.get_setting('start_experiment_time', time.time()))}"
+    folder_name = build_monitor_data_experiment_folder_name(
+        global_setting.get_setting("experiment_setting_file", None),
+        global_setting.get_setting('start_experiment_time', time.time()),
     )
     return os.path.abspath(
         os.path.join(

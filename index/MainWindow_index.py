@@ -2508,11 +2508,7 @@ class MainWindow_Index(ThemedWindow):
             return None
         if start_time <= 0:
             return None
-        file_name_without_extension = (
-            os.path.splitext(os.path.basename(experiment_setting_file))[0]
-            if experiment_setting_file and os.path.exists(experiment_setting_file)
-            else ""
-        )
+
         storage = global_setting.get_setting('monitor_data')['STORAGE']
         experiment_setting = (
             global_setting.get_setting("experiment_setting", None)
@@ -2531,7 +2527,10 @@ class MainWindow_Index(ThemedWindow):
         )
         return os.path.abspath(os.path.join(
             storage_root,
-            f"{file_name_without_extension}_{time_util.get_format_file_from_time(start_time)}"
+            main_monitor_data.build_monitor_data_experiment_folder_name(
+                experiment_setting_file,
+                start_time,
+            )
         ))
 
     def _get_experiment_db_path(self):
