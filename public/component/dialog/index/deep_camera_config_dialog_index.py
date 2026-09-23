@@ -69,10 +69,13 @@ class deep_camera_config_dialog(QDialog):
         self.refresh_btn: QPushButton | None = None
         self.ok_btn: QPushButton | None = None
         self.scan_thread: UVCCameraScanThread | None = None
+        self._close_when_scan_finishes = False
+        self._base_window_title = ""
 
         self._init_ui(parent, geometry, title)
         self._init_customize_ui()
         self.init_data()
+        self._base_window_title = self.windowTitle()
 
     def showEvent(self, a0: typing.Optional[QtGui.QShowEvent]) -> None:
         logger.warning("deep_config_dialog-show")
@@ -257,17 +260,21 @@ class deep_camera_config_dialog(QDialog):
         if self.scan_thread is not None and self.scan_thread.isRunning():
             return
 
-        if self.refresh_btn is not None:
-            self.refresh_btn.setEnabled(False)
-        if self.ok_btn is not None:
-            self.ok_btn.setEnabled(False)
+        self._set_scan_controls_enabled(False)
 
         self.scan_thread = UVCCameraScanThread(self)
         self.scan_thread.scan_finished.connect(self._apply_scan_result)
+        self.scan_thread.finished.connect(self._on_scan_thread_finished)
         self.scan_thread.finished.connect(self.scan_thread.deleteLater)
         self.scan_thread.start()
 
     def _apply_scan_result(self, cameras, error):
+        if error:
+            logger.error(f"deep camera refresh failed: {error}")
+
+        if self._close_when_scan_finishes:
+            return
+
         raw_cameras = [item for item in cameras if isinstance(item, dict)]
         self.camera_series_list = assign_logical_camera_indices(
             raw_cameras,
@@ -306,14 +313,44 @@ class deep_camera_config_dialog(QDialog):
         ]
         self.init_combox()
 
+    def _set_scan_controls_enabled(self, enabled: bool):
         if self.refresh_btn is not None:
-            self.refresh_btn.setEnabled(True)
+            self.refresh_btn.setEnabled(enabled)
         if self.ok_btn is not None:
-            self.ok_btn.setEnabled(True)
-        self.scan_thread = None
+            self.ok_btn.setEnabled(enabled)
 
-        if error:
-            logger.error(f"deep camera refresh failed: {error}")
+    def _on_scan_thread_finished(self):
+        finished_thread = self.sender()
+        if finished_thread is self.scan_thread:
+            self.scan_thread = None
+
+        if self._close_when_scan_finishes:
+            self._close_when_scan_finishes = False
+            self.setWindowTitle(self._base_window_title)
+            super().reject()
+            return
+
+        self._set_scan_controls_enabled(True)
+
+    def _defer_close_for_scan(self) -> bool:
+        if self.scan_thread is None or not self.scan_thread.isRunning():
+            return False
+
+        self._close_when_scan_finishes = True
+        self._set_scan_controls_enabled(False)
+        self.setWindowTitle(f"{self._base_window_title}（正在结束相机检测…）")
+        return True
+
+    def reject(self):
+        if self._defer_close_for_scan():
+            return
+        super().reject()
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:
+        if self._defer_close_for_scan():
+            event.ignore()
+            return
+        super().closeEvent(event)
 
     def ok_func(self):
         choose_data = [item for item in self.camera_series_choose_list if item is not None]
