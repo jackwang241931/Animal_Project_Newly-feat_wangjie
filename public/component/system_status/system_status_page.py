@@ -124,9 +124,13 @@ _IGNORED_ALERT_REASONS = frozenset({
 })
 
 
-def _is_ignored_alert(item: Mapping[str, Any]) -> bool:
-    reason = str(item.get("reason_code") or "").strip().lower()
+def is_ignored_alert_reason(reason_code: Any) -> bool:
+    reason = str(reason_code or "").strip().lower()
     return reason in _IGNORED_ALERT_REASONS
+
+
+def _is_ignored_alert(item: Mapping[str, Any]) -> bool:
+    return is_ignored_alert_reason(item.get("reason_code"))
 
 
 def derive_channel_status_issues(

@@ -25,7 +25,7 @@ from Service.UFC_UGC_ZOS_Service.index.UFC_UGC_ZOS_index import UFC_UGC_ZOS_inde
 from my_abc.BaseModule import BaseModule
 from public.component.Guide_tutorial_interface.Tutorial_Manager import TutorialManager
 from public.component.custom_status_bar import CustomStatusBar
-from public.component.system_status import SystemStatusPage
+from public.component.system_status import SystemStatusPage, is_ignored_alert_reason
 from public.component.experiment_config.experiment_config_page import ExperimentConfigPage
 from public.component.workflow_pages import (
     DataAnalysisPage,
@@ -1220,9 +1220,24 @@ class MainWindow_Index(ThemedWindow):
         if self.workflow_shell is None or self.health_store is None:
             return
         self.workflow_shell.set_experiment_state(self.workflow_run_state)
+        raw_issues = self.health_store.active_issues()
+        actionable_issues = [
+            issue
+            for issue in raw_issues
+            if not is_ignored_alert_reason(issue.reason_code)
+        ]
+        if actionable_issues:
+            summary_state = max(
+                (issue.state for issue in actionable_issues),
+                key=lambda state: state.severity,
+            )
+        elif raw_issues:
+            summary_state = HealthState.NORMAL
+        else:
+            summary_state = self.health_store.overall_state()
         self.workflow_shell.set_health_summary(
-            self.health_store.overall_state(),
-            len(self.health_store.active_issues()),
+            summary_state,
+            len(actionable_issues),
         )
 
     def _system_health_view(self):
