@@ -1498,10 +1498,11 @@ class DataViewPage(_BaseWorkflowPage):
                 configured[group_name] = weight
         return configured
 
-    def _capture_table_anchor(self) -> tuple[Optional[tuple[str, ...]], int]:
-        scroll_bar = self.table.verticalScrollBar()
+    def _capture_table_anchor(self) -> tuple[Optional[tuple[str, ...]], int, int]:
+        vertical_scroll_bar = self.table.verticalScrollBar()
+        horizontal_scroll_bar = self.table.horizontalScrollBar()
         if self.table.rowCount() <= 0:
-            return None, scroll_bar.value()
+            return None, vertical_scroll_bar.value(), horizontal_scroll_bar.value()
         top_row = self.table.rowAt(0)
         if top_row < 0:
             top_row = 0
@@ -1511,13 +1512,15 @@ class DataViewPage(_BaseWorkflowPage):
             else ""
             for column in range(self.table.columnCount())
         )
-        return signature, scroll_bar.value()
+        return signature, vertical_scroll_bar.value(), horizontal_scroll_bar.value()
 
     def _restore_table_anchor(
         self,
         signature: Optional[tuple[str, ...]],
-        previous_scroll_value: int,
+        previous_vertical_scroll_value: int,
+        previous_horizontal_scroll_value: int,
     ) -> None:
+        anchor_restored = False
         if signature is not None:
             for row in range(self.table.rowCount()):
                 candidate = tuple(
@@ -1533,12 +1536,24 @@ class DataViewPage(_BaseWorkflowPage):
                             item,
                             QAbstractItemView.ScrollHint.PositionAtTop,
                         )
-                    return
-        scroll_bar = self.table.verticalScrollBar()
-        scroll_bar.setValue(min(previous_scroll_value, scroll_bar.maximum()))
+                        anchor_restored = True
+                    break
+        if not anchor_restored:
+            vertical_scroll_bar = self.table.verticalScrollBar()
+            vertical_scroll_bar.setValue(
+                min(previous_vertical_scroll_value, vertical_scroll_bar.maximum())
+            )
+        horizontal_scroll_bar = self.table.horizontalScrollBar()
+        horizontal_scroll_bar.setValue(
+            min(previous_horizontal_scroll_value, horizontal_scroll_bar.maximum())
+        )
 
     def refresh(self) -> None:
-        anchor_signature, previous_scroll_value = self._capture_table_anchor()
+        (
+            anchor_signature,
+            previous_vertical_scroll_value,
+            previous_horizontal_scroll_value,
+        ) = self._capture_table_anchor()
         db_path = self._db_path()
         if not db_path:
             state = _provider_value(self._context_provider).get("experiment_status")
@@ -1553,7 +1568,6 @@ class DataViewPage(_BaseWorkflowPage):
             with sqlite3.connect(db_path) as connection:
                 selected = self._selected_channel_filter
                 headers, rows = self._epoch_rows(connection, selected, db_path)
-                rows = list(reversed(rows))
                 self.table.setSortingEnabled(False); self.table.clear(); self.table.setColumnCount(len(headers)); self.table.setHorizontalHeaderLabels(headers); self.table.setRowCount(len(rows))
                 for r, row in enumerate(rows):
                     highlight_error = self._row_has_remark_error(headers, row)
@@ -1571,7 +1585,11 @@ class DataViewPage(_BaseWorkflowPage):
                 self.table.resizeColumnsToContents()
                 self.table.horizontalHeader().setSortIndicator(-1, Qt.SortOrder.AscendingOrder)
                 self.table.setSortingEnabled(True)
-                self._restore_table_anchor(anchor_signature, previous_scroll_value)
+                self._restore_table_anchor(
+                    anchor_signature,
+                    previous_vertical_scroll_value,
+                    previous_horizontal_scroll_value,
+                )
                 selected_label = "全部" if selected in (None, -1) else f"CH{int(selected):02d}"
                 self.status_label.setText(f"当前筛选：{selected_label}；读取 {len(rows)} 条监测记录，数据源：{db_path}")
         except (OSError, sqlite3.Error) as error:
