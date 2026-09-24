@@ -237,6 +237,8 @@ class read_queue_data_Thread(MyQThread):
                         标定的消息
                         """
                         if self.window is not None:
+                            if self.window.status_bar is not None:
+                                self.window.status_bar.update_tip(message.data)
                             self.window.cache_calibration_detail_log(message.data, has_time=True)
                     case 'set_start_zero_calibration_time':
                         """
@@ -1578,7 +1580,7 @@ class MainWindow_Index(ThemedWindow):
             # start/stop acknowledgements from their original consumers.
             "main_logs": list(
                 getattr(self, "workflow_runtime_log_buffer", [])
-            )[-100:],
+            )[-200:],
         }
 
     def _clear_main_tab_content(self):

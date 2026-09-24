@@ -213,8 +213,10 @@ class Startup_O2_Span_Air_Calibration:
 
                 status = self._handler.get_status()
                 if phase == "span" and status.get("need_air"):
+                    self._log_phase_final_progress(phase, target_points, status)
                     return
                 if phase == "air" and status.get("completed"):
+                    self._log_phase_final_progress(phase, target_points, status)
                     return
 
                 elapsed = time.monotonic() - started
@@ -223,15 +225,44 @@ class Startup_O2_Span_Air_Calibration:
                     raise TimeoutError(
                         f"{phase}采样超时；各通道点数：{counts}"
                     )
-                if elapsed - last_log >= 10:
-                    counts = status.get("phase_counts", {}).get(phase, {})
-                    progress = "，".join(
-                        f"{self._channel_name(ch)}={counts.get(self._channel_name(ch), 0)}/{target_points}"
-                        for ch in self.CHANNELS
-                    )
-                    self._send_text(f"{phase}采样进度：{progress}")
-                    last_log = elapsed
                 self._stop_event.wait(sample_interval)
+
+            # Report only after one full REF + M1..M8 scan. Logging inside the
+            # channel loop exposed a mid-scan snapshot and made later channels
+            # appear to be one sample behind even when the scan was healthy.
+            elapsed = time.monotonic() - started
+            if elapsed - last_log >= 10:
+                counts = self._handler.get_status().get("phase_counts", {}).get(phase, {})
+                progress = "，".join(
+                    f"{self._channel_name(ch)}={counts.get(self._channel_name(ch), 0)}/{target_points}"
+                    for ch in self.CHANNELS
+                )
+                self._send_text(f"{phase}采样进度（整轮扫描完成）：{progress}")
+                last_log = elapsed
+
+    def _log_phase_final_progress(self, phase, target_points, status=None):
+        """Log an explicit per-channel snapshot when a sampling phase finishes."""
+        status = status or self._handler.get_status()
+        counts = status.get("phase_counts", {}).get(phase, {})
+        channel_counts = {
+            self._channel_name(channel): counts.get(self._channel_name(channel), 0)
+            for channel in self.CHANNELS
+        }
+        progress = "，".join(
+            f"{name}={count}/{target_points}" for name, count in channel_counts.items()
+        )
+        incomplete = [
+            f"{name}({count}/{target_points})"
+            for name, count in channel_counts.items()
+            if count < target_points
+        ]
+        result = (
+            "全部通道达到目标点数"
+            if not incomplete
+            else f"未达标通道：{'、'.join(incomplete)}"
+        )
+        phase_label = "Span" if phase == "span" else "空气"
+        self._send_text(f"{phase_label}采样最终进度：{progress}；{result}")
 
     def _restore_safe_gas_state(self):
         first_error = None
@@ -270,7 +301,7 @@ class Startup_O2_Span_Air_Calibration:
             global_setting.set_setting("is_calibrating", True)
             global_setting.set_setting("current_calibration_type", self.name)
             self._send_text(
-                f"开始压缩包流程；每路目标 {target_points} 点，通道间隔 {sample_interval:g} 秒"
+                f"开始 O₂ Span+空气校准；每路目标 {target_points} 点，通道间隔 {sample_interval:g} 秒"
             )
 
             # Span phase: enable manifold/ZOS calibration mode, then use 20.50% gas.

@@ -250,10 +250,10 @@ class UFC_UGC_ZOS_index(MyQThread):
                                                                    title='calibration_msg',
                                                                    data=text,
                                                                    time=time_util.get_format_from_time(time.time())))
-                            queue.put(ObjectQueueItem(origin='UFC_UGC_ZOS_index', to='MainWindow_index',
-                                                                   title='gap_system_running_state',
-                                                                   data=text,
-                                                                   time=time_util.get_format_from_time(time.time())))
+                            # calibration_msg already feeds both the P3 runtime
+                            # log and calibration detail history. Sending the
+                            # same text through gap_system_running_state as well
+                            # mirrors it from the hidden startup dialog a second time.
                     pass
                 case GapSystem_Running_Type.DEFAULT:
                     queue = global_setting.get_setting("queue", None)

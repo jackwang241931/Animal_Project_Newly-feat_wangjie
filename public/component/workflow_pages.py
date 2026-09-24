@@ -526,6 +526,8 @@ class ExperimentControlPage(_BaseWorkflowPage):
         self._active_calibrations: set[str] = set()
         self._stopping_calibrations: set[str] = set()
         self._combined_calibration = False
+        self._main_log_render_signature = None
+        self._main_log_rendered_entries = ()
         self.main_log_list = QTableWidget(0, 2)
         super().__init__(context_provider, health_source, parent)
         # The displayed duration contains seconds, so P3 must refresh once per
@@ -1221,9 +1223,12 @@ class ExperimentControlPage(_BaseWorkflowPage):
                                ("temperature", "气室温度"))
         )
         self.calibration_evidence.setText(f"校准读数：{evidence}")
-        logs = context.get("main_logs") or []
-        self.main_log_list.setRowCount(0)
-        for entry in list(logs)[-30:]:
+        self._refresh_main_log_list(context.get("main_logs") or [])
+        self.refreshed.emit()
+
+    def _refresh_main_log_list(self, logs) -> None:
+        entries = []
+        for entry in list(logs)[-200:]:
             if isinstance(entry, Mapping):
                 stamp, message = entry.get("time", ""), entry.get("message", "")
                 level = entry.get("level", entry.get("type", "信息"))
@@ -1233,23 +1238,53 @@ class ExperimentControlPage(_BaseWorkflowPage):
             else:
                 stamp, message = "", entry
                 level = "信息"
-            row = self.main_log_list.rowCount(); self.main_log_list.insertRow(row)
-            stamp_item = QTableWidgetItem(_text(stamp, ""))
-            stamp_item.setBackground(QColor("#eef6ff"))
-            self.main_log_list.setItem(row, 0, stamp_item)
-            level_label = QLabel(_text(level, "信息"))
-            level_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            level_label.setProperty("chip", True)
-            level_label.setProperty("tone", "info")
-            level_label.setStyleSheet("background:#e2f1ff;color:#156fc1;border-radius:8px;padding:2px 5px;font-size:10px;font-weight:700;")
-            self.main_log_list.setCellWidget(row, 1, level_label)
-            message_item = QTableWidgetItem(_text(message, ""))
-            message_item.setBackground(QColor("#eef6ff"))
-            self.main_log_list.setItem(row, 2, message_item)
-            self.main_log_list.setRowHeight(row, 32)
+            entries.append((_text(stamp, ""), _text(level, "信息"), _text(message, "")))
+
+        signature = tuple(entries)
+        if signature == self._main_log_render_signature:
+            return
+
+        scroll_bar = self.main_log_list.verticalScrollBar()
+        follow_latest = scroll_bar.value() >= scroll_bar.maximum() - 1
+        old_scroll_value = scroll_bar.value()
+        anchor_row = self.main_log_list.rowAt(1)
+        anchor_entry = (
+            self._main_log_rendered_entries[anchor_row]
+            if 0 <= anchor_row < len(self._main_log_rendered_entries)
+            else None
+        )
+
+        self.main_log_list.setUpdatesEnabled(False)
+        try:
+            self.main_log_list.setRowCount(0)
+            for stamp, level, message in entries:
+                row = self.main_log_list.rowCount()
+                self.main_log_list.insertRow(row)
+                stamp_item = QTableWidgetItem(stamp)
+                stamp_item.setBackground(QColor("#eef6ff"))
+                self.main_log_list.setItem(row, 0, stamp_item)
+                level_label = QLabel(level)
+                level_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                level_label.setProperty("chip", True)
+                level_label.setProperty("tone", "info")
+                level_label.setStyleSheet("background:#e2f1ff;color:#156fc1;border-radius:8px;padding:2px 5px;font-size:10px;font-weight:700;")
+                self.main_log_list.setCellWidget(row, 1, level_label)
+                message_item = QTableWidgetItem(message)
+                message_item.setBackground(QColor("#eef6ff"))
+                self.main_log_list.setItem(row, 2, message_item)
+                self.main_log_list.setRowHeight(row, 32)
+        finally:
+            self.main_log_list.setUpdatesEnabled(True)
+
+        self._main_log_render_signature = signature
+        self._main_log_rendered_entries = signature
         if self.main_log_list.rowCount():
-            self.main_log_list.scrollToBottom()
-        self.refreshed.emit()
+            if follow_latest:
+                self.main_log_list.scrollToBottom()
+            elif anchor_entry in entries:
+                self.main_log_list.verticalScrollBar().setValue(entries.index(anchor_entry))
+            else:
+                scroll_bar.setValue(min(old_scroll_value, scroll_bar.maximum()))
 
 
 class DataViewPage(_BaseWorkflowPage):
