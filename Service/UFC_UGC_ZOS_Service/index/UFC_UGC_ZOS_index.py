@@ -428,16 +428,24 @@ class UFC_UGC_ZOS_index(MyQThread):
         global stop_flag
         stop_flag = False
         self._prepare_startup_calibration_cages()
-
-        chain = AsyPromise.resolve_immediately(None)
         if include_co2_zero:
-            chain = chain.then(
-                lambda _: AsyPromise(self.co2_zero_calibration_obj_calibrate_wrapped)
+            self.update_status_main_signal_gui_update.send(
+                f"{time_util.get_format_from_time(time.time())} | 启动组合校准：先执行旧版CO₂校零，再执行O₂ Span和空气校准",
+                title=GapSystem_Running_Type.STARTUP_AIR_CALIBRATION,
             )
+            chain = AsyPromise(self.co2_zero_calibration_obj_calibrate_wrapped)
+            chain = chain.then(
+                lambda _: AsyPromise(self.UFC_gas_state_check_obj.read_start_status)
+            )
+        else:
+            self.update_status_main_signal_gui_update.send(
+                f"{time_util.get_format_from_time(time.time())} | 启动O₂ Span和空气校准：正在按顺序启动气路",
+                title=GapSystem_Running_Type.STARTUP_AIR_CALIBRATION,
+            )
+            chain = AsyPromise(self.UFC_gas_state_check_obj.read_start_status)
 
         return (
             chain
-            .then(lambda _: AsyPromise(self.UFC_gas_state_check_obj.read_start_status))
             .then(self._remember_ufc_start_status)
             .then(lambda _: AsyPromise(self.UGC_gas_path_system_obj.start))
             .then(lambda _: AsyPromise(self.ZOS_gas_path_system_obj.start))
@@ -448,6 +456,10 @@ class UFC_UGC_ZOS_index(MyQThread):
         )
 
     def _reject_o2_span_air_start(self, error):
+        self.update_status_main_signal_gui_update.send(
+            f"{time_util.get_format_from_time(time.time())} | O₂ Span+空气启动流程失败：{error}",
+            title=GapSystem_Running_Type.STARTUP_AIR_CALIBRATION,
+        )
         self.calibration_log_recorder.record(
             "STARTUP_O2_SPAN_AIR_CALIBRATION",
             {"type": "calibration_failed", "value": f"O2 Span+空气校准启动流程失败: {error}"},
