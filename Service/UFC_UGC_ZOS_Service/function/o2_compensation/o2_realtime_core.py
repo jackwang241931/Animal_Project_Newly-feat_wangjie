@@ -90,6 +90,8 @@ class RealtimeO2Compensator:
         except Exception:
             self._config_mtime_ns = current
             return False
+        # A new calibration must be followed by a new measured REF sample.
+        self.ref_corr = None
         offs = cfg.get("offsets") or {}
         for ch in VALID_CHANNELS:
             if ch in offs:
@@ -105,6 +107,13 @@ class RealtimeO2Compensator:
         logger.info("reload calib air_lock=%.4f", self.air_lock)
         return True
 
+    def has_valid_reference_sample(self):
+        try:
+            reference = float(self.ref_corr)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        return math.isfinite(reference) and 0.0 <= reference <= 100.0
+
     def compensate(self, channel, o2_partial, zos_temp, gas_pressure, o2_percent, zos_rh):
         del o2_partial
         self.ensure_latest()
@@ -112,13 +121,15 @@ class RealtimeO2Compensator:
             return None
         dry = calc_dry_o2(o2_percent, gas_pressure, zos_temp, zos_rh)
         if pd.isna(dry):
+            if channel == "REF":
+                self.ref_corr = None
             return None
         corr = float(dry) + float(self.offsets.get(channel, 0.0))
         if channel == "REF":
             self.ref_corr = corr
-            return float(self.air_lock)
-        if self.ref_corr is None:
-            return float(self.air_lock)
+            return float(self.air_lock) if self.has_valid_reference_sample() else None
+        if not self.has_valid_reference_sample():
+            return None
         return float(self.air_lock + (corr - self.ref_corr))
 
 
