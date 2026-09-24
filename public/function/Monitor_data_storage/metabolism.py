@@ -31,7 +31,7 @@ def calculate_epoch_metabolism(values: Mapping):
     """Return VO2, VCO2, RER and EE, or four unavailable values.
 
     Haldane nitrogen balance: Vi = Vo * (1-FeO2-FeCO2)/(1-FiO2-FiCO2).
-    EE uses the 3.815/1.232 Weir coefficients already used by this GUI.
+    EE uses the CV1=3.941 and CV2=1.106: 60 * (CV1*VO2 + CV2*VCO2).
     """
     unavailable = {name: None for name, _ in METABOLISM_COLUMNS}
     flow = _number(values.get("UFC_flow_num"))
@@ -59,5 +59,5 @@ def calculate_epoch_metabolism(values: Mapping):
         "vo2_consumption": vo2,
         "vco2_production": vco2,
         "rer_rq": vco2 / vo2,
-        "ee_energy_expenditure": 60.0 * (3.815 * vo2 + 1.232 * vco2),
+        "ee_energy_expenditure": 60.0 * (3.941 * vo2 + 1.106 * vco2),
     }

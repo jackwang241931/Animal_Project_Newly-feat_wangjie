@@ -27,7 +27,7 @@ class MetabolismCalculationTests(unittest.TestCase):
         self.assertAlmostEqual(result["vo2_consumption"], vo2)
         self.assertAlmostEqual(result["vco2_production"], vco2)
         self.assertAlmostEqual(result["rer_rq"], vco2 / vo2)
-        self.assertAlmostEqual(result["ee_energy_expenditure"], 60 * (3.815 * vo2 + 1.232 * vco2))
+        self.assertAlmostEqual(result["ee_energy_expenditure"], 60 * (3.941 * vo2 + 1.106 * vco2))
 
     def test_missing_reference_and_invalid_flow_are_unavailable(self):
         for change in ({"reference_CO2_num": None}, {"UFC_flow_num": 0}, {"UFC_flow_num": math.nan}):

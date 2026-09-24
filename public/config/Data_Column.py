@@ -359,7 +359,7 @@ class Data_Column(Enum):
         "column_text": "EE（Energy Expenditure 能量消耗）",
         "column_name": "ee_energy_expenditure",
         "unit": "kcal/hr",
-        "desc": "能量消耗率（EE）。VO2/VCO2 为 L/min 时，EE = 60 * (3.815 * VO2 + 1.232 * VCO2)（kcal/hr）",
+        "desc": "能量消耗率（EE）。VO2/VCO2 为 L/min 时，EE = 60 * (3.941 * VO2 + 1.106 * VCO2)（kcal/hr）",
         "data_format": "calculated_data",
         "note": "记录所用 CV/公式",
         "module":None

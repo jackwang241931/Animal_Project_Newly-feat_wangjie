@@ -94,7 +94,7 @@ def calculate_ee(measurements: Mapping[str, Any]) -> Optional[float]:
     vco2 = _formula_measurement(measurements, _VCO2_ALIASES)
     if vo2 is None or vco2 is None:
         return None
-    return 60.0 * (3.815 * vo2 + 1.232 * vco2)
+    return 60.0 * (3.941 * vo2 + 1.106 * vco2)
 
 
 def format_duration(value: Any) -> str:

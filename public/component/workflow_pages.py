@@ -5958,7 +5958,7 @@ class DataAnalysisPage(_BaseWorkflowPage):
                                         continue
                                     value = vco2 / vo2
                                 else:
-                                    value = 60.0 * (3.815 * vo2 + 1.232 * vco2)
+                                    value = 60.0 * (3.941 * vo2 + 1.106 * vco2)
                                 series.append((str(raw_time if raw_time is not None else row_index), value))
                         if series:
                             if preview_limit is not None:
