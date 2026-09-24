@@ -17,7 +17,6 @@ from Service.UFC_UGC_ZOS_Service.function.o2_compensation import (
     calculate_o2_compensated,
     get_reference_dry_oxygen_percent,
     has_valid_reference_dry_oxygen_sample,
-    get_realtime_o2_compensator,
 )
 from Service.UFC_UGC_ZOS_Service.function.o2_compensation.host_wet_o2_guard import (
     WetOxygenAnomalyGuard,
@@ -1404,16 +1403,6 @@ class ZOS_gas_path_system_run_thread(MyQThread):
 
         compensation_value = -1
         if inputs_complete:
-            # The host guard already filtered wet-basis O2. Keep the legacy
-            # compensator's O2 history aligned with that cleaned value so its
-            # older adjacent-value check does not filter the same sample twice.
-            try:
-                cleaned_o2 = float(o2_raw_pct)
-                channel_state = get_realtime_o2_compensator().last_values.get(channel_id)
-                if channel_state is not None and np.isfinite(cleaned_o2):
-                    channel_state["o2"] = cleaned_o2
-            except (TypeError, ValueError):
-                pass
             compensation_value = calculate_o2_compensated(
                 channel_id,
                 o2_partial_press,
