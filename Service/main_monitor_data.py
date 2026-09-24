@@ -2631,13 +2631,17 @@ def barrier_action():
                 store_Datas.append(
                     {'desc': 'CO2生产量(%)',
                      'value': round(fitted_co2_num - reference_data.get(f'UGC_CO2_num'), 4)})
-            if results.get(f'ZOS_monitor_data_cage_{mouse_cage_number}__oxygen_num') is not None and reference_data.get(f'ZOS_oxygen_num') is not None:
+            sample_dry_basis_oxygen = results.get(
+                f'ZOS_monitor_data_cage_{mouse_cage_number}__dry_basis_oxygen_num'
+            )
+            reference_dry_basis_oxygen = reference_data.get('ZOS_dry_basis_oxygen_num')
+            if sample_dry_basis_oxygen is not None and reference_dry_basis_oxygen is not None:
 
 
 
                 store_Datas.append(
                     {'desc': '耗氧量(%)',
-                     'value':reference_data.get(f'ZOS_oxygen_num')-results.get(f'ZOS_monitor_data_cage_{mouse_cage_number}__oxygen_num')})
+                     'value': round(reference_dry_basis_oxygen - sample_dry_basis_oxygen, 4)})
 
 
             pass
