@@ -17,6 +17,7 @@ from Service.UFC_UGC_ZOS_Service.function.gas_path_system.Gas_path_system import
     UGC_gas_path_system, UFC_gas_path_system
 from Service.UFC_UGC_ZOS_Service.function.gas_state_check.Gas_State_Check import UFC_Gas_State_Check
 from Service.UFC_UGC_ZOS_Service.function.startup_air_calibration import Startup_Air_Calibration
+from Service.UFC_UGC_ZOS_Service.function.startup_air_calibration.Startup_O2_Span_Air_Calibration import Startup_O2_Span_Air_Calibration
 from public.config_class.global_setting import global_setting
 from public.config_class.ini_parser import ini_parser
 from public.entity.MyQThread import MyQThread, MyThread
@@ -122,6 +123,7 @@ class UFC_UGC_ZOS_index(MyQThread):
         self.Zero_carlibration_obj: Zero_Carlibration = None
         self.Range_carlibration_obj: Range_Carlibration = None
         self.Startup_air_calibration_obj: Startup_Air_Calibration = None
+        self.Startup_o2_span_air_calibration_obj: Startup_O2_Span_Air_Calibration = None
         self.Startup_co2_air_calibration_obj: Startup_CO2_Air_Calibration = None
         self.UFC_gas_state_check_obj: UFC_Gas_State_Check = None
 
@@ -293,6 +295,9 @@ class UFC_UGC_ZOS_index(MyQThread):
         self.Startup_air_calibration_obj = Startup_Air_Calibration()
         self.Startup_air_calibration_obj.update_status_main_signal_gui_update = self.update_status_main_signal_gui_update
         self.Startup_air_calibration_obj.update()
+        self.Startup_o2_span_air_calibration_obj = Startup_O2_Span_Air_Calibration()
+        self.Startup_o2_span_air_calibration_obj.update_status_main_signal_gui_update = self.update_status_main_signal_gui_update
+        self.Startup_o2_span_air_calibration_obj.update()
         self.Startup_co2_air_calibration_obj = Startup_CO2_Air_Calibration()
         self.Startup_co2_air_calibration_obj.update_status_main_signal_gui_update = self.update_status_main_signal_gui_update
         self.Startup_co2_air_calibration_obj.update()
@@ -398,6 +403,58 @@ class UFC_UGC_ZOS_index(MyQThread):
             error, logger=logger, message_prefix="Air气路启动流程失败"
         )
 
+    def co2_zero_calibration_obj_calibrate_wrapped(self, resolve, reject):
+        """Run the established CO2 zero-calibration worker without its legacy O2 zero stage."""
+        self.Zero_carlibration_obj.co2_only_mode = True
+        try:
+            self.zero_carlibration_obj_calibrate_wrapped(resolve, reject)
+        finally:
+            self.Zero_carlibration_obj.co2_only_mode = False
+
+    def _prepare_startup_calibration_cages(self):
+        experiment_settings = global_setting.get_setting("experiment_setting", None)
+        groups = getattr(experiment_settings, "groups", []) if experiment_settings is not None else []
+        cage_ids = []
+        for group in groups:
+            try:
+                cage_ids.append(int(group.id))
+            except (AttributeError, TypeError, ValueError):
+                continue
+        if cage_ids:
+            global_setting.set_setting("mouse_cages", cage_ids)
+
+    def start_btn_handle_with_o2_span_air_calibration(self, include_co2_zero=False):
+        """Start the normal gas path, run the supplied O2 Span→Air routine, then continue startup."""
+        global stop_flag
+        stop_flag = False
+        self._prepare_startup_calibration_cages()
+
+        chain = AsyPromise.resolve_immediately(None)
+        if include_co2_zero:
+            chain = chain.then(
+                lambda _: AsyPromise(self.co2_zero_calibration_obj_calibrate_wrapped)
+            )
+
+        return (
+            chain
+            .then(lambda _: AsyPromise(self.UFC_gas_state_check_obj.read_start_status))
+            .then(self._remember_ufc_start_status)
+            .then(lambda _: AsyPromise(self.UGC_gas_path_system_obj.start))
+            .then(lambda _: AsyPromise(self.ZOS_gas_path_system_obj.start))
+            .then(lambda _: AsyPromise(self.UFC_gas_path_system_obj.start))
+            .then(lambda _: AsyPromise(self.Startup_o2_span_air_calibration_obj.run))
+            .then(lambda _: AsyPromise(self.finish_start))
+            .catch(self._reject_o2_span_air_start)
+        )
+
+    def _reject_o2_span_air_start(self, error):
+        self.calibration_log_recorder.record(
+            "STARTUP_O2_SPAN_AIR_CALIBRATION",
+            {"type": "calibration_failed", "value": f"O2 Span+空气校准启动流程失败: {error}"},
+        )
+        return AsyPromise.log_and_reject(
+            error, logger=logger, message_prefix="O2 Span+空气校准启动流程失败"
+        )
     def _remember_ufc_start_status(self, startup_status):
         self.UFC_gas_path_system_obj.set_startup_status(startup_status)
         return startup_status
@@ -540,6 +597,10 @@ class UFC_UGC_ZOS_index(MyQThread):
             self.UFC_gas_path_system_obj.ufc_gas_path_system_start_thread.is_stop=True
         global auto_wait_event,stop_flag
         stop_flag = True
+        if self.Startup_o2_span_air_calibration_obj is not None:
+            self.Startup_o2_span_air_calibration_obj.request_stop()
+            if self.Startup_o2_span_air_calibration_obj.is_running:
+                self.Startup_o2_span_air_calibration_obj.wait_until_finished(30)
         auto_wait_event.set()
         auto_wait_event.clear()
 
@@ -730,7 +791,7 @@ class UFC_UGC_ZOS_index(MyQThread):
         logger.critical(f"{self.name}<UNK>is_auto_calibration：{is_auto_calibration}")
         if startup_calibration_mode == "air_co2":
             startup_calibration_mode = "air"
-        if startup_calibration_mode not in {"none", "air", "zero", "span", "full"}:
+        if startup_calibration_mode not in {"none", "air", "zero", "span", "full", "o2_span_air", "co2_o2_span_air"}:
             # Only an explicitly selected startup mode may enter calibration.
             startup_calibration_mode = "none"
         global_setting.set_setting("startup_calibration_mode", startup_calibration_mode)
@@ -760,6 +821,17 @@ class UFC_UGC_ZOS_index(MyQThread):
             self.start_btn_handle_with_air_calibration().then(
                 lambda _: self.run_btn_handle().then(
                     lambda _: self.gas_state_check_handle().then(
+                        self.stop()
+                    ).catch(lambda e: logger.error(f"{e}"))
+                ).catch(lambda e: logger.error(f"{e}"))
+            ).catch(lambda e: logger.error(f"{e}"))
+        elif startup_calibration_mode in {"o2_span_air", "co2_o2_span_air"}:
+            include_co2_zero = startup_calibration_mode == "co2_o2_span_air"
+            self.start_btn_handle_with_o2_span_air_calibration(
+                include_co2_zero=include_co2_zero
+            ).then(
+                lambda _: self.run_btn_handle().then(
+                    lambda __: self.gas_state_check_handle().then(
                         self.stop()
                     ).catch(lambda e: logger.error(f"{e}"))
                 ).catch(lambda e: logger.error(f"{e}"))

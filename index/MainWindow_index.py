@@ -2651,7 +2651,7 @@ class MainWindow_Index(ThemedWindow):
         mode = global_setting.get_setting("startup_calibration_mode", None)
         if mode == "air_co2":
             mode = "air"
-        if mode not in {"none", "air", "zero", "span", "full"}:
+        if mode not in {"none", "air", "zero", "span", "full", "o2_span_air", "co2_o2_span_air"}:
             mode = "none"
         if global_setting.get_setting("environment_module_only", False):
             mode = "none"
@@ -2673,7 +2673,7 @@ class MainWindow_Index(ThemedWindow):
         mode = global_setting.get_setting("startup_calibration_mode", "none")
         if mode == "air_co2":
             mode = "air"
-        if mode not in {"none", "air", "zero", "span", "full"}:
+        if mode not in {"none", "air", "zero", "span", "full", "o2_span_air", "co2_o2_span_air"}:
             mode = "none"
         if global_setting.get_setting("environment_module_only", False):
             mode = "none"
@@ -2856,7 +2856,7 @@ class MainWindow_Index(ThemedWindow):
             startup_calibration_mode = "none"
         if startup_calibration_mode == "air_co2":
             startup_calibration_mode = "air"
-        if startup_calibration_mode not in {"none", "air", "zero", "span", "full"}:
+        if startup_calibration_mode not in {"none", "air", "zero", "span", "full", "o2_span_air", "co2_o2_span_air"}:
             startup_calibration_mode = "none"
 
         calibration_config = global_setting.get_setting('UFC_UGC_ZOS_config', {}).get('Calibration', {})
@@ -2880,6 +2880,31 @@ class MainWindow_Index(ThemedWindow):
             start_wait_times += calibration_timeout
             self.start_dialog.countdown_seconds = start_wait_times
             self.start_dialog.current_seconds = start_wait_times
+        elif startup_calibration_mode in {"o2_span_air", "co2_o2_span_air"}:
+            try:
+                target_points = max(
+                    int(float(calibration_config.get("o2_span_air_target_points", 25))), 5
+                )
+            except (TypeError, ValueError):
+                target_points = 25
+            try:
+                sample_interval = max(
+                    float(calibration_config.get("startup_air_calibration_channel_interval", 2)), 0.5
+                )
+            except (TypeError, ValueError):
+                sample_interval = 2.0
+            # Two five-minute gas flushes plus up to nine channels × target points.
+            calibration_wait = 2 * (300 + target_points * sample_interval * 9)
+            if startup_calibration_mode == "co2_o2_span_air":
+                try:
+                    calibration_wait += max(
+                        float(calibration_config.get("calibration_max_timeout", 300)), 300
+                    ) + 120
+                except (TypeError, ValueError):
+                    calibration_wait += 420
+            start_wait_times += calibration_wait
+            self.start_dialog.countdown_seconds = start_wait_times
+            self.start_dialog.current_seconds = start_wait_times
         elif startup_calibration_mode == "full":
             try:
                 # Zero and span each have their own bounded calibration window.
@@ -2890,7 +2915,7 @@ class MainWindow_Index(ThemedWindow):
             self.start_dialog.countdown_seconds = start_wait_times
             self.start_dialog.current_seconds = start_wait_times
 
-        if startup_calibration_mode in {"air", "zero", "span", "full"}:
+        if startup_calibration_mode in {"air", "zero", "span", "full", "o2_span_air", "co2_o2_span_air"}:
             self.init__calibration_windows()
             self.start_dialog.insert_calibration_dialog(self.calibration_details_windows)
 

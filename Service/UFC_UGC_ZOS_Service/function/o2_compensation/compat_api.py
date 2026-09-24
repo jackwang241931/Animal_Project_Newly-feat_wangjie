@@ -156,7 +156,10 @@ def start_new_o2_calibration(target_points: int | None = None):
     return bool(handler.start_new_calibration())
 
 
-def append_o2_calibration_data(channel, o2_partial, zos_temp, gas_pressure, o2_percent, zos_rh):
+def append_o2_calibration_data(
+    channel, o2_partial, zos_temp, gas_pressure, o2_percent, zos_rh,
+    sht_temp=None, sht_rh=None,
+):
     handler = get_o2_calibration_handler()
     success = bool(handler.add_data(
         channel=channel,
@@ -165,12 +168,12 @@ def append_o2_calibration_data(channel, o2_partial, zos_temp, gas_pressure, o2_p
         gas_pressure=gas_pressure,
         o2_percent=o2_percent,
         zos_rh=zos_rh,
+        sht_temp=sht_temp,
+        sht_rh=sht_rh,
     ))
     if success:
         reload_o2_compensation_config()
     return success
-
-
 def get_o2_calibration_status():
     status = get_o2_calibration_handler().get_status()
     if not isinstance(status, dict):
@@ -222,14 +225,26 @@ def calculate_o2_compensated(
         return -1
 
     try:
-        result = _core.calculate_o2_compensated(
-            channel_id,
-            o2_partial_press,
-            zos_temp,
-            gas_total_press,
-            o2_raw_pct,
-            zos_rh,
-        )
+        parameters = inspect.signature(_core.calculate_o2_compensated).parameters
+        if "sht_temp" in parameters or len(parameters) >= 7:
+            result = _core.calculate_o2_compensated(
+                channel_id,
+                o2_partial_press,
+                zos_temp,
+                gas_total_press,
+                o2_raw_pct,
+                None,
+                zos_rh,
+            )
+        else:
+            result = _core.calculate_o2_compensated(
+                channel_id,
+                o2_partial_press,
+                zos_temp,
+                gas_total_press,
+                o2_raw_pct,
+                zos_rh,
+            )
         numeric_result = float(result)
         if not math.isfinite(numeric_result):
             return -1

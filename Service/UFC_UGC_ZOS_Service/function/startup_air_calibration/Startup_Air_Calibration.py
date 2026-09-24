@@ -373,7 +373,7 @@ class Startup_Air_Calibration:
                 f"{self.name}: CO2 time sync tolerance adjusted to {channel_gap_window:.1f}s "
                 f"for {active_channel_count} sequential channels"
             )
-        self.o2_calibration_handler.start_new_calibration()
+        self.o2_calibration_handler.start_air_touchup()
         self.o2_calibration_filter = WetOxygenReferenceFilter()
         for channel in self.o2_calibration_handler.channels:
             self.o2_calibration_filter.set_initial_references(

@@ -611,7 +611,7 @@ class ExperimentControlPage(_BaseWorkflowPage):
         calibration_card = QFrame(); calibration_card.setProperty("card", True)
         calibration_box = QVBoxLayout(calibration_card); calibration_box.setContentsMargins(14, 12, 14, 12)
         calibration_box.setSpacing(10)
-        calibration_card.setMinimumHeight(300)
+        calibration_card.setMinimumHeight(370)
         calibration_box.addWidget(QLabel("空气校准"))
         self.calibration_status = QLabel("待校准"); self.calibration_status.setProperty("value", True)
         calibration_box.addWidget(self.calibration_status)
@@ -643,6 +643,18 @@ class ExperimentControlPage(_BaseWorkflowPage):
             self.calibration_buttons[key] = button
             control_grid.addWidget(button, 1, column)
         calibration_box.addLayout(control_grid)
+        archive_flow_row = QHBoxLayout()
+        for key, title in (
+            ("o2_span_air", "O₂ Span+空气校准"),
+            ("co2_o2_span_air", "CO₂校零+O₂ Span+空气校准"),
+        ):
+            button = QPushButton(title)
+            button.clicked.connect(
+                lambda _checked=False, selected=key: self._select_startup_calibration(selected)
+            )
+            self.calibration_buttons[key] = button
+            archive_flow_row.addWidget(button)
+        calibration_box.addLayout(archive_flow_row)
         self.calibration_evidence = QLabel("校准读数（采样流量、O₂、CO₂、气室压差、气室温度）：未知")
         self.calibration_evidence.setProperty("hint", True); self.calibration_evidence.setVisible(True); calibration_box.addWidget(self.calibration_evidence)
         self._update_calibration_buttons()
@@ -972,6 +984,8 @@ class ExperimentControlPage(_BaseWorkflowPage):
             "zero": ("zero", "校零"),
             "span": ("span", "校量程"),
             "all": ("full", "校零且量程"),
+            "o2_span_air": ("o2_span_air", "O₂ Span+空气校准"),
+            "co2_o2_span_air": ("co2_o2_span_air", "CO₂校零+O₂ Span+空气校准"),
         }[key]
         current_mode = global_setting.get_setting("startup_calibration_mode", "none")
         if current_mode == mode:
@@ -1036,6 +1050,14 @@ class ExperimentControlPage(_BaseWorkflowPage):
             and not getattr(self, "_last_can_stop", False)
         )
 
+        selected_mode = global_setting.get_setting("startup_calibration_mode", "none")
+        for key, title in (
+            ("o2_span_air", "O₂ Span+空气校准"),
+            ("co2_o2_span_air", "CO₂校零+O₂ Span+空气校准"),
+        ):
+            button = self.calibration_buttons[key]
+            button.setEnabled(startup_ready and not active)
+            button.setText(f"已选择：{title}" if selected_mode == key else title)
     def on_calibration_event(self, event: str) -> None:
         """React to the same zero/span start and finish events used by the legacy UI."""
         channel, _, phase = event.partition("_")

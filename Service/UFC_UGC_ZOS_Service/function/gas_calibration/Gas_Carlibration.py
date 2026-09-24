@@ -526,6 +526,7 @@ class Zero_Carlibration(Gas_Carlibration, MyQThread):
     def __init__(self):
         self.title = GapSystem_Running_Type.ZERO_CALIBRATION
         self.port = None
+        self.co2_only_mode = False
         Gas_Carlibration.__init__(self, title=self.title, type=Gas_Carlibration_Type.ZERO)
         MyQThread.__init__(self, name='Zero_Carlibration_thread')
 
@@ -2277,6 +2278,30 @@ def _patched_zero_dosomething_v2(self):
         f"{time_util.get_format_from_time(time.time())} | 零点标定前关闭reference气电磁阀（空气阀）已临时跳过",
         title=self.title
     )
+    if getattr(self, "co2_only_mode", False):
+        self.update_status_main_signal_gui_update.send(
+            f"{time_util.get_format_from_time(time.time())} | 组合流程：执行旧CO2零点逻辑，跳过旧O2零点采样",
+            title=self.title,
+        )
+        AsyPromise(self.open_ugc_zero_or_span_valve, port=self.port).then(
+            lambda _: AsyPromise(self.open_zos_zero_or_span_valve, port=self.port).then(
+                lambda __: AsyPromise(self.start_ufc_if_needed_for_zero, port=self.port).then(
+                    lambda ___: AsyPromise(self.open_gas_pump_and_flow_for_zero, port=self.port).then(
+                        lambda ____: AsyPromise(self.wait_one_minute_for_zero, step_desc="开启气泵后等待一分钟").then(
+                            lambda _____: AsyPromise(
+                                self.cyclic_sampling_of_ugc_carbon_sensor, port=self.port
+                            ).then(
+                                lambda ______: AsyPromise(
+                                    self.zero_finalize_flow, port=self.port
+                                ).then(lambda _______: self.stop()).catch(lambda e: self.stop())
+                            ).catch(lambda e: self.stop())
+                        ).catch(lambda e: self.stop())
+                    ).catch(lambda e: self.stop())
+                ).catch(lambda e: self.stop())
+            ).catch(lambda e: self.stop())
+        ).catch(lambda e: self.stop())
+        return
+
     AsyPromise(self.open_ugc_zero_or_span_valve, port=self.port).then(
         lambda _: AsyPromise(self.open_zos_zero_or_span_valve, port=self.port).then(
             lambda __: AsyPromise(self.start_ufc_if_needed_for_zero, port=self.port).then(
@@ -2294,8 +2319,6 @@ def _patched_zero_dosomething_v2(self):
             ).catch(lambda e: self.stop())
         ).catch(lambda e: self.stop())
     ).catch(lambda e: self.stop())
-
-
 def _patched_range_dosomething_v2(self):
     self.ufc_started_by_calibration = False
     self.defer_zos_close_until_finalize = True
