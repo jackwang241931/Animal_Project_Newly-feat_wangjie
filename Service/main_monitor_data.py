@@ -48,6 +48,7 @@ from public.function.weight.weight_window_assembler import (
 )
 from public.util.cage_light_state_util import (
     build_cage_light_commands,
+    build_cage_light_state_change_commands,
     force_save_cage_lights_off,
     save_cage_light_state,
 )
@@ -778,6 +779,26 @@ def _send_cage_control_response(send_message, send_state, response_hex=None, det
             "response_hex": response_text,
         },
     )
+
+
+def _notify_internal_command_result(send_message, send_state, response_hex=None, detail=None):
+    """Return a queued control command's device result to its owner thread."""
+    if not isinstance(send_message, dict):
+        return
+    result_queue = send_message.get("_internal_result_queue")
+    if result_queue is None:
+        return
+    try:
+        result_queue.put_nowait({
+            "success": bool(send_state),
+            "response_hex": str(response_hex or ""),
+            "detail": str(detail or ""),
+        })
+    except queue.Full:
+        pass
+    except Exception as error:
+        logger.warning(f"内部控制指令回执发送失败: {error}")
+
 
 def _notify_food_trough_current_off_success(response_hex=None, cage_number=None):
     """Show the success notice after the current-off command is acknowledged."""
@@ -1998,6 +2019,12 @@ class Send_thread(MyQThread):
                                 # logger.debug(
                                 #     f"气路切换操作完成 | 模块: {send_message.get('module_type')} | 操作: {send_message.get('switch_step')}")
                                 pass
+                            _notify_internal_command_result(
+                                send_message,
+                                send_state,
+                                response_hex=response_hex,
+                                detail=parser_message if not send_state else None,
+                            )
                         except queue.Empty:
                             self.priority_queue_empty=True
                             pass
@@ -2008,6 +2035,11 @@ class Send_thread(MyQThread):
                                     False,
                                     detail=f"发送异常：{error}",
                                 )
+                            _notify_internal_command_result(
+                                send_message,
+                                False,
+                                detail=f"发送异常：{error}",
+                            )
                             logger.exception(f"优先级控制指令处理失败: {error}")
                         send_message=None
                         # 处理普通消息
@@ -2462,6 +2494,11 @@ store_thread:Store_Thread = None
 periodic_xlsx_export_thread: PeriodicXlsxExportThread = None
 
 
+LIGHTING_COMMAND_MAX_ATTEMPTS = 3
+LIGHTING_COMMAND_RESULT_TIMEOUT_SECONDS = 5.0
+LIGHTING_COMMAND_RETRY_DELAY_MS = 200
+
+
 class LightingScheduleThread(QThread):
     def __init__(self, schedule, cages, sender, parent=None):
         super().__init__(parent)
@@ -2472,6 +2509,7 @@ class LightingScheduleThread(QThread):
         self._running = True
         self._force_apply = True
         self._last_signature = None
+        self._applied_states = {}
 
     def set_schedule(self, schedule, apply_now=False):
         with self._lock:
@@ -2505,6 +2543,9 @@ class LightingScheduleThread(QThread):
                         state["brightness"],
                     )
                     if force_apply or signature != self._last_signature:
+                        # A partial device failure is considered handled for
+                        # this stage after its bounded retries.  Do not retry
+                        # the entire stage every second and starve acquisition.
                         if self._apply_state(state):
                             self._last_signature = signature
             except Exception:
@@ -2519,35 +2560,103 @@ class LightingScheduleThread(QThread):
         if getattr(self._sender, "modbus", None) is None:
             logger.warning("lighting schedule waiting: modbus unavailable")
             return False
-        queued = 0
+        target_state = {
+            "power": bool(state["power"]),
+            "color_temperature": int(state["color_temperature"]),
+            "brightness": int(state["brightness"]),
+        }
+        attempted_sends = 0
+        successful_cages = []
+        failed_cages = []
         for cage in self._cages:
-            commands = build_cage_light_commands(
+            commands = build_cage_light_state_change_commands(
                 cage,
                 state["power"],
                 state["color_temperature"],
                 state["brightness"],
                 port=global_setting.get_setting("port", None),
+                previous_state=self._applied_states.get(cage),
             )
+            cage_success = True
             for command in commands:
-                self._sender.add_message(
-                    message={"message": command},
-                    urgent=True,
-                    origin="lighting_schedule",
+                command_success, attempts = self._send_command_with_retry(cage, command)
+                attempted_sends += attempts
+                if not command_success:
+                    cage_success = False
+                    break
+            if cage_success:
+                self._applied_states[cage] = dict(target_state)
+                save_cage_light_state(
+                    [cage],
+                    state["power"],
+                    state["color_temperature"],
+                    state["brightness"],
                 )
-                queued += 1
-        save_cage_light_state(
-            self._cages,
-            state["power"],
-            state["color_temperature"],
-            state["brightness"],
-        )
+                successful_cages.append(cage)
+            else:
+                # Some earlier steps may already have reached the hardware;
+                # mark it unknown so the next stage sends a complete sequence.
+                self._applied_states.pop(cage, None)
+                failed_cages.append(cage)
         logger.info(
             "lighting schedule applied: "
             f"stage={state['stage_key']}, cages={self._cages}, power={state['power']}, "
             f"color_temperature={state['color_temperature']}, brightness={state['brightness']}, "
-            f"transitioning={state['transitioning']}, queued={queued}"
+            f"successful_cages={successful_cages}, failed_cages={failed_cages}, "
+            f"attempted_sends={attempted_sends}"
         )
         return True
+
+    def _send_command_with_retry(self, cage, command):
+        step = command.get("switch_step", "unknown")
+        for attempt in range(1, LIGHTING_COMMAND_MAX_ATTEMPTS + 1):
+            if self.isInterruptionRequested():
+                return False, attempt - 1
+            result_queue = queue.Queue(maxsize=1)
+            queued_command = dict(command)
+            queued_command["data"] = list(command.get("data", []))
+            queued_command["_internal_result_queue"] = result_queue
+            self._sender.add_message(
+                message={"message": queued_command},
+                urgent=True,
+                origin="lighting_schedule",
+            )
+            deadline = time.monotonic() + LIGHTING_COMMAND_RESULT_TIMEOUT_SECONDS
+            result = None
+            while not self.isInterruptionRequested():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    result = result_queue.get(timeout=min(0.1, remaining))
+                    break
+                except queue.Empty:
+                    continue
+
+            if result is not None and result.get("success"):
+                logger.info(
+                    "lighting command succeeded: "
+                    f"cage={cage}, step={step}, attempt={attempt}, "
+                    f"response={result.get('response_hex', '')}"
+                )
+                return True, attempt
+
+            failure_detail = "等待设备回执超时" if result is None else (
+                result.get("detail") or result.get("response_hex") or "设备未返回有效响应"
+            )
+            logger.warning(
+                "lighting command failed: "
+                f"cage={cage}, step={step}, attempt={attempt}/{LIGHTING_COMMAND_MAX_ATTEMPTS}, "
+                f"detail={failure_detail}"
+            )
+            if attempt < LIGHTING_COMMAND_MAX_ATTEMPTS:
+                self.msleep(LIGHTING_COMMAND_RETRY_DELAY_MS)
+
+        logger.error(
+            "lighting command abandoned after bounded retries: "
+            f"cage={cage}, step={step}, attempts={LIGHTING_COMMAND_MAX_ATTEMPTS}"
+        )
+        return False, LIGHTING_COMMAND_MAX_ATTEMPTS
 
 
 lighting_schedule_thread: LightingScheduleThread = None

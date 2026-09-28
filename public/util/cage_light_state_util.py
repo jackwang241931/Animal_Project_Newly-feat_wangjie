@@ -58,6 +58,49 @@ def build_cage_light_commands(cage_number, power, color_temperature=7, brightnes
     ]
 
 
+def build_cage_light_state_change_commands(
+    cage_number,
+    power,
+    color_temperature=7,
+    brightness=7,
+    port=None,
+    previous_state=None,
+):
+    """Build only the ENM commands required to reach the requested state.
+
+    When the previous hardware state is unknown, the complete safe sequence is
+    returned.  Turning a lamp on deliberately writes color and brightness
+    before the power command so that it cannot briefly light using stale
+    settings.
+    """
+    target_power = bool(power)
+    target_color = max(1, min(9, int(color_temperature)))
+    target_brightness = max(1, min(9, int(brightness))) if target_power else 0
+    commands = build_cage_light_commands(
+        cage_number,
+        target_power,
+        target_color,
+        target_brightness or 1,
+        port=port,
+    )
+
+    if not isinstance(previous_state, dict):
+        return commands
+
+    previous_power = bool(previous_state.get("power", False))
+    if not target_power:
+        return commands if previous_power else []
+    if not previous_power:
+        return commands
+
+    required_steps = set()
+    if int(previous_state.get("color_temperature", -1)) != target_color:
+        required_steps.add("light_color_temperature")
+    if int(previous_state.get("brightness", -1)) != target_brightness:
+        required_steps.add("light_brightness")
+    return [command for command in commands if command["switch_step"] in required_steps]
+
+
 def save_cage_light_state(cage_numbers, power, color_temperature=7, brightness=7):
     saved_cages = []
     for cage_number in _normalize_cage_numbers(cage_numbers):

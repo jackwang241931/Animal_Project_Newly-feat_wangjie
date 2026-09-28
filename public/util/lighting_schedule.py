@@ -1,4 +1,3 @@
-import copy
 from datetime import datetime, timedelta
 
 
@@ -27,7 +26,10 @@ def default_lighting_schedule():
         "version": 1,
         "enabled": False,
         "mode": DAILY_MODE,
-        "transition_minutes": 1,
+        # Retained in the persisted schema for backward compatibility.  The
+        # controller now applies each stage directly without intermediate
+        # brightness steps.
+        "transition_minutes": 0,
         "repeat": True,
         "start_at": "",
         "stages": [
@@ -57,9 +59,7 @@ def normalize_lighting_schedule(schedule):
     normalized["enabled"] = bool(schedule.get("enabled", False))
     mode = str(schedule.get("mode", DAILY_MODE)).lower()
     normalized["mode"] = mode if mode in {DAILY_MODE, STAGE_MODE} else DAILY_MODE
-    normalized["transition_minutes"] = max(
-        0, min(60, _safe_int(schedule.get("transition_minutes"), 1))
-    )
+    normalized["transition_minutes"] = 0
     normalized["repeat"] = bool(schedule.get("repeat", normalized["mode"] == DAILY_MODE))
     normalized["start_at"] = str(schedule.get("start_at") or "")
 
@@ -121,12 +121,12 @@ def resolve_lighting_state(schedule, now=None):
             return None
         stage, previous, elapsed_seconds, stage_key = resolved
 
-    state = _apply_transition(
-        stage=stage,
-        previous=previous,
-        elapsed_seconds=elapsed_seconds,
-        transition_seconds=schedule["transition_minutes"] * 60,
-    )
+    state = {
+        "power": bool(stage["power"]),
+        "color_temperature": stage["color_temperature"],
+        "brightness": stage["brightness"] if stage["power"] else 0,
+        "transitioning": False,
+    }
     state["stage_key"] = stage_key
     return state
 
@@ -215,37 +215,6 @@ def _resolve_duration_stage(schedule, now):
             return stage, previous, cycle_elapsed - cursor, f"stage:{cycle}:{index}"
         cursor += duration_seconds
     return None
-
-
-def _apply_transition(stage, previous, elapsed_seconds, transition_seconds):
-    target = copy.deepcopy(stage)
-    state = {
-        "power": bool(target["power"]),
-        "color_temperature": target["color_temperature"],
-        "brightness": target["brightness"] if target["power"] else 0,
-        "transitioning": False,
-    }
-    if transition_seconds <= 0 or elapsed_seconds >= transition_seconds:
-        return state
-
-    ratio = max(0.0, min(1.0, elapsed_seconds / transition_seconds))
-    if target["power"]:
-        start_level = previous["brightness"] if previous.get("power") else MIN_LIGHT_LEVEL
-        target_level = target["brightness"]
-        state["brightness"] = _clamp_level(
-            round(start_level + (target_level - start_level) * ratio), target_level
-        )
-        state["transitioning"] = state["brightness"] != target_level
-    elif previous.get("power"):
-        previous_level = _clamp_level(previous.get("brightness"), 1)
-        level = max(MIN_LIGHT_LEVEL, round(previous_level * (1.0 - ratio)))
-        state.update({
-            "power": True,
-            "color_temperature": _clamp_level(previous.get("color_temperature"), 7),
-            "brightness": level,
-            "transitioning": True,
-        })
-    return state
 
 
 def _parse_start_at(value):

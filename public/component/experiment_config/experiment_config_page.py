@@ -607,7 +607,6 @@ class ExperimentConfigPage(QWidget):
         layout.addWidget(self.lighting_enabled)
         self.lighting_mode = self._field(layout, "运行模式", "每日定时", True)
         self.lighting_mode.clear(); self.lighting_mode.addItems(["每日定时", "阶段实验"])
-        self.lighting_transition = self._field(layout, "渐变过渡（分钟）", str(schedule["transition_minutes"]))
         stage_grid = QGridLayout(); stage_grid.setHorizontalSpacing(6)
         self._lighting_stages = []
         for index, stage in enumerate(schedule["stages"][:4]):
@@ -1678,7 +1677,7 @@ class ExperimentConfigPage(QWidget):
         return normalize_lighting_schedule({
             "enabled": self.lighting_enabled.isChecked(),
             "mode": "stage" if self.lighting_mode.currentIndex() == 1 else "daily",
-            "transition_minutes": int(self.lighting_transition.text() or 0),
+            "transition_minutes": 0,
             "repeat": True,
             "stages": stages or default_lighting_schedule()["stages"],
         })
