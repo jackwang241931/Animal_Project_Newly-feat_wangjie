@@ -27,6 +27,15 @@ class Send_Message:
 
     def _send_with_retry(self, max_retries=3):
         """带重试机制的发送方法"""
+        if global_setting.get_setting("ufc_emergency_shutdown_active", False):
+            error_msg = "系统正在执行UFC异常关泵，已阻止后续普通气路指令"
+            logger.critical(error_msg)
+            return None, None, False, {
+                "data": [{"desc": "备注", "value": error_msg}],
+                "response_state": False,
+                "response_msg": error_msg,
+            }
+
         for attempt in range(max_retries + 1):  # 包含初次发送 + 3次重试
             try:
                 logger.info(f"发送尝试 {attempt + 1}/{max_retries + 1}: {self.send_message}")

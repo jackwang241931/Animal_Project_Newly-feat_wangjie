@@ -43,6 +43,88 @@ system_health_snapshot_queue = None
 process_health_reporters = {}
 process_health_reporters_lock = threading.Lock()
 single_instance_lock_handle = None
+ufc_emergency_shutdown_request = None
+ufc_emergency_shutdown_complete = None
+ufc_emergency_shutdown_result = None
+ufc_emergency_shutdown_lock = threading.Lock()
+ufc_emergency_shutdown_requested = False
+
+
+def request_emergency_ufc_shutdown(reason, timeout_seconds=12.0):
+    """Ask the still-running monitor-data process to stop the UFC pump.
+
+    A native crash in the GUI bypasses Qt/Python cleanup callbacks. The
+    parent supervisor therefore requests this before terminating children.
+    """
+    global ufc_emergency_shutdown_requested
+    request_event = ufc_emergency_shutdown_request
+    complete_event = ufc_emergency_shutdown_complete
+    result_value = ufc_emergency_shutdown_result
+    if request_event is None or complete_event is None or result_value is None:
+        logger.error(
+            f"UFC emergency shutdown unavailable: reason={reason}, "
+            "IPC channel is not initialized"
+        )
+        return False
+
+    monitor_process = None
+    if monitor is not None:
+        monitor_info = monitor.processes.get("p_monitor_data", {})
+        monitor_process = monitor_info.get("process")
+    if monitor_process is None or not monitor_process.is_alive():
+        logger.error(
+            f"UFC emergency shutdown unavailable: reason={reason}, "
+            "p_monitor_data is not running"
+        )
+        return False
+
+    # Both the process-monitor thread and the controller loop can observe the
+    # same GUI crash.  Only the first caller sends the request, but every
+    # caller must wait for the same completion event; otherwise one caller can
+    # tear down p_monitor_data while it is still executing the pump-off write.
+    should_signal = False
+    with ufc_emergency_shutdown_lock:
+        if not ufc_emergency_shutdown_requested:
+            complete_event.clear()
+            with result_value.get_lock():
+                result_value.value = 0
+            ufc_emergency_shutdown_requested = True
+            should_signal = True
+
+    if should_signal:
+        logger.critical(
+            f"UFC emergency shutdown requested before child cleanup: reason={reason}"
+        )
+        request_event.set()
+    else:
+        logger.warning(
+            "UFC emergency shutdown already in progress; waiting for the same "
+            f"result: reason={reason}"
+        )
+
+    if not complete_event.wait(timeout=max(float(timeout_seconds), 0.1)):
+        logger.critical(
+            f"UFC emergency shutdown timed out after {timeout_seconds:.1f}s: "
+            f"reason={reason}"
+        )
+        return False
+
+    with result_value.get_lock():
+        result = int(result_value.value)
+    if result == 1:
+        logger.critical(
+            f"UFC emergency shutdown confirmed: pump is off, reason={reason}"
+        )
+        return True
+    if result == 2:
+        logger.critical(
+            f"UFC emergency shutdown command acknowledged but state verification "
+            f"was unavailable: reason={reason}"
+        )
+        return False
+
+    logger.critical(f"UFC emergency shutdown failed: reason={reason}")
+    return False
 
 
 def get_main_program_dir():
@@ -484,6 +566,10 @@ def on_critical_failure(process_id, **kwargs):
     logger.critical(
         error_msg
     )
+    if process_id == "p_main_gui" and kwargs.get("exitcode") not in (None, 0):
+        request_emergency_ufc_shutdown(
+            f"critical process {process_id} exited with code {kwargs.get('exitcode')}"
+        )
     # main_gui.on_crash(error_msg)
 def on_shutdown_triggered(process_id, **kwargs):
     failed_processes = kwargs.get('failed_processes', [])
@@ -541,12 +627,18 @@ def test_integrated_monitor():
     atexit.register(release_single_instance_lock)
 
     global runtime_diagnostics_queue, system_health_snapshot_queue, process_health_reporters
+    global ufc_emergency_shutdown_request, ufc_emergency_shutdown_complete
+    global ufc_emergency_shutdown_result, ufc_emergency_shutdown_requested
     runtime_diagnostics_queue = multiprocessing.Queue(maxsize=2048)
     # Health is deliberately a separate, bounded queue.  The runtime
     # diagnostics queue below has a single file-log consumer and must not be
     # consumed by the GUI.
     system_health_snapshot_queue = multiprocessing.Queue(maxsize=512)
     process_health_reporters = {}
+    ufc_emergency_shutdown_request = multiprocessing.Event()
+    ufc_emergency_shutdown_complete = multiprocessing.Event()
+    ufc_emergency_shutdown_result = multiprocessing.Value('i', 0)
+    ufc_emergency_shutdown_requested = False
     diagnostics_thread = threading.Thread(
         target=runtime_diagnostics_writer,
         args=(runtime_diagnostics_queue,),
@@ -645,7 +737,14 @@ def test_integrated_monitor():
     monitor.start_worker(
         target_func=main_monitor_data.main,
         restart_target_func=main_monitor_data.restart,
-        args=(q, send_message_q, system_health_snapshot_queue),
+        args=(
+            q,
+            send_message_q,
+            system_health_snapshot_queue,
+            ufc_emergency_shutdown_request,
+            ufc_emergency_shutdown_complete,
+            ufc_emergency_shutdown_result,
+        ),
         name="p_monitor_data",
         auto_restart=True,
         log_config=p_monitor_data_config
@@ -734,6 +833,10 @@ def test_integrated_monitor():
             gui_process_info = monitor.processes.get("p_main_gui", {})
             gui_process = gui_process_info.get("process")
             if gui_process is not None and not gui_process.is_alive():
+                if gui_process.exitcode not in (None, 0):
+                    request_emergency_ufc_shutdown(
+                        f"controller observed p_main_gui exit code {gui_process.exitcode}"
+                    )
                 emit_runtime_diagnostic(
                     "process_monitor",
                     "controller_stopping",

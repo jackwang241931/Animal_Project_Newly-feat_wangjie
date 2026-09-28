@@ -89,6 +89,167 @@ _health_snapshot_queue = None
 _health_reporters = {}
 _health_reporters_lock = threading.RLock()
 _health_last_success_report_at = {}
+_ufc_emergency_shutdown_thread = None
+ufc_ugc_zos_thread = None
+
+
+def _stop_ufc_activity_before_emergency_command():
+    """Prevent an in-flight UFC startup worker from reopening the pump."""
+    controller = ufc_ugc_zos_thread
+    if controller is None:
+        return
+    ufc = getattr(controller, "UFC_gas_path_system_obj", None)
+    if ufc is None:
+        return
+
+    start_thread = getattr(ufc, "ufc_gas_path_system_start_thread", None)
+    if start_thread is not None:
+        start_thread.is_stop = True
+    run_thread = getattr(ufc, "ufc_gas_path_system_run_thread", None)
+    if run_thread is not None and run_thread.isRunning():
+        run_thread.stop()
+
+
+def _extract_ufc_pump_state(parsed_response):
+    if not isinstance(parsed_response, dict):
+        return None
+    for item in parsed_response.get("data") or []:
+        if isinstance(item, dict) and item.get("desc") == "气泵":
+            try:
+                value = int(item.get("value"))
+            except (TypeError, ValueError):
+                return None
+            return value if value in (0, 1) else None
+    return None
+
+
+def emergency_stop_ufc_pump():
+    """Synchronously stop and verify the UFC pump after a GUI crash.
+
+    Returns 1 when pump-off was verified, 2 when the write was acknowledged
+    but state verification was unavailable, and 0 when the write failed.
+    """
+    # From this point onward no asynchronous gas-path/calibration callback may
+    # issue another command.  The emergency write below bypasses the regular
+    # Send_Message wrapper, so it remains allowed.
+    global_setting.set_setting("ufc_emergency_shutdown_active", True)
+
+    port = global_setting.get_setting("port", None)
+    modbus = global_setting.get_setting("modbus", None)
+    if port is None or modbus is None:
+        logger.critical(
+            "UFC emergency shutdown failed: serial port or Modbus instance is missing"
+        )
+        return 0
+
+    _stop_ufc_activity_before_emergency_command()
+    serial_lock = global_setting.get_setting("serial_lock", None)
+    if serial_lock is None:
+        logger.critical("UFC emergency shutdown failed: serial lock is missing")
+        return 0
+    if not serial_lock.acquire(timeout=5.0):
+        logger.critical("UFC emergency shutdown failed: serial lock timeout")
+        return 0
+
+    try:
+        logger.critical(
+            "UFC emergency shutdown: sending pump-off command "
+            "slave=2 function=5 data=000A0000"
+        )
+        _, response_hex, send_state, _ = modbus.send_command(
+            slave_id="2",
+            function_code="5",
+            data_hex_list=number_util.set_int_to_4_bytes_list("000A0000"),
+            is_parse_response=False,
+        )
+        if not send_state:
+            logger.critical(
+                f"UFC emergency shutdown command failed: response={response_hex}"
+            )
+            return 0
+
+        for attempt in range(1, 4):
+            time.sleep(0.2)
+            state_response, state_hex, state_ok, _ = modbus.send_command(
+                slave_id="2",
+                function_code="1",
+                data_hex_list=number_util.set_int_to_4_bytes_list("C"),
+                is_parse_response=False,
+            )
+            if not state_ok or state_response is None:
+                logger.warning(
+                    "UFC emergency shutdown state read failed: "
+                    f"attempt={attempt}, response={state_hex}"
+                )
+                continue
+            try:
+                parsed, _ = modbus.parse_response(
+                    response=state_response,
+                    response_hex=state_response.hex(),
+                    send_state=True,
+                    slave_id="2",
+                    function_code="1",
+                )
+            except Exception as error:
+                logger.warning(
+                    "UFC emergency shutdown state parse failed: "
+                    f"attempt={attempt}, error={error}"
+                )
+                continue
+            pump_state = _extract_ufc_pump_state(parsed)
+            logger.critical(
+                "UFC emergency shutdown state read: "
+                f"attempt={attempt}, air_pump={pump_state}"
+            )
+            if pump_state == 0:
+                global_setting.set_setting("ufc_start_time_state", False)
+                return 1
+
+        logger.critical(
+            "UFC emergency shutdown command was acknowledged, "
+            "but pump-off state was not verified"
+        )
+        return 2
+    except Exception as error:
+        logger.exception(f"UFC emergency shutdown raised an exception: {error}")
+        return 0
+    finally:
+        serial_lock.release()
+
+
+def _watch_ufc_emergency_shutdown(request_event, complete_event, result_value):
+    logger.info("UFC emergency shutdown watcher started")
+    while True:
+        request_event.wait()
+        request_event.clear()
+        result = 0
+        try:
+            result = emergency_stop_ufc_pump()
+        except BaseException as error:
+            # This thread is the last software safety path before the worker is
+            # terminated.  Never leave the parent waiting just because an
+            # unexpected library/native-wrapper exception escaped.
+            logger.exception(
+                f"UFC emergency shutdown watcher failed unexpectedly: {error}"
+            )
+        finally:
+            with result_value.get_lock():
+                result_value.value = int(result)
+            complete_event.set()
+
+
+def _start_ufc_emergency_shutdown_watcher(
+        request_event, complete_event, result_value):
+    global _ufc_emergency_shutdown_thread
+    if request_event is None or complete_event is None or result_value is None:
+        return
+    _ufc_emergency_shutdown_thread = threading.Thread(
+        target=_watch_ufc_emergency_shutdown,
+        args=(request_event, complete_event, result_value),
+        name="ufc_emergency_shutdown_watcher",
+        daemon=True,
+    )
+    _ufc_emergency_shutdown_thread.start()
 
 
 def _set_health_snapshot_queue(health_snapshot_queue):
@@ -2849,7 +3010,10 @@ def store_data_with_result(return_data_struct, need_result=False, timeout=None):
 #     if wait_UFC_UGC_ZOS_start_event is not None:
 #         wait_UFC_UGC_ZOS_start_event.set()
 #         wait_UFC_UGC_ZOS_start_event.clear()  # 重置事件
-def main(q, send_message_q, health_snapshot_queue=None):
+def main(q, send_message_q, health_snapshot_queue=None,
+         emergency_shutdown_request=None,
+         emergency_shutdown_complete=None,
+         emergency_shutdown_result=None):
 
     # logger.remove(0)
     # 加载日志配置
@@ -2873,6 +3037,12 @@ def main(q, send_message_q, health_snapshot_queue=None):
     global_setting.set_setting("cage_number_list_index", None)
     global_setting.set_setting("queue", q)
     global_setting.set_setting("send_message_queue", send_message_q)
+    global_setting.set_setting("ufc_emergency_shutdown_active", False)
+    _start_ufc_emergency_shutdown_watcher(
+        emergency_shutdown_request,
+        emergency_shutdown_complete,
+        emergency_shutdown_result,
+    )
     #设置线程屏障，等待4个线程 ufc ugc zos的run还有鼠笼内的模块线程的send_message_thread
     # barrier专门用于多个线程需要在某个点同步等待的场景。每个线程执行完自己的工作后调用
     # barrier.wait()，当所有线程都到达这个同步点时，它们会同时继续执行下一轮循环。
@@ -3055,8 +3225,18 @@ def stop_calibration():
     if ufc_ugc_zos_thread is not None:
         ufc_ugc_zos_thread.stop_calibration_btn_start()
     pass
-def restart(q, send_message_q, health_snapshot_queue=None):
-    main(q, send_message_q, health_snapshot_queue=health_snapshot_queue)
+def restart(q, send_message_q, health_snapshot_queue=None,
+            emergency_shutdown_request=None,
+            emergency_shutdown_complete=None,
+            emergency_shutdown_result=None):
+    main(
+        q,
+        send_message_q,
+        health_snapshot_queue=health_snapshot_queue,
+        emergency_shutdown_request=emergency_shutdown_request,
+        emergency_shutdown_complete=emergency_shutdown_complete,
+        emergency_shutdown_result=emergency_shutdown_result,
+    )
     start()
 def pause():
     logger.info(f"{'-' * 30}monitor_data_pause{'-' * 30}")
