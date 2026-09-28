@@ -12,6 +12,7 @@ from loguru import logger
 
 VALID_CHANNELS = ["REF"] + [f"M{i}" for i in range(1, 9)]
 AIR_NOMINAL = 20.93
+_k17 = 0.75
 
 _COMPENSATOR_LOCK = threading.Lock()
 _COMPENSATOR = None
@@ -129,8 +130,11 @@ class RealtimeO2Compensator:
             self.ref_corr = corr
             return float(self.air_lock) if self.has_valid_reference_sample() else None
         if not self.has_valid_reference_sample():
+            # A chamber value without a real REF sample is not measurable.
+            # Do not substitute air_lock (20.93), because that would turn
+            # missing reference data into an apparently valid observation.
             return None
-        return float(self.air_lock + (corr - self.ref_corr))
+        return float(self.air_lock + _k17 * (corr - self.ref_corr))
 
 
 def get_realtime_o2_compensator():
