@@ -153,19 +153,39 @@ def emergency_stop_ufc_pump():
         return 0
 
     try:
-        logger.critical(
-            "UFC emergency shutdown: sending pump-off command "
-            "slave=2 function=5 data=000A0000"
-        )
-        _, response_hex, send_state, _ = modbus.send_command(
-            slave_id="2",
-            function_code="5",
-            data_hex_list=number_util.set_int_to_4_bytes_list("000A0000"),
-            is_parse_response=False,
-        )
-        if not send_state:
+        # A crash can be detected while another UFC request is finishing.  In
+        # that case the first response may belong to the old request (the
+        # field log contained exactly this situation).  Keep the serial lock
+        # and retry the safety command before allowing process cleanup.
+        pump_off_acknowledged = False
+        for write_attempt in range(1, 4):
             logger.critical(
-                f"UFC emergency shutdown command failed: response={response_hex}"
+                "UFC emergency shutdown: sending pump-off command "
+                f"attempt={write_attempt}/3, slave=2 function=5 data=000A0000"
+            )
+            _, response_hex, send_state, _ = modbus.send_command(
+                slave_id="2",
+                function_code="5",
+                data_hex_list=number_util.set_int_to_4_bytes_list("000A0000"),
+                is_parse_response=False,
+            )
+            if send_state:
+                pump_off_acknowledged = True
+                logger.critical(
+                    "UFC emergency shutdown pump-off command acknowledged: "
+                    f"attempt={write_attempt}, response={response_hex}"
+                )
+                break
+            logger.critical(
+                "UFC emergency shutdown pump-off attempt failed: "
+                f"attempt={write_attempt}, response={response_hex}"
+            )
+            time.sleep(0.3)
+
+        if not pump_off_acknowledged:
+            logger.critical(
+                "UFC emergency shutdown failed: pump-off command was not "
+                "acknowledged after 3 attempts"
             )
             return 0
 

@@ -50,7 +50,7 @@ ufc_emergency_shutdown_lock = threading.Lock()
 ufc_emergency_shutdown_requested = False
 
 
-def request_emergency_ufc_shutdown(reason, timeout_seconds=12.0):
+def request_emergency_ufc_shutdown(reason, timeout_seconds=20.0):
     """Ask the still-running monitor-data process to stop the UFC pump.
 
     A native crash in the GUI bypasses Qt/Python cleanup callbacks. The
