@@ -597,7 +597,7 @@ class StartupCompletionContractTests(unittest.TestCase):
             source,
         )
 
-    def test_gas_shutdown_only_stops_calibration_workers_when_they_are_running(self):
+    def test_gas_shutdown_cancels_active_calibrations_before_stopping_paths(self):
         path = (
             PROJECT_ROOT
             / "Service"
@@ -618,11 +618,15 @@ class StartupCompletionContractTests(unittest.TestCase):
             ),
         )
 
-        self.assertNotIn("Zero_carlibration_obj.stop_calibrate", stop_source)
-        self.assertNotIn("Range_carlibration_obj.stop_calibrate", stop_source)
-        self.assertIn("Zero_carlibration_obj.isRunning()", calibration_source)
-        self.assertIn("Range_carlibration_obj.isRunning()", calibration_source)
-        self.assertIn("return AsyPromise(self.finished_stop)", calibration_source)
+        calibration_source = ast.get_source_segment(text, _class_method(path, "UFC_UGC_ZOS_index", "_request_stop_active_calibrations"))
+        self.assertLess(stop_source.index("self._request_stop_active_calibrations()"), stop_source.index("self._stop_gas_paths_then_finish("))
+        self.assertIn("calibration.isRunning()", calibration_source)
+        self.assertIn("is_STOP", calibration_source)
+        self.assertIn("stop_calibrate(", calibration_source)
+        self.assertIn("calibration.stop()", calibration_source)
+        finish_source = ast.get_source_segment(text, _class_method(path, "UFC_UGC_ZOS_index", "_stop_active_calibrations_then_finish"))
+        self.assertIn("self._request_stop_active_calibrations()", finish_source)
+        self.assertIn("return AsyPromise(self.finished_stop)", finish_source)
 
     def test_selected_calibration_route_keeps_stop_detail_messages(self):
         from index.MainWindow_index import MainWindow_Index

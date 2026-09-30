@@ -451,18 +451,25 @@ class UFC_gas_path_system_close_thread(MyQThread):
         self.send_thread: Send_Message = Send_Message(
             update_status_main_signal_gui_update=self.update_status_main_signal_gui_update,
             send_message=self.send_message)
+        self.close_error = None
         super().__init__(name=name)
     def before_Runing_work(self):
         pass
     def dosomething(self):
         port = global_setting.get_setting("port", None)
         if port is None:
-            self.update_status_main_signal_gui_update.send(
-                f"{time_util.get_format_from_time(time.time())} | 启动失败，未选择串口！")
+            self._finish_close_failure("未选择串口，无法关闭UFC")
             return
         AsyPromise(self.close_Gas_flow_rate_valve, port=port).then(
             lambda _: self.stop()
-        ).catch(lambda e: logger.error(f"{e}"))
+        ).catch(self._finish_close_failure)
+
+    def _finish_close_failure(self, error):
+        self.close_error = str(error)
+        logger.error(f"UFC关闭失败：{error}")
+        global wait_UFC_stop_finish_event
+        wait_UFC_stop_finish_event.set()
+        self.stop()
 
     def close_Gas_flow_rate_valve(self,resolve,reject,port):
         """1.气泵及设定鼠笼流量控制器关闭（新流程：直接关气泵，无需先关鼠笼和ZOS采样阀）"""
@@ -485,8 +492,10 @@ class UFC_gas_path_system_close_thread(MyQThread):
                                 time=time_util.get_format_from_time(time.time())))
         self.send_thread.send_message = self.send_message
         AsyPromise(self.send_thread.Send).then(
-            lambda r: AsyPromise(self.close_UFC_valve, port=port), resolve()
-        )
+            lambda _: AsyPromise(self.close_UFC_valve, port=port)
+        ).then(
+            lambda _: resolve()
+        ).catch(reject)
     def close_UFC_valve(self,resolve,reject,port):
         """2.UFC阀门关闭 让步骤3延迟1分钟在关闭"""
         queue = global_setting.get_setting("queue", None)
@@ -521,14 +530,13 @@ class UFC_gas_path_system_close_thread(MyQThread):
             lambda _:AsyPromise(self.finish_close).then(
                 lambda r:resolve()
             ).catch(lambda e: logger.error(f"{e}"))
-        ).catch(lambda e: logger.error(f"{e}"))
+        ).catch(reject)
 
     def finish_close(self,resolve,reject):
         global_setting.set_setting("ufc_start_time_state", False)
         # 释放 正在等待ufc启动的地方
         global wait_UFC_stop_finish_event
         wait_UFC_stop_finish_event.set()
-        wait_UFC_stop_finish_event.clear()
         self.update_status_main_signal_gui_update.send(
             f"{time_util.get_format_from_time(time.time())} | UFC 已关闭")
         # 返回响应
@@ -795,6 +803,10 @@ class UFC_gas_path_system(Gas_path_system):
         停止气路
         :return:
         """
+        port = global_setting.get_setting("port", None)
+        if port is None:
+            reject("未选择串口，无法确认UFC关闭")
+            return
         time.sleep(0.01)
         self.update_status_main_signal_gui_update.send(f"{time_util.get_format_from_time(time.time())} | UFC 正在停止{'.'*100}")
         if self.ufc_gas_path_system_run_thread is not None:
@@ -806,11 +818,34 @@ class UFC_gas_path_system(Gas_path_system):
             self.ufc_gas_path_system_start_thread.stop()
             self.ufc_gas_path_system_start_thread.deleteLater()
             self.ufc_gas_path_system_start_thread=None
-        self.ufc_gas_path_system_close_thread.update_status_main_signal_gui_update = self.update_status_main_signal_gui_update
-        self.ufc_gas_path_system_close_thread.start()
-        # 等待开始线程 把ufc停止完成
+        close_thread = self.ufc_gas_path_system_close_thread
+        if close_thread is None:
+            reject("UFC关闭线程不存在")
+            return
         global wait_UFC_stop_finish_event
-        wait_UFC_stop_finish_event.wait()
+        if not close_thread.isRunning():
+            close_thread.close_error = None
+            wait_UFC_stop_finish_event.clear()
+            close_thread.update_status_main_signal_gui_update = self.update_status_main_signal_gui_update
+            close_thread.start()
+
+        try:
+            ufc_config = (global_setting.get_setting("UFC_UGC_ZOS_config", {}) or {}).get("UFC", {})
+            wait_time = max(0.0, float(ufc_config.get("wait_time", 60)))
+            wait_delay = max(0.01, float(ufc_config.get("wait_time_delay", 1)))
+            shutdown_timeout = max(20.0, wait_time * wait_delay + 15.0)
+        except (TypeError, ValueError, AttributeError):
+            shutdown_timeout = 90.0
+
+        if not wait_UFC_stop_finish_event.wait(shutdown_timeout):
+            close_thread.stop()
+            reject(f"等待UFC关泵/关阀回执超时（{shutdown_timeout:.0f}秒）")
+            return
+
+        wait_UFC_stop_finish_event.clear()
+        if close_thread.close_error:
+            reject(f"UFC关闭失败：{close_thread.close_error}")
+            return
         resolve()
     pass
 

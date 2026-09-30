@@ -3525,15 +3525,17 @@ def stop():
 
     if global_setting.get_setting("is_calibrating", False):
         calibration_type = global_setting.get_setting("current_calibration_type", "校准")
-        logger.warning(f"skip monitor_data_stop while calibration is running: {calibration_type}")
+        logger.warning(
+            f"experiment stop requested while {calibration_type} is running; "
+            "cancel calibration first, then continue full shutdown"
+        )
         queue = global_setting.get_setting("queue", None)
         if queue:
             queue.put(
                 ObjectQueueItem(origin="main_monitor_data", to="MainWindow_index",
                                 title="stop_show_info_except_status_counts",
-                                data=f"{calibration_type}进行中，已跳过自动停止气路，避免误关闭UFC",
+                                data=f"{calibration_type}进行中，正在先取消校准并继续关闭实验",
                                 time=time_util.get_format_from_time(time.time())))
-        return
 
     # 发送线程关闭前，按实际启用的笼子逐个关闭食槽门驱动电流。
     try:

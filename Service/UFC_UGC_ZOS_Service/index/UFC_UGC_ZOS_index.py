@@ -108,6 +108,8 @@ class UFC_UGC_ZOS_index(MyQThread):
         # second chain before the first one completes, producing many repeated
         # "ZOS 正在启动" commands and stale callbacks during shutdown.
         self._startup_chain_started = False
+        self._stop_requested = False
+        self._shutdown_errors = []
 
         self.send_message = {
             'port': '',
@@ -523,6 +525,8 @@ class UFC_UGC_ZOS_index(MyQThread):
     def start_btn_handle(self):
         global stop_flag
         stop_flag = False
+        self._stop_requested = False
+        self._shutdown_errors = []
         p = AsyPromise(self.ZOS_gas_path_system_obj.start).then(
             lambda _:AsyPromise(
                 self.UFC_gas_path_system_obj.start,
@@ -609,51 +613,114 @@ class UFC_UGC_ZOS_index(MyQThread):
             self.UFC_gas_path_system_obj.ufc_gas_path_system_start_thread.is_stop=True
         global auto_wait_event,stop_flag
         stop_flag = True
+        self._stop_requested = True
+        self._shutdown_errors = []
+        # 先同步设置标定线程的取消标志并等待其退出，再发关气路命令，
+        # 避免校准流程在泵关闭后继续发开阀/开泵指令。
+        self._request_stop_active_calibrations()
         if self.Startup_o2_span_air_calibration_obj is not None:
             self.Startup_o2_span_air_calibration_obj.request_stop()
             if self.Startup_o2_span_air_calibration_obj.is_running:
-                self.Startup_o2_span_air_calibration_obj.wait_until_finished(30)
+                if not self.Startup_o2_span_air_calibration_obj.wait_until_finished(30):
+                    self._record_shutdown_error("启动校准", "取消等待超时")
         auto_wait_event.set()
         auto_wait_event.clear()
 
         self.close_timers()
-        p = AsyPromise(self.UGC_gas_path_system_obj.stop).then(
-            lambda v: AsyPromise(
-                self.UFC_gas_path_system_obj.stop,
-            ).then(
-                lambda v2: AsyPromise(self.ZOS_gas_path_system_obj.stop).then(
-                    lambda v22: self._stop_active_calibrations_then_finish()
-                        ).catch(lambda e: logger.error(f"{e}"))
-                    ).catch(lambda e: logger.error(f"{e}"))
-                ).catch( lambda e: logger.error(f"{e}"))
+        return self._stop_gas_paths_then_finish(
+            [("UGC", self.UGC_gas_path_system_obj),
+             ("UFC", self.UFC_gas_path_system_obj),
+             ("ZOS", self.ZOS_gas_path_system_obj)],
+            index=0,
+        )
 
-        return p
+    def _record_shutdown_error(self, module_name, error):
+        message = f"{module_name}关闭未确认：{error}"
+        self._shutdown_errors.append(message)
+        logger.error(message)
+        queue = global_setting.get_setting("queue", None)
+        if queue:
+            queue.put(ObjectQueueItem(
+                origin="UFC_UGC_ZOS_index",
+                to="MainWindow_index",
+                title="stop_show_info_except_status_counts",
+                data=message,
+                time=time_util.get_format_from_time(time.time()),
+            ))
+
+    def _request_stop_active_calibrations(self):
+        current_type = global_setting.get_setting("current_calibration_type", None)
+        active_calibrations = []
+        for calibration in (self.Zero_carlibration_obj, self.Range_carlibration_obj):
+            if calibration is None:
+                continue
+            is_active = calibration.isRunning() or current_type == calibration.name
+            if not is_active:
+                continue
+
+            calibration.is_STOP = True
+            try:
+                # This method emits the existing stop-time/UI notifications. Its
+                # cancellation finish path is hardware-free when is_STOP is set.
+                calibration.stop_calibrate(
+                    lambda *_: None,
+                    lambda error=None: logger.warning(
+                        f"{calibration.name}取消回调异常：{error}"
+                    ),
+                )
+            except Exception as exc:
+                logger.exception(f"请求取消{calibration.name}失败：{exc}")
+                try:
+                    calibration.set_calibration_running_state(False)
+                except Exception:
+                    pass
+            try:
+                calibration.stop()
+            except Exception as exc:
+                self._record_shutdown_error(calibration.name, exc)
+            active_calibrations.append(calibration)
+            logger.warning(f"实验停止：已请求取消{calibration.name}")
+
+        if active_calibrations or global_setting.get_setting("is_calibrating", False):
+            global_setting.set_setting("is_calibrating", False)
+            global_setting.set_setting("current_calibration_type", None)
+
+        # Only wait a bounded time. The stop flag has already been set, so any
+        # later calibration stage must abort before issuing another command.
+        for calibration in active_calibrations:
+            try:
+                if calibration.isRunning() and not calibration.wait(2000):
+                    self._record_shutdown_error(calibration.name, "线程退出等待超时")
+            except Exception as exc:
+                self._record_shutdown_error(calibration.name, exc)
+
+    def _stop_gas_paths_then_finish(self, paths, index):
+        if index >= len(paths):
+            return self._stop_active_calibrations_then_finish()
+
+        module_name, path_system = paths[index]
+        if path_system is None:
+            self._record_shutdown_error(module_name, "气路对象不存在")
+            return self._stop_gas_paths_then_finish(paths, index + 1)
+
+        try:
+            stop_promise = AsyPromise(path_system.stop)
+        except Exception as exc:
+            self._record_shutdown_error(module_name, exc)
+            return self._stop_gas_paths_then_finish(paths, index + 1)
+
+        return stop_promise.then(
+            lambda _: self._stop_gas_paths_then_finish(paths, index + 1)
+        ).catch(
+            lambda error: (
+                self._record_shutdown_error(module_name, error),
+                self._stop_gas_paths_then_finish(paths, index + 1),
+            )[1]
+        )
 
     def _stop_active_calibrations_then_finish(self):
-        """Only stop calibration workers that are actually running."""
-        zero_running = (
-            self.Zero_carlibration_obj is not None
-            and self.Zero_carlibration_obj.isRunning()
-        )
-        range_running = (
-            self.Range_carlibration_obj is not None
-            and self.Range_carlibration_obj.isRunning()
-        )
-
-        if zero_running:
-            return AsyPromise(self.Zero_carlibration_obj.stop_calibrate).then(
-                lambda _: (
-                    AsyPromise(self.Range_carlibration_obj.stop_calibrate).then(
-                        lambda __: AsyPromise(self.finished_stop)
-                    )
-                    if range_running
-                    else AsyPromise(self.finished_stop)
-                )
-            )
-        if range_running:
-            return AsyPromise(self.Range_carlibration_obj.stop_calibrate).then(
-                lambda _: AsyPromise(self.finished_stop)
-            )
+        """Finish shutdown after the calibration cancellation and path stops."""
+        self._request_stop_active_calibrations()
         return AsyPromise(self.finished_stop)
 
     def finished_stop(self,resolve,reject):
@@ -680,13 +747,18 @@ class UFC_UGC_ZOS_index(MyQThread):
         if self.ZOS_gas_path_system_obj is not None:
             self.ZOS_gas_path_system_obj=None
 
-        #返回响应
-        logger.error(f"停止气路完成")
+        # 返回响应；若某个模块未确认关闭，明确将其作为异常说明回报。
+        if self._shutdown_errors:
+            stop_message = "气路停止流程已结束，但关闭未确认：" + "；".join(self._shutdown_errors)
+            logger.error(stop_message)
+        else:
+            stop_message = "停止气路完成"
+            logger.info(stop_message)
         queue = global_setting.get_setting("queue", None)
         if queue:
             queue.put(
                 ObjectQueueItem(origin="UFC_UGC_ZOS_index", to="MainWindow_index", title="stop_gap_system_return",
-                                data="停止气路完成",
+                                data=stop_message,
                                 time=time_util.get_format_from_time(time.time())))
 
         resolve()
