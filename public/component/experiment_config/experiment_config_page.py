@@ -11,7 +11,7 @@ from loguru import logger
 from PyQt6.QtWidgets import (
     QComboBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
     QPushButton, QCheckBox, QScrollArea, QSizePolicy, QVBoxLayout, QWidget,
-    QSpinBox, QTimeEdit, QButtonGroup, QFileDialog, QMessageBox,
+    QSpinBox, QDoubleSpinBox, QTimeEdit, QButtonGroup, QFileDialog, QMessageBox,
 )
 from public.config_class.global_setting import global_setting
 from public.entity.experiment_setting_entity import Group, Animal, AnimalGroupRecord
@@ -150,7 +150,7 @@ class ExperimentConfigPage(QWidget):
             QFrame#cameraMappingColumn { background:#f7fbff; border:1px solid #dcebf7; border-radius:8px; }
             QLabel#sectionTitle { color:#075fae; font-size:14px; font-weight:700; }
             QLabel#fieldLabel { color:#567b9e; font-size:12px; min-height:18px; }
-            QLineEdit, QComboBox { min-height:34px; border:1px solid #cfe1f1; border-radius:7px; padding:2px 9px; background:#fff; }
+            QLineEdit, QComboBox, QDoubleSpinBox { min-height:34px; border:1px solid #cfe1f1; border-radius:7px; padding:2px 9px; background:#fff; }
             QPushButton#channelButton { min-width:58px; min-height:30px; border:1px solid #cfe1f1; border-radius:8px; background:#fff; color:#17395c; }
             QPushButton#channelButton:checked { background:#258dde; color:#fff; border-color:#258dde; }
             QPushButton#channelConfigButton { min-width:74px; min-height:32px; border:1px solid #cfe1f1; border-radius:8px; background:#fff; color:#17395c; }
@@ -214,6 +214,7 @@ class ExperimentConfigPage(QWidget):
             cards.addWidget(card, 0, column)
         root.addLayout(cards)
         root.addWidget(self._serial_panel())
+        root.addWidget(self._calibration_gas_panel())
         root.addWidget(self._camera_mapping_panel())
         root.addWidget(self._channel_panel())
         action_bar = QFrame()
@@ -296,6 +297,62 @@ class ExperimentConfigPage(QWidget):
         self.serial_status_label = QLabel("请选择串口并确认，随后检测已启用的笼位。")
         self.serial_status_label.setObjectName("statusNote")
         layout.addWidget(self.serial_status_label)
+        return card
+
+    def _calibration_gas_panel(self) -> QFrame:
+        """Expose the legacy span-gas parameters in the current workflow page.
+
+        These values are consumed by the existing O2/CO2 calibration code via
+        ``global_setting`` and are also sent to the monitor-data process when
+        the page is saved.  Keeping the controls here avoids falling back to
+        the hidden legacy device-configuration page.
+        """
+        card, layout = self._card("校准气体基础配置")
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(18)
+        grid.setVerticalSpacing(9)
+        grid.setColumnStretch(0, 3)
+        grid.setColumnStretch(1, 2)
+
+        def add_value_row(row, label_text, setting_key, default, decimals, step):
+            label = QLabel(label_text)
+            label.setObjectName("calibrationGasLabel")
+            editor = QDoubleSpinBox()
+            editor.setObjectName(setting_key)
+            editor.setRange(0.0, 100.0)
+            editor.setDecimals(decimals)
+            editor.setSingleStep(step)
+            editor.setSuffix(" %")
+            editor.setValue(float(global_setting.get_setting(setting_key, default)))
+            grid.addWidget(label, row, 0)
+            grid.addWidget(editor, row, 1)
+            return editor
+
+        self.span_oxygen_desc_text = add_value_row(
+            0,
+            "Span校准标准气体的氧浓度（例如20.9%，请输入20.9）",
+            "span_standard_oxygen_value",
+            20.9,
+            3,
+            0.01,
+        )
+        self.span_carbon_desc_text = add_value_row(
+            1,
+            "Span校准标准气体的CO2浓度（例如0.03%，请输入0.03）",
+            "span_standard_carbon_value",
+            0.03,
+            4,
+            0.01,
+        )
+        self.vr_desc_text = add_value_row(
+            2,
+            "Vr值（已弃用；按气瓶标识填写，例如20.9%，请输入20.9）",
+            "Vr",
+            20.9,
+            3,
+            0.01,
+        )
+        layout.addLayout(grid)
         return card
 
     def _legacy_device_page(self):
@@ -1556,6 +1613,18 @@ class ExperimentConfigPage(QWidget):
         setting.startup_calibration = self._startup_calibration_label(startup_calibration_mode)
         setting.storage_path = self.storage_path.text().strip()
         setting.auto_backup = self.backup.currentText()
+        # Preserve the complete legacy calibration contract.  The calibration
+        # implementation reads these values directly from global_setting,
+        # while _broadcast_setting mirrors them into p_monitor_data.
+        global_setting.set_setting("Vr", float(self.vr_desc_text.value()))
+        global_setting.set_setting(
+            "span_standard_oxygen_value",
+            float(self.span_oxygen_desc_text.value()),
+        )
+        global_setting.set_setting(
+            "span_standard_carbon_value",
+            float(self.span_carbon_desc_text.value()),
+        )
         self._capture_current_channel()
         setting.channel_modules = copy.deepcopy(self._channel_module_values)
         setting.channel_data_config = copy.deepcopy(self._channel_data_values)
@@ -1646,6 +1715,17 @@ class ExperimentConfigPage(QWidget):
         calibration_enabled = calibration_mode != "none"
         global_setting.set_setting("startup_calibration_mode", calibration_mode)
         global_setting.set_setting("is_auto_calibration", calibration_enabled)
+        basic_config = {
+            "startup_calibration_mode": calibration_mode,
+            "is_auto_calibration": calibration_enabled,
+            "vr_desc": float(global_setting.get_setting("Vr", 20.9)),
+            "span_standard_oxygen_value": float(
+                global_setting.get_setting("span_standard_oxygen_value", 20.9)
+            ),
+            "span_standard_carbon_value": float(
+                global_setting.get_setting("span_standard_carbon_value", 0.03)
+            ),
+        }
         payload = {
             "experiment_setting": setting,
             "experiment_setting_file": global_setting.get_setting("experiment_setting_file", ""),
@@ -1654,7 +1734,7 @@ class ExperimentConfigPage(QWidget):
         if monitor_queue is not None:
             monitor_queue.put(ObjectQueueItem(
                 origin="ExperimentConfigPage", to="main_monitor_data", title="set_experiment_basic_config",
-                data={"startup_calibration_mode": calibration_mode, "is_auto_calibration": calibration_enabled},
+                data=basic_config,
                 time=time_util.get_format_from_time(time.time()),
             ))
             monitor_queue.put(ObjectQueueItem(

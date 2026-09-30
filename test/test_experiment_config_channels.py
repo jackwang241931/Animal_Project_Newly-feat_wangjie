@@ -59,7 +59,13 @@ class ExperimentConfigChannelTests(unittest.TestCase):
             self.assertEqual(global_setting.get_setting("startup_calibration_mode"), "none")
             self.assertFalse(global_setting.get_setting("is_auto_calibration"))
         config = monitor_queue.put.call_args_list[0].args[0].data
-        self.assertEqual(config, {"startup_calibration_mode": "none", "is_auto_calibration": False})
+        self.assertEqual(config, {
+            "startup_calibration_mode": "none",
+            "is_auto_calibration": False,
+            "vr_desc": 20.9,
+            "span_standard_oxygen_value": 20.9,
+            "span_standard_carbon_value": 0.03,
+        })
 
     def test_startup_calibration_selector_is_not_rendered(self):
         setting = global_setting.get_setting("experiment_setting")
@@ -68,6 +74,35 @@ class ExperimentConfigChannelTests(unittest.TestCase):
         self.addCleanup(page.deleteLater)
         self.assertFalse(hasattr(page, "startup_calibration"))
         self.assertNotIn("启动前校准方式", [label.text() for label in page.findChildren(QLabel)])
+
+    def test_legacy_calibration_gas_values_are_editable_and_broadcast(self):
+        monitor_queue = Mock()
+        with patch.dict(global_setting._setting, {
+            "send_message_queue": monitor_queue,
+            "queue": None,
+            "Vr": 20.7,
+            "span_standard_oxygen_value": 20.8,
+            "span_standard_carbon_value": 0.04,
+        }):
+            page = ExperimentConfigPage()
+            self.addCleanup(page.deleteLater)
+            self.assertAlmostEqual(page.vr_desc_text.value(), 20.7)
+            self.assertAlmostEqual(page.span_oxygen_desc_text.value(), 20.8)
+            self.assertAlmostEqual(page.span_carbon_desc_text.value(), 0.04)
+
+            page.vr_desc_text.setValue(20.6)
+            page.span_oxygen_desc_text.setValue(20.75)
+            page.span_carbon_desc_text.setValue(0.05)
+            page.save_experiment_config()
+
+            config_messages = [
+                call.args[0] for call in monitor_queue.put.call_args_list
+                if call.args[0].title == "set_experiment_basic_config"
+            ]
+            self.assertTrue(config_messages)
+            self.assertEqual(config_messages[-1].data["vr_desc"], 20.6)
+            self.assertEqual(config_messages[-1].data["span_standard_oxygen_value"], 20.75)
+            self.assertEqual(config_messages[-1].data["span_standard_carbon_value"], 0.05)
 
     def test_storage_location_button_updates_the_path(self):
         page = ExperimentConfigPage()
