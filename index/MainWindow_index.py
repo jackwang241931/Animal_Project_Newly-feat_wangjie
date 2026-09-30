@@ -103,6 +103,11 @@ class read_queue_data_Thread(MyQThread):
     start_failed_signal = pyqtSignal(str)
     operation_progress_signal = pyqtSignal(int, str)
     calibration_event_signal = pyqtSignal(str)
+    # Calibration detail widgets are QWidgets and must only be touched from
+    # the GUI thread.  The queue reader runs in a worker thread, so it emits a
+    # small description of the update instead of calling the dialog directly.
+    calibration_detail_update_signal = pyqtSignal(object)
+    status_tip_signal = pyqtSignal(str)
     stop_backend_completed_signal = pyqtSignal()
     stop_backend_issue_signal = pyqtSignal(str)
     stop_progress_signal = pyqtSignal(str)
@@ -173,7 +178,7 @@ class read_queue_data_Thread(MyQThread):
                             if not self.window._is_uncalibrated_stop_housekeeping(message.data):
                                 #  更新气路运行消息
                                 # 将运行信息放入status栏中
-                                self.window.status_bar.update_tip(message.data)
+                                self.status_tip_signal.emit(str(message.data))
                                 if self.window.workflow_run_state == ExperimentRunState.STOPPING:
                                     self.window._append_workflow_runtime_log(message.data, "停止")
                                     return
@@ -203,13 +208,13 @@ class read_queue_data_Thread(MyQThread):
                         #鼠笼环境内部模块运行情况
                         if message.data and self.window:
                             # 将运行信息放入status栏中
-                            self.window.status_bar.update_tip(message.data)
+                            self.status_tip_signal.emit(str(message.data))
                             pass
                     case "epoch_running_state":
                         # 一轮模块数据运行情况
                         if message.data and self.window:
                             # 将运行信息放入status栏中
-                            self.window.status_bar.update_tip(message.data)
+                            self.status_tip_signal.emit(str(message.data))
                             pass
                     case 'close_start_experiment_dialog':
                         self.gas_path_start_completed_signal.emit()
@@ -243,9 +248,11 @@ class read_queue_data_Thread(MyQThread):
                         标定的消息
                         """
                         if self.window is not None:
-                            if self.window.status_bar is not None:
-                                self.window.status_bar.update_tip(message.data)
-                            self.window.cache_calibration_detail_log(message.data, has_time=True)
+                            self.calibration_detail_update_signal.emit({
+                                "kind": "message",
+                                "message": message.data,
+                                "has_time": True,
+                            })
                     case 'set_start_zero_calibration_time':
                         """
                         设置开始校准零点
@@ -254,11 +261,10 @@ class read_queue_data_Thread(MyQThread):
                         if self.window is not None:
                             self.operation_progress_signal.emit(5, "校零进行中")
                             self.calibration_event_signal.emit("zero_started")
-                            self.window.calibration_detail_zero_start_time = message.data
-                            self.window.calibration_detail_status_text = "零点标定"
-                            if self.window.calibration_details_windows is not None:
-                                self.window.calibration_details_windows.updateZeroStartTime(message.data, event_time=message.data)
-                                self.window.calibration_details_windows.updateStatus("零点标定", event_time=message.data)
+                            self.calibration_detail_update_signal.emit({
+                                "kind": "zero_start",
+                                "time": message.data,
+                            })
 
                     case 'set_stop_zero_calibration_time':
                         """
@@ -268,11 +274,10 @@ class read_queue_data_Thread(MyQThread):
                         if self.window is not None:
                             self.operation_progress_signal.emit(100, "校零完成")
                             self.calibration_event_signal.emit("zero_finished")
-                            self.window.calibration_detail_zero_end_time = message.data
-                            self.window.calibration_detail_status_text = "零点标定完成"
-                            if self.window.calibration_details_windows is not None:
-                                self.window.calibration_details_windows.updateZeroEndTime(message.data, event_time=message.data)
-                                self.window.calibration_details_windows.updateStatus("零点标定完成", event_time=message.data)
+                            self.calibration_detail_update_signal.emit({
+                                "kind": "zero_end",
+                                "time": message.data,
+                            })
                     case 'set_start_span_calibration_time':
                         """
                         设置开始校准span
@@ -281,11 +286,10 @@ class read_queue_data_Thread(MyQThread):
                         if self.window is not None:
                             self.operation_progress_signal.emit(5, "校量程进行中")
                             self.calibration_event_signal.emit("span_started")
-                            self.window.calibration_detail_span_start_time = message.data
-                            self.window.calibration_detail_status_text = "量程标定"
-                            if self.window.calibration_details_windows is not None:
-                                self.window.calibration_details_windows.updateSpanStartTime(message.data, event_time=message.data)
-                                self.window.calibration_details_windows.updateStatus("量程标定", event_time=message.data)
+                            self.calibration_detail_update_signal.emit({
+                                "kind": "span_start",
+                                "time": message.data,
+                            })
                     case 'set_stop_span_calibration_time':
                         """
                         设置结束校准span
@@ -294,38 +298,35 @@ class read_queue_data_Thread(MyQThread):
                         if self.window is not None:
                             self.operation_progress_signal.emit(100, "校量程完成")
                             self.calibration_event_signal.emit("span_finished")
-                            self.window.calibration_detail_span_end_time = message.data
-                            self.window.calibration_detail_status_text = "量程标定完成"
-                            if self.window.calibration_details_windows is not None:
-                                self.window.calibration_details_windows.updateSpanEndTime(message.data, event_time=message.data)
-                                self.window.calibration_details_windows.updateStatus("量程标定完成", event_time=message.data)
+                            self.calibration_detail_update_signal.emit({
+                                "kind": "span_end",
+                                "time": message.data,
+                            })
                     case 'set_start_air_calibration_time':
                         if self.window is not None:
                             self.operation_progress_signal.emit(5, "空气校准进行中")
-                            self.window.calibration_detail_zero_start_time = message.data
-                            self.window.calibration_detail_status_text = "Air空气校准"
-                            if self.window.calibration_details_windows is not None:
-                                self.window.calibration_details_windows.updateAirStartTime(message.data, event_time=message.data)
-                                self.window.calibration_details_windows.updateStatus("Air空气校准", event_time=message.data)
+                            self.calibration_detail_update_signal.emit({
+                                "kind": "air_start",
+                                "time": message.data,
+                            })
                     case 'set_stop_air_calibration_time':
                         if self.window is not None:
                             self.operation_progress_signal.emit(100, "空气校准完成")
-                            self.window.calibration_detail_zero_end_time = message.data
-                            self.window.calibration_detail_status_text = "Air空气校准完成"
-                            if self.window.calibration_details_windows is not None:
-                                self.window.calibration_details_windows.updateAirEndTime(message.data, event_time=message.data)
-                                self.window.calibration_details_windows.updateStatus("Air空气校准完成", event_time=message.data)
+                            self.calibration_detail_update_signal.emit({
+                                "kind": "air_end",
+                                "time": message.data,
+                            })
                     case 'set_calibration_values':
                         """
                         设置校准窗口显示值
                         data:{"oxygen_value":0,"carbon_value":0,"oxygen_pressure_value":0}
                         """
-                        if self.window is not None and self.window.calibration_details_windows is not None and message.data is not None:
-                            self.window.calibration_details_windows.updateO2Current(message.data.get("oxygen_value", 0), event_time=message.time)
-                            self.window.calibration_details_windows.updateCO2Current(
-                                message.data.get("carbon_value", 0), event_time=message.time)
-                            self.window.calibration_details_windows.updatePressureCurrent(
-                                message.data.get("oxygen_pressure_value", 0), event_time=message.time)
+                        if self.window is not None and message.data is not None:
+                            self.calibration_detail_update_signal.emit({
+                                "kind": "values",
+                                "values": dict(message.data) if isinstance(message.data, dict) else {},
+                                "time": message.time,
+                            })
                     case _:
                         pass
 
@@ -751,6 +752,15 @@ class MainWindow_Index(ThemedWindow):
         self._stop_backend_grace_complete = False
         self._stop_operation_failed = False
         self._stop_cleanup_started = False
+        # Calibration values can arrive faster than matplotlib can redraw.
+        # Keep data ingestion immediate but coalesce chart repaints on the GUI
+        # thread so the queue reader never blocks on QWidget work.
+        self._calibration_chart_refresh_timer = QTimer(self)
+        self._calibration_chart_refresh_timer.setSingleShot(True)
+        self._calibration_chart_refresh_timer.setInterval(200)
+        self._calibration_chart_refresh_timer.timeout.connect(
+            self._flush_calibration_chart_refresh
+        )
         read_queue_data_thread.gas_path_start_completed_signal.connect(
             self._on_gas_path_start_success
         )
@@ -762,6 +772,12 @@ class MainWindow_Index(ThemedWindow):
         )
         read_queue_data_thread.calibration_event_signal.connect(
             self._on_calibration_event
+        )
+        read_queue_data_thread.calibration_detail_update_signal.connect(
+            self._on_calibration_detail_update
+        )
+        read_queue_data_thread.status_tip_signal.connect(
+            self.update_status_tip_signal.emit
         )
         read_queue_data_thread.cage_control_response_signal.connect(
             self._on_cage_control_response
@@ -1231,6 +1247,131 @@ class MainWindow_Index(ThemedWindow):
             ExperimentRunState.STOP_FAILED,
         }:
             page.on_calibration_event(event)
+
+    def _on_calibration_detail_update(self, update) -> None:
+        """Apply calibration-detail updates on the GUI thread only.
+
+        ``read_queue_data_Thread`` is a worker thread.  Calling the dialog or
+        its matplotlib canvas directly from that thread was the source of the
+        long GUI stalls seen during Air calibration and could race with dialog
+        destruction during stop/close.  This slot is connected to the worker
+        signal, so Qt queues it to this MainWindow's thread.
+        """
+        if not isinstance(update, dict):
+            return
+
+        kind = update.get("kind")
+        if kind == "message":
+            message = update.get("message")
+            if self.status_bar is not None:
+                self.status_bar.update_tip(message)
+            self.cache_calibration_detail_log(
+                message,
+                has_time=bool(update.get("has_time", True)),
+            )
+            return
+
+        event_time = update.get("time")
+        if kind == "zero_start":
+            self.calibration_detail_zero_start_time = event_time
+            self.calibration_detail_status_text = "零点标定"
+            if self.calibration_details_windows is not None:
+                self.calibration_details_windows.updateZeroStartTime(
+                    event_time, event_time=event_time
+                )
+                self.calibration_details_windows.updateStatus(
+                    "零点标定", event_time=event_time
+                )
+            return
+        if kind == "zero_end":
+            self.calibration_detail_zero_end_time = event_time
+            self.calibration_detail_status_text = "零点标定完成"
+            if self.calibration_details_windows is not None:
+                self.calibration_details_windows.updateZeroEndTime(
+                    event_time, event_time=event_time
+                )
+                self.calibration_details_windows.updateStatus(
+                    "零点标定完成", event_time=event_time
+                )
+            return
+        if kind == "span_start":
+            self.calibration_detail_span_start_time = event_time
+            self.calibration_detail_status_text = "量程标定"
+            if self.calibration_details_windows is not None:
+                self.calibration_details_windows.updateSpanStartTime(
+                    event_time, event_time=event_time
+                )
+                self.calibration_details_windows.updateStatus(
+                    "量程标定", event_time=event_time
+                )
+            return
+        if kind == "span_end":
+            self.calibration_detail_span_end_time = event_time
+            self.calibration_detail_status_text = "量程标定完成"
+            if self.calibration_details_windows is not None:
+                self.calibration_details_windows.updateSpanEndTime(
+                    event_time, event_time=event_time
+                )
+                self.calibration_details_windows.updateStatus(
+                    "量程标定完成", event_time=event_time
+                )
+            return
+        if kind == "air_start":
+            self.calibration_detail_zero_start_time = event_time
+            self.calibration_detail_status_text = "Air空气校准"
+            if self.calibration_details_windows is not None:
+                self.calibration_details_windows.updateAirStartTime(
+                    event_time, event_time=event_time
+                )
+                self.calibration_details_windows.updateStatus(
+                    "Air空气校准", event_time=event_time
+                )
+            return
+        if kind == "air_end":
+            self.calibration_detail_zero_end_time = event_time
+            self.calibration_detail_status_text = "Air空气校准完成"
+            if self.calibration_details_windows is not None:
+                self.calibration_details_windows.updateAirEndTime(
+                    event_time, event_time=event_time
+                )
+                self.calibration_details_windows.updateStatus(
+                    "Air空气校准完成", event_time=event_time
+                )
+            return
+        if kind != "values":
+            return
+
+        # A stop can release the dialog while queued values are still being
+        # delivered.  Ignore those late values instead of dereferencing a
+        # closing QWidget.
+        if self.workflow_run_state in {
+            ExperimentRunState.STOPPING,
+            ExperimentRunState.STOPPED,
+            ExperimentRunState.STOP_FAILED,
+        }:
+            return
+        dialog = self.calibration_details_windows
+        if dialog is None:
+            return
+        values = update.get("values") or {}
+        dialog.updateCalibrationValues(
+            values.get("oxygen_value", 0),
+            values.get("carbon_value", 0),
+            values.get("oxygen_pressure_value", 0),
+            event_time=event_time,
+            redraw=False,
+        )
+        if not self._calibration_chart_refresh_timer.isActive():
+            self._calibration_chart_refresh_timer.start()
+
+    def _flush_calibration_chart_refresh(self) -> None:
+        """Redraw the calibration chart at most five times per second."""
+        dialog = self.calibration_details_windows
+        if dialog is None:
+            return
+        chart = getattr(dialog, "chart_widget", None)
+        if chart is not None:
+            chart.updateChart()
 
     def _on_cage_control_response(self, response) -> None:
         """Forward the real device acknowledgement to the visible P3 page."""
@@ -3188,6 +3329,8 @@ class MainWindow_Index(ThemedWindow):
         self.calibration_details_windows.show()
     def release_calibration_windows(self):
         # 释放标定窗口
+        if hasattr(self, "_calibration_chart_refresh_timer"):
+            self._calibration_chart_refresh_timer.stop()
         if self.calibration_details_windows is not None:
             self.calibration_details_windows.hide()
             self.calibration_details_windows.close()

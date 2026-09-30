@@ -146,7 +146,7 @@ class CalibrationChartWidget(QWidget):
 
         return valid_data, valid_indices
 
-    def addDataPoint(self, data_type, value):
+    def addDataPoint(self, data_type, value, redraw=True):
         """添加数据点"""
         if value is None:
             # 直接添加None，不过滤
@@ -156,7 +156,8 @@ class CalibrationChartWidget(QWidget):
                 self.data_co2_current.append(None)
             elif data_type == "pressure_current":
                 self.data_pressure_current.append(None)
-            self.updateChart()
+            if redraw:
+                self.updateChart()
             return
 
         try:
@@ -169,7 +170,8 @@ class CalibrationChartWidget(QWidget):
                 self.data_co2_current.append(None)
             elif data_type == "pressure_current":
                 self.data_pressure_current.append(None)
-            self.updateChart()
+            if redraw:
+                self.updateChart()
             return
 
         # 添加数据到对应的deque
@@ -181,7 +183,8 @@ class CalibrationChartWidget(QWidget):
             self.data_pressure_current.append(value)
 
         # 更新图表
-        self.updateChart()
+        if redraw:
+            self.updateChart()
 
     def updateChart(self):
         """更新图表"""
@@ -872,7 +875,7 @@ class CalibrationDialog(QDialog):
         except (TypeError, ValueError):
             return none_text
 
-    def updateO2Current(self, value, event_time=None, log_event=True):
+    def updateO2Current(self, value, event_time=None, log_event=True, redraw=True):
         """更新O2当前数据"""
         formatted = self.format_value(value, 4)
         self.cells[self.data_cells['o2_current']].setText(formatted)
@@ -882,7 +885,7 @@ class CalibrationDialog(QDialog):
             self.addLog(f"O2当前数据更新: {formatted}%")
         # 添加数据到图表（包括None值）
         if hasattr(self, 'chart_widget'):
-            self.chart_widget.addDataPoint("o2_current", value)
+            self.chart_widget.addDataPoint("o2_current", value, redraw=redraw)
 
     def updateO2Span(self, value, event_time=None, log_event=True):
         """更新O2 Span数值"""
@@ -893,7 +896,7 @@ class CalibrationDialog(QDialog):
         if value is not None:
             self.addLog(f"O2 Span数值更新: {formatted}%")
 
-    def updateCO2Current(self, value, event_time=None, log_event=True):
+    def updateCO2Current(self, value, event_time=None, log_event=True, redraw=True):
         """更新CO2当前数据"""
         formatted = self.format_value(value, 4)
         self.cells[self.data_cells['co2_current']].setText(formatted)
@@ -903,7 +906,7 @@ class CalibrationDialog(QDialog):
             self.addLog(f"CO2当前数据更新: {formatted}ppm")
         # 添加数据到图表（包括None值）
         if hasattr(self, 'chart_widget'):
-            self.chart_widget.addDataPoint("co2_current", value)
+            self.chart_widget.addDataPoint("co2_current", value, redraw=redraw)
 
     def updateCO2Span(self, value, event_time=None, log_event=True):
         """更新CO2 Span数值"""
@@ -914,7 +917,7 @@ class CalibrationDialog(QDialog):
         if value is not None:
             self.addLog(f"CO2 Span数值更新: {formatted}ppm")
 
-    def updatePressureCurrent(self, value, event_time=None, log_event=True):
+    def updatePressureCurrent(self, value, event_time=None, log_event=True, redraw=True):
         """更新O2压力当前数据"""
         formatted = self.format_value(value, 3)
         self.cells[self.data_cells['pressure_current']].setText(formatted)
@@ -924,7 +927,45 @@ class CalibrationDialog(QDialog):
             self.addLog(f"O2压力当前数据更新: {formatted} KPa")
         # 添加数据到图表（包括None值）
         if hasattr(self, 'chart_widget'):
-            self.chart_widget.addDataPoint("pressure_current", value)
+            self.chart_widget.addDataPoint("pressure_current", value, redraw=redraw)
+
+    def updateCalibrationValues(
+        self,
+        oxygen_value,
+        carbon_value,
+        pressure_value,
+        event_time=None,
+        log_event=True,
+        redraw=True,
+    ):
+        """Update one calibration sample with a single optional chart repaint.
+
+        Air calibration produces three values for the same sample.  Updating
+        them through the three legacy methods used to rebuild and synchronously
+        paint the matplotlib canvas three times per queue message.  Keeping
+        the existing methods intact while batching this path preserves the
+        displayed data and reduces the GUI work substantially.
+        """
+        self.updateO2Current(
+            oxygen_value,
+            event_time=event_time,
+            log_event=log_event,
+            redraw=False,
+        )
+        self.updateCO2Current(
+            carbon_value,
+            event_time=event_time,
+            log_event=log_event,
+            redraw=False,
+        )
+        self.updatePressureCurrent(
+            pressure_value,
+            event_time=event_time,
+            log_event=log_event,
+            redraw=False,
+        )
+        if redraw and hasattr(self, "chart_widget"):
+            self.chart_widget.updateChart()
 
     def updatePressureSpan(self, value, event_time=None, log_event=True):
         """更新O2压力Span数值"""
