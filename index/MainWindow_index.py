@@ -8,6 +8,7 @@ import sqlite3
 import threading
 import time
 from json import JSONDecodeError
+from queue import Empty
 
 from PyQt6.QtGui import QFont
 from PyQt6 import QtCore
@@ -129,7 +130,12 @@ class read_queue_data_Thread(MyQThread):
     def dosomething(self):
         if self.queue and  not self.queue.empty():
             try:
-                message: ObjectQueueItem = self.queue.get()
+                # multiprocessing.Queue.empty() is only a hint.  Never use a
+                # blocking get in the GUI reader: shutdown must be able to
+                # join this thread before Qt destroys MainWindow widgets.
+                message: ObjectQueueItem = self.queue.get_nowait()
+            except Empty:
+                return
             except Exception as e:
                 logger.error(f"{self.name}发生错误{e}")
                 return
@@ -432,6 +438,43 @@ class ManualExcelExportThread(QThread):
 
 
 read_queue_data_thread = read_queue_data_Thread(name="MainWindow_index_read_queue_data_thread")
+
+
+def stop_main_window_queue_thread(timeout_ms=5000):
+    """Stop the GUI queue reader before Qt starts destroying widgets.
+
+    The reader keeps a reference to ``MainWindow_Index`` and emits Qt signals
+    from its worker thread.  Letting the QApplication tear down the window
+    first leaves a small race in SIP/QtWidgets (the crash dump showed exactly
+    that race).  This helper is intentionally idempotent and does not call
+    ``deleteLater`` while the event loop is being shut down.
+    """
+    thread = read_queue_data_thread
+    if thread is None:
+        return True
+
+    try:
+        thread.blockSignals(True)
+        if thread.isRunning():
+            thread.stop()
+            thread.requestInterruption()
+            if not thread.wait(timeout_ms):
+                logger.error(
+                    f"MainWindow queue reader did not stop within {timeout_ms} ms"
+                )
+                return False
+
+        # Do this only after the native QThread has ended.  The worker must
+        # never dereference a QWidget or a multiprocessing queue during Qt
+        # object destruction.
+        thread.window = None
+        thread.queue = None
+        return True
+    except Exception as error:
+        logger.exception(f"停止 MainWindow queue reader 失败: {error}")
+        return False
+
+
 class MainWindow_Index(ThemedWindow):
     # 根据程序状态来改变是否可以点击的组件
     change_enable_component_app_state_signal = QtCore.pyqtSignal()
@@ -458,6 +501,58 @@ class MainWindow_Index(ThemedWindow):
             # 停止实验
             self.stop_experiment()
         # 关闭所有串口
+
+    def prepare_for_shutdown(self, timeout_ms=5000):
+        """Quiesce GUI-owned workers/timers before QApplication exits.
+
+        This is separate from the experiment stop workflow.  It is only the
+        final Qt teardown barrier, so it does not send any UFC/gas command.
+        """
+        if getattr(self, "_shutdown_prepared", False):
+            return
+        self._shutdown_prepared = True
+        logger.info("开始 Qt GUI 退出清理：先停止窗口线程和导出任务")
+
+        # Do not allow queued timer callbacks to touch widgets while the
+        # parent window is being destroyed.
+        for timer in self.findChildren(QTimer):
+            try:
+                timer.stop()
+            except RuntimeError:
+                pass
+
+        # A periodic export is a Python thread.  Detach its GUI callback first
+        # so a late completion cannot call into a half-destroyed MainWindow.
+        periodic_thread = self.periodic_export_thread
+        if periodic_thread is not None:
+            periodic_thread.callback = None
+            if periodic_thread.is_alive():
+                periodic_thread.join(timeout=timeout_ms / 1000.0)
+                if periodic_thread.is_alive():
+                    logger.error("定时 Excel 导出线程未能在退出前结束")
+
+        # Export QThreads are parented to this window.  Block their signals
+        # before waiting; their work is allowed to finish, but no completion
+        # callback may update widgets after shutdown has started.
+        for name in ("stop_export_thread", "manual_export_thread"):
+            thread = getattr(self, name, None)
+            if thread is None:
+                continue
+            try:
+                thread.blockSignals(True)
+                if thread.isRunning():
+                    thread.requestInterruption()
+                    thread.quit()
+                    if not thread.wait(timeout_ms):
+                        logger.error(f"{name} 未能在退出前结束")
+            except RuntimeError as error:
+                logger.warning(f"退出时清理 {name} 跳过已销毁对象: {error}")
+            except Exception as error:
+                logger.exception(f"退出时清理 {name} 失败: {error}")
+
+        # The module-level queue reader is shared by the workflow page and
+        # must be stopped before this window is released.
+        stop_main_window_queue_thread(timeout_ms=timeout_ms)
 
     def _experiment_needs_stop_before_close(self):
         """Return whether closing must wait for the experiment stop/export flow."""
@@ -2584,6 +2679,9 @@ class MainWindow_Index(ThemedWindow):
         with self.periodic_export_lock:
             self.periodic_export_in_progress = False
             self.periodic_export_thread = None
+
+        if getattr(self, "_shutdown_prepared", False):
+            return
 
         if success:
             logger.info(message)

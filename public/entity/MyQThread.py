@@ -87,52 +87,29 @@ class MyQThread(QThread):
         self.mutex.unlock()
 
     def deleteLater(self):
-        """更安全的删除方法"""
+        """Stop the worker, then preserve Qt's deferred QObject deletion."""
         logger.warning(f"开始删除线程 {self.name}")
-
         try:
-            # # 1. 设置停止标志
-            # self.stop()
-
-            # 2. 请求中断
+            self.stop()
             self.requestInterruption()
-
-            # 3. 强制唤醒多次
-            for _ in range(5):
-                self.mutex.lock()
-                self.condition.wakeAll()
-                self.mutex.unlock()
-                QThread.msleep(20)
-
-            # 4. 退出事件循环
+            self.condition.wakeAll()
             self.quit()
 
-            # 5. 等待线程结束
-            wait_count = 0
-            while self.isRunning() and wait_count < 50:  # 最多等待5秒 (50 * 100ms)
-                QThread.msleep(100)
-                wait_count += 1
-
-                # 每秒再次唤醒一次
-                if wait_count % 10 == 0:
-                    self.mutex.lock()
-                    self.condition.wakeAll()
-                    self.mutex.unlock()
-
-            if self.isRunning():
-                logger.warning(f"{self.name}线程等待超时，强制终止")
-                # self.terminate()
-                self.wait(1000)
+            # Waiting from inside the same QThread would deadlock.
+            if QThread.currentThread() != self and self.isRunning():
+                if not self.wait(5000):
+                    logger.error(f"{self.name}线程退出等待超时")
+        except Exception as error:
+            logger.exception(f"{self.name}删除线程清理失败: {error}")
+        finally:
+            # The old override never called Qt's implementation, so the
+            # QObject wrapper could remain alive through interpreter teardown.
+            if not self.isRunning():
+                super().deleteLater()
             else:
-                logger.warning(f"{self.name}线程正常结束")
-
-        except Exception as e:
-            logger.error(f"{self.name}删除线程异常: {e}")
-            try:
-                # self.terminate()
-                self.wait(1000)
-            except Exception as e2:
-                logger.error(f"{self.name}强制终止失败: {e2}")
+                # Never schedule QObject destruction while native code is
+                # still executing in the worker thread.
+                logger.error(f"{self.name}仍在运行，跳过延迟销毁")
     def isStart(self):
         return self._running and not self._stop_requested
 

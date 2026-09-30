@@ -3,6 +3,7 @@ import sys
 import time
 import traceback
 from multiprocessing import freeze_support
+from queue import Empty
 
 # Load the native ML runtime before Qt/OpenCV are imported. The legacy
 # version initialized YOLO at worker-process startup; late loading from a
@@ -15,7 +16,7 @@ from PyQt6.QtCore import QThreadPool, QRect, QTimer, pyqtSignal
 from PyQt6.QtWidgets import QApplication, QDialog, QMessageBox
 from blinker import signal
 from loguru import logger
-from index.MainWindow_index import MainWindow_Index
+from index.MainWindow_index import MainWindow_Index, stop_main_window_queue_thread
 from index.Program_self_check import Program_self_check_index
 from public.component.dialog.index.deep_camera_config_dialog_index import deep_camera_config_dialog
 from public.component.dialog.index.infrared_camera_config_dialog_index import infrared_camera_config_dialog
@@ -49,7 +50,12 @@ class read_queue_data_Thread(MyQThread):
     def dosomething(self):
         if not self.queue.empty():
             try:
-                message: ObjectQueueItem = self.queue.get()
+                # ``empty()`` is only a hint for multiprocessing queues.  A
+                # blocking get here can make the Qt thread survive window
+                # destruction and race with SIP during interpreter shutdown.
+                message: ObjectQueueItem = self.queue.get_nowait()
+            except Empty:
+                return
             except Exception as e:
                 logger.error(f"{self.name}发生错误{e}")
                 return
@@ -102,7 +108,7 @@ read_queue_data_thread = read_queue_data_Thread(name="main_gui_read_queue_data_t
 _qt_shutdown_started = False
 
 
-def quit_qt_application():
+def quit_qt_application(main_window=None):
     """
     退出QT程序
     :return:
@@ -125,15 +131,21 @@ def quit_qt_application():
 
                             time=time_util.get_format_from_time(time.time())))
 
-    # aboutToQuit runs on Qt's GUI thread.  Do not sleep or call sys.exit()
-    # here: Qt may still be dispatching queued worker signals while widgets
-    # are being destroyed.  Blocking/re-entering interpreter shutdown in this
-    # callback can leave SIP invoking a callback whose wrapper was deleted.
+    if main_window is not None:
+        try:
+            main_window.prepare_for_shutdown()
+        except Exception as error:
+            logger.exception(f"窗口退出清理失败: {error}")
+
+    # aboutToQuit runs on Qt's GUI thread.  Stop every queue reader before
+    # QWidget/QApplication destruction.  Do not call sys.exit() here.
     if read_queue_data_thread.isRunning():
+        read_queue_data_thread.blockSignals(True)
         read_queue_data_thread.stop()
         read_queue_data_thread.requestInterruption()
-        if not read_queue_data_thread.wait(2000):
+        if not read_queue_data_thread.wait(5000):
             logger.warning("main GUI queue reader did not stop before Qt shutdown")
+    stop_main_window_queue_thread(timeout_ms=5000)
     shared_video_frame_store.close_reader()
 
 def on_crash( error_msg):
@@ -195,10 +207,7 @@ def start_qt_application():
         # rejection leaves a windowless GUI process alive forever, preventing
         # the parent controller from reclaiming the remaining child processes.
         logger.info("Startup cancelled by user; closing GUI process")
-        read_queue_data_thread.stop()
-        read_queue_data_thread.requestInterruption()
-        read_queue_data_thread.wait(2000)
-        shared_video_frame_store.close_reader()
+        quit_qt_application()
         app.closeAllWindows()
         return 0
 
@@ -210,12 +219,14 @@ def start_qt_application():
     # live GUI event loop so startup work is not reported as a runtime freeze.
     crash_handler.start_gui_watchdog(app, timeout_seconds=3.0)
     # Stop the watchdog before the slower device cleanup callback runs.
-    app.aboutToQuit.connect(quit_qt_application)
+    app.aboutToQuit.connect(lambda: quit_qt_application(main_window))
     # 系统退出
     exit_code = app.exec()
-    logger.critical(f"Qt event loop returned | exit_code={exit_code}")
-    sys.exit(exit_code)
-    pass
+    # Normally aboutToQuit has already done this.  The explicit idempotent
+    # call also covers event-loop termination initiated by the OS/window.
+    quit_qt_application(main_window)
+    logger.info(f"Qt event loop returned | exit_code={exit_code}")
+    return exit_code
 
 
 def main(q, send_message_q, runtime_diagnostics_queue=None, system_health_snapshot_queue=None):
