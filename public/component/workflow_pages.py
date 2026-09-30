@@ -4236,6 +4236,7 @@ class DataAnalysisPage(_BaseWorkflowPage):
         self._historical_load_generation = 0
         self._historical_workers: set[_HistoricalWorkbookLoader] = set()
         self._analysis_worker: Optional[_AnalysisPreviewLoader] = None
+        self._background_stopping = False
         self._csv_export_worker: Optional[_AnalysisCsvExporter] = None
         self._analysis_requested_key: Optional[tuple[Any, ...]] = None
         self._analysis_completed_key: Optional[tuple[Any, ...]] = None
@@ -4253,7 +4254,12 @@ class DataAnalysisPage(_BaseWorkflowPage):
         self.refresh_trajectory_experiments()
         self.start_refresh()
 
+    def start_refresh(self) -> None:
+        self._background_stopping = False
+        super().start_refresh()
+
     def stop_refresh(self) -> None:
+        self._background_stopping = True
         super().stop_refresh()
         if self._csv_export_worker is not None:
             self._csv_export_worker.requestInterruption()
@@ -4570,11 +4576,15 @@ class DataAnalysisPage(_BaseWorkflowPage):
             except OSError:
                 pass
 
-    def _live_snapshot_worker_finished(self, worker: LiveDatabaseSnapshotLoader) -> None:
+    def _live_snapshot_worker_finished(self) -> None:
+        worker = self.sender()
+        if not isinstance(worker, LiveDatabaseSnapshotLoader):
+            return
         if self._live_snapshot_worker is worker:
             self._live_snapshot_worker = None
         worker.deleteLater()
-        self._update_live_analysis_status()
+        if not self._background_stopping:
+            self._update_live_analysis_status()
 
     def _live_snapshot_loaded(
         self,
@@ -4633,7 +4643,10 @@ class DataAnalysisPage(_BaseWorkflowPage):
         self._live_snapshot_worker = worker
         worker.loaded.connect(self._live_snapshot_loaded)
         worker.failed.connect(self._live_snapshot_failed)
-        worker.finished.connect(lambda current=worker: self._live_snapshot_worker_finished(current))
+        # Connect to a QObject-bound method so Qt automatically disconnects it
+        # when this page is destroyed.  A lambda retaining ``self`` can run
+        # after the wrapped QWidget has already been deleted.
+        worker.finished.connect(self._live_snapshot_worker_finished)
         self._update_live_analysis_status()
         worker.start()
 
@@ -4967,11 +4980,14 @@ class DataAnalysisPage(_BaseWorkflowPage):
         self._historical_workers.add(worker)
         worker.loaded.connect(self._historical_workbook_loaded)
         worker.failed.connect(self._historical_workbook_failed)
-        worker.finished.connect(lambda current=worker: self._historical_worker_finished(current))
+        worker.finished.connect(self._historical_worker_finished)
         self._set_historical_loading(True)
         worker.start()
 
-    def _historical_worker_finished(self, worker: _HistoricalWorkbookLoader) -> None:
+    def _historical_worker_finished(self) -> None:
+        worker = self.sender()
+        if not isinstance(worker, _HistoricalWorkbookLoader):
+            return
         self._historical_workers.discard(worker)
         worker.deleteLater()
 
@@ -6048,10 +6064,13 @@ class DataAnalysisPage(_BaseWorkflowPage):
         self._csv_export_worker = worker
         self.compare_export_status.setText(f"正在导出完整{title}…")
         worker.completed.connect(self.compare_export_status.setText)
-        worker.finished.connect(lambda current=worker: self._csv_export_finished(current))
+        worker.finished.connect(self._csv_export_finished)
         worker.start()
 
-    def _csv_export_finished(self, worker: "_AnalysisCsvExporter") -> None:
+    def _csv_export_finished(self) -> None:
+        worker = self.sender()
+        if not isinstance(worker, _AnalysisCsvExporter):
+            return
         if self._csv_export_worker is worker:
             self._csv_export_worker = None
         worker.deleteLater()
@@ -6242,6 +6261,8 @@ class DataAnalysisPage(_BaseWorkflowPage):
         return key, request
 
     def _schedule_analysis_refresh(self, force: bool = False) -> None:
+        if self._background_stopping:
+            return
         if not self.isVisible() or not hasattr(self, "right_metric") or not hasattr(self, "trajectory_compare_plots"):
             return
         key, request = self._analysis_request()
@@ -6256,19 +6277,28 @@ class DataAnalysisPage(_BaseWorkflowPage):
         self._analysis_started_at = time.monotonic()
         worker.loaded.connect(self._analysis_preview_loaded)
         worker.failed.connect(self._analysis_preview_failed)
-        worker.finished.connect(lambda current=worker: self._analysis_worker_finished(current))
+        worker.finished.connect(self._analysis_worker_finished)
         worker.start()
 
-    def _analysis_worker_finished(self, worker: "_AnalysisPreviewLoader") -> None:
+    def _analysis_worker_finished(self) -> None:
+        worker = self.sender()
+        if not isinstance(worker, _AnalysisPreviewLoader):
+            return
         duration = max(0.0, time.monotonic() - self._analysis_started_at)
         self._analysis_next_allowed_at = time.monotonic() + min(30.0, duration)
         if self._analysis_worker is worker:
             self._analysis_worker = None
         worker.deleteLater()
-        if self._refresh_timer.isActive() and self._analysis_requested_key != self._analysis_completed_key:
+        if (
+            not self._background_stopping
+            and self._refresh_timer.isActive()
+            and self._analysis_requested_key != self._analysis_completed_key
+        ):
             self._schedule_analysis_refresh()
 
     def _analysis_preview_failed(self, key: tuple[Any, ...], error: str) -> None:
+        if self._background_stopping:
+            return
         if key != self._analysis_requested_key:
             return
         self._analysis_completed_key = key
@@ -6276,6 +6306,8 @@ class DataAnalysisPage(_BaseWorkflowPage):
         self.compare_export_status.setText(f"数据加载失败：{error}")
 
     def _analysis_preview_loaded(self, key: tuple[Any, ...], payload: Mapping[str, Any]) -> None:
+        if self._background_stopping:
+            return
         requested = self._analysis_requested_key
         if requested is None or (key != requested and key[4:] != requested[4:]):
             return
@@ -6466,7 +6498,7 @@ class _AnalysisPreviewLoader(QThread):
             series: list[tuple[str, Any]] = []
             sleep_multiplier = 1
             if module == "infrared":
-                if self._live_analysis_mode:
+                if context._live_analysis_mode:
                     live_temperature = context._metric_channel_series(
                         set(self.request["trajectory_channels"]),
                         2,

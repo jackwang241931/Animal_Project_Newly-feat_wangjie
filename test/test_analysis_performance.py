@@ -37,6 +37,37 @@ class AnalysisPerformanceTests(unittest.TestCase):
         self.assertEqual(multiplier, 40)
         self.assertIn(1.0, preview)
 
+    def test_live_infrared_preview_reads_live_mode_from_work_context(self):
+        request = {
+            "context": {},
+            "module": "infrared",
+            "live_mode": True,
+            "trajectory_channels": (1,),
+            "bio_channel": 1,
+            "trajectory_export_path": None,
+            "trajectory_selection_user_set": False,
+            "excel_path": None,
+            "comparison_origin": 0.0,
+            "comparison_cache": {},
+            "left_channels": (1,),
+            "right_channels": (1,),
+            "left_metric": 0,
+            "right_metric": 4,
+            "left_metric_label": "称重",
+            "right_metric_label": "二氧化碳",
+            "behavior_categories": ("自由活动",),
+        }
+        worker = _AnalysisPreviewLoader(("infrared-live",), request)
+        results = []
+        errors = []
+        worker.loaded.connect(lambda _key, payload: results.append(payload))
+        worker.failed.connect(lambda _key, error: errors.append(error))
+
+        worker.run()
+
+        self.assertFalse(errors, errors)
+        self.assertEqual(len(results), 1)
+
     def test_background_request_bounds_large_database_preview(self):
         with tempfile.TemporaryDirectory() as folder:
             db_path = Path(folder) / "data.db"

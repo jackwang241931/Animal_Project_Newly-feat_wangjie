@@ -99,11 +99,19 @@ class read_queue_data_Thread(MyQThread):
 
 
 read_queue_data_thread = read_queue_data_Thread(name="main_gui_read_queue_data_thread")
+_qt_shutdown_started = False
+
+
 def quit_qt_application():
     """
     退出QT程序
     :return:
     """
+    global _qt_shutdown_started
+    if _qt_shutdown_started:
+        return
+    _qt_shutdown_started = True
+
     logger.info("Qt application is shutting down normally")
     # modbus: ModbusRTUMasterNew = global_setting.get_setting("modbus", None)
     # if modbus is not None:
@@ -117,11 +125,16 @@ def quit_qt_application():
 
                             time=time_util.get_format_from_time(time.time())))
 
-    #
-    # 等待5秒系统退出
-    time.sleep(5)
+    # aboutToQuit runs on Qt's GUI thread.  Do not sleep or call sys.exit()
+    # here: Qt may still be dispatching queued worker signals while widgets
+    # are being destroyed.  Blocking/re-entering interpreter shutdown in this
+    # callback can leave SIP invoking a callback whose wrapper was deleted.
+    if read_queue_data_thread.isRunning():
+        read_queue_data_thread.stop()
+        read_queue_data_thread.requestInterruption()
+        if not read_queue_data_thread.wait(2000):
+            logger.warning("main GUI queue reader did not stop before Qt shutdown")
     shared_video_frame_store.close_reader()
-    sys.exit(0)
 
 def on_crash( error_msg):
     """处理崩溃事件"""

@@ -1811,6 +1811,7 @@ class Tab_4(ThemedWindow):
         super().__init__()
         self.charts_list = []
         self.loader_thread: ImageLoaderThread | None = None
+        self._closing = False
         self.trajectory_thread: MouseTrajectoryThread | None = None
         self.trajectory_submitter_thread: TrajectoryFrameSubmitterThread | None = None
         self.connected_trajectory_signal_thread: MouseTrajectoryThread | None = None
@@ -1869,6 +1870,7 @@ class Tab_4(ThemedWindow):
 
     def showEvent(self, a0: typing.Optional[QtGui.QShowEvent]) -> None:
         logger.warning("tab4-show")
+        self._closing = False
         self.start_loader_thread()
         self.refresh_cage_selector()
         self.render_selected_content()
@@ -1882,6 +1884,9 @@ class Tab_4(ThemedWindow):
 
     def closeEvent(self, a0: typing.Optional[QtGui.QCloseEvent]) -> None:
         logger.warning("tab4-close")
+        self._closing = True
+        if self.video_render_timer.isActive():
+            self.video_render_timer.stop()
         self.stop_loader_thread()
         self.stop_trajectory_thread()
         if self.temperature_widget is not None:
@@ -1980,6 +1985,8 @@ class Tab_4(ThemedWindow):
         self.render_selected_content()
 
     def start_loader_thread(self):
+        if self._closing:
+            return
         self.refresh_cage_selector()
         if self.current_mode == self.MODE_VIDEO:
             self.start_trajectory_thread()
@@ -1999,12 +2006,22 @@ class Tab_4(ThemedWindow):
         if self.loader_thread is None:
             return
 
-        if self.loader_thread.isRunning():
-            self.loader_thread.stop()
-            self.loader_thread.requestInterruption()
-            self.loader_thread.wait(2000)
-
+        worker = self.loader_thread
+        # Prevent new code from using this worker while it is being stopped.
         self.loader_thread = None
+        try:
+            worker.image_loaded.disconnect(self.update_image)
+        except (RuntimeError, TypeError):
+            pass
+
+        if worker.isRunning():
+            worker.stop()
+            worker.requestInterruption()
+            if not worker.wait(5000):
+                # Keep the Python wrapper alive if the native thread has not
+                # stopped; destroying a running QThread can crash SIP/Qt.
+                logger.error("tab4_image_loader did not stop within 5 seconds")
+                self.loader_thread = worker
 
     def _request_trajectory_module_load(self):
         global trajectory_module_loader
@@ -2486,6 +2503,8 @@ class Tab_4(ThemedWindow):
         self.render_selected_content()
 
     def update_image(self, pixmap_path_dict):
+        if self._closing:
+            return
         if pixmap_path_dict is None or "infrared_camera" not in pixmap_path_dict:
             logger.error("未获取到图片数据")
             return
