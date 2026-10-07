@@ -65,6 +65,7 @@ runtime_diagnostics_dropped = 0
 trajectory_service_lock = threading.RLock()
 shared_trajectory_thread = None
 shared_trajectory_submitter_thread = None
+trajectory_service_stopping = False
 trajectory_service_consumers = weakref.WeakSet()
 trajectory_module_loader_lock = threading.RLock()
 trajectory_module_loader = None
@@ -777,11 +778,16 @@ def attach_shared_trajectory_service(consumer):
     """
     global shared_trajectory_thread
     global shared_trajectory_submitter_thread
+    global trajectory_service_stopping
 
     with trajectory_module_loader_lock:
         trajectory_class = mouse_trajectory_thread_class
 
     with trajectory_service_lock:
+        if trajectory_service_stopping:
+            logger.info("shared mouse trajectory service is stopping; attach is deferred")
+            return None
+
         trajectory_thread = shared_trajectory_thread
         if trajectory_thread is not None and trajectory_thread.isRunning():
             is_finishing = (
@@ -840,6 +846,7 @@ def detach_shared_trajectory_service(consumer) -> bool:
     """Detach one view and finalize only after the final consumer leaves."""
     global shared_trajectory_thread
     global shared_trajectory_submitter_thread
+    global trajectory_service_stopping
 
     with trajectory_service_lock:
         trajectory_thread = getattr(consumer, "trajectory_thread", None)
@@ -854,13 +861,27 @@ def detach_shared_trajectory_service(consumer) -> bool:
             consumer.trajectory_submitter_thread = None
             return True
 
+        # Block a new view from attaching while the last consumer is stopping
+        # the producer and draining the trajectory worker.
+        trajectory_service_stopping = True
         submitter = shared_trajectory_submitter_thread
-        shared_trajectory_submitter_thread = None
 
     if submitter is not None and submitter.isRunning():
         submitter.stop()
         submitter.requestInterruption()
-        _wait_for_trajectory_thread_responsive(submitter, 2000)
+        if not _wait_for_trajectory_thread_responsive(submitter, 2000):
+            logger.error(
+                "trajectory frame submitter did not stop within 2 seconds; "
+                "trajectory finalization is deferred to avoid releasing resources "
+                "while frames may still be submitted"
+            )
+            with trajectory_service_lock:
+                trajectory_service_stopping = False
+            return False
+
+    with trajectory_service_lock:
+        if shared_trajectory_submitter_thread is submitter:
+            shared_trajectory_submitter_thread = None
 
     if trajectory_thread.isRunning():
         trajectory_thread.request_finish_after_drain()
@@ -888,12 +909,15 @@ def detach_shared_trajectory_service(consumer) -> bool:
         logger.error(
             "mouse trajectory finalization timed out; final trajectory output may be incomplete"
         )
+        with trajectory_service_lock:
+            trajectory_service_stopping = False
         return False
 
     trajectory_thread.finalize_outputs()
     with trajectory_service_lock:
         if shared_trajectory_thread is trajectory_thread:
             shared_trajectory_thread = None
+        trajectory_service_stopping = False
     consumer.trajectory_thread = None
     consumer.trajectory_submitter_thread = None
     logger.info(
