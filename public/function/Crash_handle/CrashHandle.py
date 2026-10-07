@@ -1,3 +1,5 @@
+import atexit
+import faulthandler
 import sys
 import traceback
 import threading
@@ -12,6 +14,107 @@ from loguru import logger
 
 _crash_log_handler_id = None
 _crash_log_handler_lock = threading.Lock()
+_native_crash_diagnostics_lock = threading.Lock()
+_faulthandler_file = None
+_thread_lifecycle_stop_event = None
+_thread_lifecycle_monitor = None
+
+
+def _thread_identity(thread):
+    return {
+        "name": thread.name,
+        "ident": thread.ident,
+        "native_id": getattr(thread, "native_id", None),
+        "daemon": thread.daemon,
+    }
+
+
+def _format_thread_identity(action, details):
+    native_id = details.get("native_id")
+    native_id_hex = f"0x{native_id:X}" if native_id is not None else "unavailable"
+    return (
+        f"[THREAD_LIFECYCLE] {action} | name={details.get('name')} | "
+        f"python_tid={details.get('ident')} | native_tid={native_id} | "
+        f"native_tid_hex={native_id_hex} | daemon={details.get('daemon')}"
+    )
+
+
+def _monitor_python_thread_lifecycle(stop_event):
+    known_threads = {}
+    while not stop_event.is_set():
+        current_threads = {
+            thread.ident: _thread_identity(thread)
+            for thread in threading.enumerate()
+            if thread.ident is not None
+        }
+
+        for ident, details in current_threads.items():
+            if ident not in known_threads:
+                logger.warning(_format_thread_identity("started", details))
+
+        for ident, details in known_threads.items():
+            if ident not in current_threads:
+                logger.warning(_format_thread_identity("exited", details))
+
+        known_threads = current_threads
+        stop_event.wait(1.0)
+
+
+def _close_native_crash_diagnostics():
+    global _faulthandler_file
+    stop_event = _thread_lifecycle_stop_event
+    if stop_event is not None:
+        stop_event.set()
+
+    fault_file = _faulthandler_file
+    _faulthandler_file = None
+    if fault_file is not None:
+        try:
+            faulthandler.disable()
+        except Exception:
+            pass
+        try:
+            fault_file.close()
+        except Exception:
+            pass
+
+
+def setup_native_crash_diagnostics():
+    """Persist native-crash Python stacks and map Python threads to Windows TIDs."""
+    global _faulthandler_file
+    global _thread_lifecycle_stop_event
+    global _thread_lifecycle_monitor
+
+    with _native_crash_diagnostics_lock:
+        if _faulthandler_file is not None:
+            return
+
+        dump_dir = os.path.abspath(os.path.join(os.getcwd(), "crash_dumps"))
+        os.makedirs(dump_dir, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        fault_path = os.path.join(
+            dump_dir,
+            f"python_fault_{timestamp}_pid{os.getpid()}.log",
+        )
+
+        # Keep this descriptor open for the lifetime of the process.  The
+        # faulthandler module writes directly to it during a native crash.
+        _faulthandler_file = open(fault_path, "ab", buffering=0)
+        faulthandler.enable(file=_faulthandler_file, all_threads=True)
+
+        _thread_lifecycle_stop_event = threading.Event()
+        _thread_lifecycle_monitor = threading.Thread(
+            target=_monitor_python_thread_lifecycle,
+            args=(_thread_lifecycle_stop_event,),
+            name="thread_lifecycle_monitor",
+            daemon=True,
+        )
+        _thread_lifecycle_monitor.start()
+        atexit.register(_close_native_crash_diagnostics)
+        logger.warning(
+            f"[NATIVE_CRASH_DIAGNOSTIC] enabled | pid={os.getpid()} | "
+            f"fault_log={fault_path}"
+        )
 
 
 def setup_crash_logging():
@@ -30,6 +133,7 @@ def setup_crash_logging():
                 encoding="utf-8",
                 filter=lambda record: record["level"].name in ["ERROR", "CRITICAL"],
             )
+        setup_native_crash_diagnostics()
     return _crash_log_handler_id
 
 

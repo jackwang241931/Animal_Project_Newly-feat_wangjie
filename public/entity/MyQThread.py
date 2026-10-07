@@ -15,9 +15,18 @@ class MyQThread(QThread):
         self._running = False
         self._paused = False
         self._stop_requested = False
+        self._python_thread_id = None
+        self._native_thread_id = None
 
     def run(self):
-        logger.warning(f"{self.name} thread {threading.get_ident()} has been started！")
+        self._python_thread_id = threading.get_ident()
+        self._native_thread_id = threading.get_native_id()
+        logger.warning(
+            f"[THREAD_LIFECYCLE] started | name={self.name} | "
+            f"python_tid={self._python_thread_id} | "
+            f"native_tid={self._native_thread_id} | "
+            f"native_tid_hex=0x{self._native_thread_id:X} | daemon=False"
+        )
         self._running = True
         self._stop_requested = False
         self._paused = False  # 启动时重置状态
@@ -52,7 +61,12 @@ class MyQThread(QThread):
             logger.error(f"{self.name} run() exception: {e}")
         finally:
             self._running = False
-            logger.warning(f"{self.name} thread run() ended")
+            logger.warning(
+                f"[THREAD_LIFECYCLE] exited | name={self.name} | "
+                f"python_tid={self._python_thread_id} | "
+                f"native_tid={self._native_thread_id} | "
+                f"native_tid_hex=0x{self._native_thread_id:X} | daemon=False"
+            )
 
     def pause(self):
         if not self.isRunning():
@@ -78,7 +92,15 @@ class MyQThread(QThread):
         self.mutex.unlock()
 
     def stop(self):
-        logger.warning(f"{self.name} thread stop() called")
+        caller_native_id = threading.get_native_id()
+        logger.warning(
+            f"[THREAD_LIFECYCLE] stop_requested | name={self.name} | "
+            f"target_python_tid={self._python_thread_id} | "
+            f"target_native_tid={self._native_thread_id} | "
+            f"caller={threading.current_thread().name} | "
+            f"caller_native_tid={caller_native_id} | "
+            f"caller_native_tid_hex=0x{caller_native_id:X}"
+        )
         self.mutex.lock()
         self._stop_requested = True
         self._running = False
@@ -150,17 +172,32 @@ class MyThread(threading.Thread):
     def isPaused(self):
         return self._paused and self._running
     def run(self):
-        logger.warning(f"{self.name} thread {threading.get_ident()} has been started！")
+        native_thread_id = threading.get_native_id()
+        logger.warning(
+            f"[THREAD_LIFECYCLE] started | name={self.name} | "
+            f"python_tid={threading.get_ident()} | "
+            f"native_tid={native_thread_id} | "
+            f"native_tid_hex=0x{native_thread_id:X} | daemon={self.daemon}"
+        )
         self._running = True
-        self.before_Runing_work()
-        while self._running:
-            self.mutex.lock()
-            if self._paused:
-                self.condition.wait(self.mutex)  # 等待条件变量
-            self.mutex.unlock()
+        try:
+            self.before_Runing_work()
+            while self._running:
+                self.mutex.lock()
+                if self._paused:
+                    self.condition.wait(self.mutex)  # 等待条件变量
+                self.mutex.unlock()
 
-            # 执行一些工作（替代为你需要的任务）
-            self.dosomething()
+                # 执行一些工作（替代为你需要的任务）
+                self.dosomething()
+        finally:
+            self._running = False
+            logger.warning(
+                f"[THREAD_LIFECYCLE] exited | name={self.name} | "
+                f"python_tid={threading.get_ident()} | "
+                f"native_tid={native_thread_id} | "
+                f"native_tid_hex=0x{native_thread_id:X} | daemon={self.daemon}"
+            )
     def move_work_to_thread(self,work):
         self.dosomething=work
     def before_Runing_work(self):
