@@ -413,6 +413,30 @@ class UFC_UGC_ZOS_index(MyQThread):
         finally:
             self.Zero_carlibration_obj.co2_only_mode = False
 
+    def _co2_zero_then_read_ufc_start_status(self, resolve, reject):
+        """Run CO2 zero first and forward the actual UFC status dictionary.
+
+        AsyPromise does not flatten a promise returned from ``then`` when the
+        previous promise has already resolved.  CO2 zero waits synchronously,
+        so nesting the UFC query in ``then`` forwarded an AsyPromise object
+        instead of the status dictionary.  Bridge both callback-style steps
+        directly to preserve the real result.
+        """
+
+        def read_ufc_status_after_zero(*_):
+            try:
+                self.UFC_gas_state_check_obj.read_start_status(resolve, reject)
+            except Exception as exc:
+                reject(exc)
+
+        try:
+            self.co2_zero_calibration_obj_calibrate_wrapped(
+                read_ufc_status_after_zero,
+                reject,
+            )
+        except Exception as exc:
+            reject(exc)
+
     def _prepare_startup_calibration_cages(self):
         experiment_settings = global_setting.get_setting("experiment_setting", None)
         groups = getattr(experiment_settings, "groups", []) if experiment_settings is not None else []
@@ -435,10 +459,7 @@ class UFC_UGC_ZOS_index(MyQThread):
                 f"{time_util.get_format_from_time(time.time())} | 启动组合校准：先执行旧版CO₂校零，再执行O₂ Span和空气校准",
                 title=GapSystem_Running_Type.STARTUP_AIR_CALIBRATION,
             )
-            chain = AsyPromise(self.co2_zero_calibration_obj_calibrate_wrapped)
-            chain = chain.then(
-                lambda _: AsyPromise(self.UFC_gas_state_check_obj.read_start_status)
-            )
+            chain = AsyPromise(self._co2_zero_then_read_ufc_start_status)
         else:
             self.update_status_main_signal_gui_update.send(
                 f"{time_util.get_format_from_time(time.time())} | 启动O₂ Span和空气校准：正在按顺序启动气路",

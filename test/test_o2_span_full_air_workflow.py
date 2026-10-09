@@ -1,5 +1,6 @@
 import inspect
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from Module.new_experiment_setting.index.Tab_1 import Tab_1
@@ -92,6 +93,31 @@ class O2SpanFullAirWorkflowTests(unittest.TestCase):
         )
         positions = [source.index(token) for token in expected_order]
         self.assertEqual(sorted(positions), positions)
+
+    def test_co2_zero_forwards_real_ufc_status_dictionary(self):
+        expected = {"ufc_status": 1, "air_pump": 0}
+
+        class _StateCheck:
+            @staticmethod
+            def read_start_status(resolve, reject):
+                resolve(expected)
+
+        service = SimpleNamespace(
+            co2_zero_calibration_obj_calibrate_wrapped=(
+                lambda resolve, reject: resolve()
+            ),
+            UFC_gas_state_check_obj=_StateCheck(),
+        )
+        resolved = []
+        rejected = []
+        UFC_UGC_ZOS_index._co2_zero_then_read_ufc_start_status(
+            service,
+            resolved.append,
+            rejected.append,
+        )
+
+        self.assertEqual([expected], resolved)
+        self.assertEqual([], rejected)
 
 
 if __name__ == "__main__":
