@@ -119,6 +119,33 @@ class O2SpanFullAirWorkflowTests(unittest.TestCase):
         self.assertEqual([expected], resolved)
         self.assertEqual([], rejected)
 
+    def test_legacy_full_calibration_failure_stops_later_startup_steps(self):
+        calls = []
+
+        def zero_done(resolve, reject):
+            calls.append("zero")
+            resolve()
+
+        def span_failed(resolve, reject):
+            calls.append("span")
+            reject("span failed")
+
+        def must_not_start(resolve, reject):
+            calls.append("experiment")
+            resolve()
+
+        resolved = []
+        rejected = []
+        UFC_UGC_ZOS_index._run_callback_steps(
+            [zero_done, span_failed, must_not_start],
+            lambda: resolved.append(True),
+            rejected.append,
+        )
+
+        self.assertEqual(["zero", "span"], calls)
+        self.assertEqual([], resolved)
+        self.assertEqual(["span failed"], rejected)
+
 
 if __name__ == "__main__":
     unittest.main()

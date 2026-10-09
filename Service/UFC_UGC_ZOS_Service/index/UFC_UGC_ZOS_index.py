@@ -337,20 +337,19 @@ class UFC_UGC_ZOS_index(MyQThread):
         global stop_flag
         stop_flag = False
 
-        p = AsyPromise(self.calibration_start).then(
-            lambda _: AsyPromise(self.ZOS_gas_path_system_obj.start).then(
-                lambda _: AsyPromise(self.UFC_gas_path_system_obj.start).then(
-                    lambda _: AsyPromise(self.UGC_gas_path_system_obj.start).then(
-                        lambda _: AsyPromise(self.finish_start).then(
-                        ).catch(lambda e: logger.error(f"{e}"))
-                    ).catch(lambda e: logger.error(f"{e}"))
-                ).catch(lambda e: logger.error(f"{e}"))
-            ).catch(lambda e: logger.error(f"{e}"))
-        ).catch(lambda e: logger.error(f"{e}"))
-
-
-
-        return p
+        return AsyPromise(
+            lambda resolve, reject: self._run_callback_steps(
+                [
+                    self.calibration_start,
+                    self.ZOS_gas_path_system_obj.start,
+                    self.UFC_gas_path_system_obj.start,
+                    self.UGC_gas_path_system_obj.start,
+                    self.finish_start,
+                ],
+                resolve,
+                reject,
+            )
+        )
 
     def start_btn_handle_with_single_calibration(self, calibration):
         """执行选定的单项校准后，再按正常流程启动气路。"""
@@ -361,15 +360,19 @@ class UFC_UGC_ZOS_index(MyQThread):
             if calibration == "zero"
             else self.span_carlibration_obj_calibrate_wrapped
         )
-        return AsyPromise(calibration_handler).then(
-            lambda _: AsyPromise(self.ZOS_gas_path_system_obj.start).then(
-                lambda _: AsyPromise(self.UFC_gas_path_system_obj.start).then(
-                    lambda _: AsyPromise(self.UGC_gas_path_system_obj.start).then(
-                        lambda _: AsyPromise(self.finish_start)
-                    ).catch(lambda e: logger.error(f"{e}"))
-                ).catch(lambda e: logger.error(f"{e}"))
-            ).catch(lambda e: logger.error(f"{e}"))
-        ).catch(lambda e: logger.error(f"{e}"))
+        return AsyPromise(
+            lambda resolve, reject: self._run_callback_steps(
+                [
+                    calibration_handler,
+                    self.ZOS_gas_path_system_obj.start,
+                    self.UFC_gas_path_system_obj.start,
+                    self.UGC_gas_path_system_obj.start,
+                    self.finish_start,
+                ],
+                resolve,
+                reject,
+            )
+        )
 
     def start_btn_handle_with_air_calibration(self):
         """启动气路，并在进入正常实验前执行 Air 空气校准。"""
@@ -544,9 +547,46 @@ class UFC_UGC_ZOS_index(MyQThread):
         logger.error(f"{error}")
 
     def calibration_start(self, resolve, reject):
-        AsyPromise(self.zero_carlibration_obj_calibrate_wrapped).then(
-            lambda _: AsyPromise(self.span_carlibration_obj_calibrate_wrapped)
-        ).then(lambda _: resolve()).catch(lambda e: reject(e))
+        self._run_callback_steps(
+            [
+                self.zero_carlibration_obj_calibrate_wrapped,
+                self.span_carlibration_obj_calibrate_wrapped,
+            ],
+            resolve,
+            reject,
+        )
+
+    @staticmethod
+    def _run_callback_steps(steps, resolve, reject):
+        """Run callback-style startup steps strictly in order."""
+
+        def run_step(index):
+            if index >= len(steps):
+                resolve()
+                return
+
+            settled = False
+
+            def step_resolved(*_):
+                nonlocal settled
+                if settled:
+                    return
+                settled = True
+                run_step(index + 1)
+
+            def step_rejected(error=None):
+                nonlocal settled
+                if settled:
+                    return
+                settled = True
+                reject(error or f"启动步骤{index + 1}失败")
+
+            try:
+                steps[index](step_resolved, step_rejected)
+            except Exception as exc:
+                step_rejected(exc)
+
+        run_step(0)
 
     def zero_carlibration_obj_calibrate_wrapped(self, resolve, reject):
         AsyPromise(self.Zero_carlibration_obj.calibrate).catch(lambda e: logger.error(f"{e}"))

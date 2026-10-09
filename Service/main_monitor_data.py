@@ -1276,6 +1276,31 @@ class read_queue_data_Thread(MyQThread):
                             global_setting.set_setting("experiment_root_path", data.get("experiment_root_path", None))
                             global_setting.set_setting("pause_experiment_time", data.get("pause_experiment_time",[]))
                             global_setting.set_setting("relieve_pause_experiment_time", data.get("relieve_pause_experiment_time",[]))
+                            startup_calibration_mode = data.get(
+                                "startup_calibration_mode",
+                                global_setting.get_setting("startup_calibration_mode", "none"),
+                            )
+                            if startup_calibration_mode == "air_co2":
+                                startup_calibration_mode = "air"
+                            valid_startup_modes = {
+                                "none", "air", "zero", "span", "full",
+                                "o2_span_air", "co2_o2_span_air",
+                            }
+                            if startup_calibration_mode not in valid_startup_modes:
+                                error = f"启动校准模式无效: {startup_calibration_mode}"
+                                logger.error(error)
+                                _send_main_window_status("start_experiment_failed", error)
+                                return
+                            global_setting.set_setting(
+                                "startup_calibration_mode", startup_calibration_mode
+                            )
+                            global_setting.set_setting(
+                                "is_auto_calibration",
+                                startup_calibration_mode != "none",
+                            )
+                            logger.critical(
+                                f"启动命令确认校准模式: {startup_calibration_mode}"
+                            )
                         try:
                             start()
                         except Exception as e:

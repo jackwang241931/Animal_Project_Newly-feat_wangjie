@@ -2956,6 +2956,14 @@ class MainWindow_Index(ThemedWindow):
             self._reject_experiment_start("后台采集服务未连接，请检查服务状态后重试。")
             return
         startup_calibration_mode = self._resolve_startup_calibration_mode_for_start()
+        calibration_was_selected = bool(
+            global_setting.get_setting("device_config_calibration_selected", False)
+        )
+        if calibration_was_selected and startup_calibration_mode == "none":
+            self._reject_experiment_start(
+                "已选择启动前校准，但校准模式丢失；为避免跳过校准，本次实验未启动，请重新选择校准方式。"
+            )
+            return
         self._reset_calibration_detail_state(startup_calibration_mode)
         behavior_enabled = self._experiment_feature_enabled("behavior")
         infrared_enabled = self._experiment_feature_enabled("infrared")
@@ -3011,7 +3019,12 @@ class MainWindow_Index(ThemedWindow):
                                                    'pause_experiment_time': global_setting.get_setting(
                                                        "pause_experiment_time"),
                                                    'relieve_pause_experiment_time': global_setting.get_setting(
-                                                       "relieve_pause_experiment_time")
+                                                       "relieve_pause_experiment_time"),
+                                                   # Carry the selected mode in the start command itself.
+                                                   # The monitor process must not depend on a preceding
+                                                   # configuration message being observed first.
+                                                   'startup_calibration_mode': startup_calibration_mode,
+                                                   'is_auto_calibration': startup_calibration_mode != "none",
                                                },
                                                 time=time_util.get_format_from_time(time.time())))
         except Exception as error:
