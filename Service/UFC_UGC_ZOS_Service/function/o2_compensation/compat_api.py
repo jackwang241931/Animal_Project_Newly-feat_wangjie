@@ -151,9 +151,12 @@ def get_o2_calibration_handler(target_points: int | None = None):
         return _CALIBRATION_HANDLER
 
 
-def start_new_o2_calibration(target_points: int | None = None):
+def start_new_o2_calibration(
+    target_points: int | None = None,
+    span_value: float | None = None,
+):
     handler = get_o2_calibration_handler(target_points=target_points)
-    return bool(handler.start_new_calibration())
+    return bool(handler.start_new_calibration(span_value=span_value))
 
 
 def append_o2_calibration_data(

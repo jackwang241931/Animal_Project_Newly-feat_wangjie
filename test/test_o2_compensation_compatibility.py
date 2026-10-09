@@ -1,14 +1,18 @@
 import json
+import math
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+from Service.UFC_UGC_ZOS_Service.function.o2_compensation import compat_api
 from Service.UFC_UGC_ZOS_Service.function.o2_compensation.calibration_handler import (
     CalibrationHandler,
 )
 from Service.UFC_UGC_ZOS_Service.function.o2_compensation.o2_realtime_core import (
     RealtimeO2Compensator,
     get_default_config_path,
+    start_new_o2_calibration,
 )
 
 
@@ -60,6 +64,75 @@ class O2CompensationCompatibilityTests(unittest.TestCase):
             self.assertIsNone(status["failure_reason"])
             self.assertEqual(_config()["match_gain"], status["match_gain"])
             self.assertEqual(_config()["match_bias"], status["match_bias"])
+
+    def test_full_calibration_uses_supplied_span_value_and_saves_it(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            config_path = Path(directory) / "calib_config.json"
+            config_path.write_text(json.dumps(_config()), encoding="utf-8")
+            handler = CalibrationHandler(target_points=5, config_path=config_path)
+
+            handler.start_new_calibration(span_value=20.8)
+            self.assertEqual(20.8, handler.get_status()["target_span"])
+
+            for channel in CHANNELS:
+                for _ in range(5):
+                    handler.add_data(channel, 0, 25, 101.3, 20.0, 0.0)
+            for channel in CHANNELS:
+                for _ in range(5):
+                    handler.add_data(channel, 0, 25, 101.3, 20.1, 0.0)
+
+            saved = json.loads(config_path.read_text(encoding="utf-8"))
+            self.assertEqual(20.8, saved["target_span"])
+            for offset in saved["offsets"].values():
+                self.assertTrue(math.isclose(0.8, offset, abs_tol=1e-9))
+
+    def test_span_value_is_validated_and_legacy_default_is_preserved(self):
+        handler = CalibrationHandler(target_points=5)
+        with self.assertRaises(ValueError):
+            handler.start_new_calibration(span_value=14.99)
+        with self.assertRaises(ValueError):
+            handler.start_new_calibration(span_value=float("nan"))
+
+        handler.start_new_calibration(span_value=20.8)
+        handler.start_new_calibration()
+        self.assertEqual(20.5, handler.get_status()["target_span"])
+
+    def test_air_touchup_preserves_saved_span_value(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            config_path = Path(directory) / "calib_config.json"
+            config = _config()
+            config["target_span"] = 20.8
+            config_path.write_text(json.dumps(config), encoding="utf-8")
+
+            handler = CalibrationHandler(target_points=5, config_path=config_path)
+            handler.start_air_touchup()
+
+            self.assertEqual(20.8, handler.get_status()["target_span"])
+
+    def test_core_wrapper_forwards_span_value(self):
+        class StubHandler:
+            def start_new_calibration(self, target_points=None, span_value=None):
+                return target_points, span_value
+
+        with patch(
+            "Service.UFC_UGC_ZOS_Service.function.o2_compensation."
+            "o2_realtime_core.get_o2_calibration_handler",
+            return_value=StubHandler(),
+        ):
+            self.assertEqual((40, 20.8), start_new_o2_calibration(40, span_value=20.8))
+
+    def test_public_compatibility_api_forwards_span_value(self):
+        class StubHandler:
+            received_span = None
+
+            def start_new_calibration(self, span_value=None):
+                self.received_span = span_value
+                return True
+
+        handler = StubHandler()
+        with patch.object(compat_api, "get_o2_calibration_handler", return_value=handler):
+            self.assertTrue(compat_api.start_new_o2_calibration(span_value=20.8))
+        self.assertEqual(20.8, handler.received_span)
 
 
 if __name__ == "__main__":

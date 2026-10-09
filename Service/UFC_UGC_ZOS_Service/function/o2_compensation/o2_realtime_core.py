@@ -181,8 +181,11 @@ def get_o2_calibration_handler(target_points=None):
         return _CALIBRATION_HANDLER
 
 
-def start_new_o2_calibration(target_points=None):
-    return get_o2_calibration_handler(target_points).start_new_calibration(target_points)
+def start_new_o2_calibration(target_points=None, span_value=None):
+    return get_o2_calibration_handler(target_points).start_new_calibration(
+        target_points,
+        span_value=span_value,
+    )
 
 
 def start_air_o2_calibration(target_points=None):

@@ -7,6 +7,7 @@ from Service.UFC_UGC_ZOS_Service.function.Send_Message.Send_Message import Send_
 from Service.UFC_UGC_ZOS_Service.function.o2_compensation import (
     get_o2_calibration_handler,
     reload_o2_compensation_config,
+    start_new_o2_calibration,
 )
 from public.config_class.global_setting import global_setting
 from public.entity.enum.Public_Enum import GapSystem_Running_Type
@@ -83,6 +84,17 @@ class Startup_O2_Span_Air_Calibration:
             return max(0.5, float(raw))
         except (TypeError, ValueError):
             return 2.0
+
+    @staticmethod
+    def _span_value():
+        raw = global_setting.get_setting("span_standard_oxygen_value", 20.50)
+        try:
+            value = float(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Span标准气氧浓度无效：{raw!r}") from exc
+        if not 15.0 <= value <= 25.0:
+            raise ValueError(f"Span标准气氧浓度必须在15.0%到25.0%之间，当前为{value}%")
+        return value
 
     @staticmethod
     def _channel_name(channel):
@@ -295,16 +307,21 @@ class Startup_O2_Span_Air_Calibration:
                 raise RuntimeError("未选择串口，无法执行O2 Span+空气校准")
             target_points = self._target_points()
             sample_interval = self._sample_interval()
+            span_value = self._span_value()
+            start_new_o2_calibration(
+                target_points=target_points,
+                span_value=span_value,
+            )
             self._handler = get_o2_calibration_handler(target_points=target_points)
-            self._handler.start_new_calibration(target_points)
 
             global_setting.set_setting("is_calibrating", True)
             global_setting.set_setting("current_calibration_type", self.name)
             self._send_text(
-                f"开始 O₂ Span+空气校准；每路目标 {target_points} 点，通道间隔 {sample_interval:g} 秒"
+                f"开始 O₂ Span+空气校准；Span标准气 {span_value:g}%，"
+                f"每路目标 {target_points} 点，通道间隔 {sample_interval:g} 秒"
             )
 
-            # Span phase: enable manifold/ZOS calibration mode, then use 20.50% gas.
+            # Span phase: use the certified concentration configured by the operator.
             self._set_coil(4, 9, True, "切换ZOS校准采样状态")
             self._set_coil(3, 2, True, "开启UGC Span标准气")
             self._set_coil(3, 0, False, "关闭UGC空气阀")

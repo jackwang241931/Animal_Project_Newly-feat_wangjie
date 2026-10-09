@@ -125,6 +125,16 @@ class CalibrationHandler:
         self.target_points = n
         return self.target_points
 
+    def set_target_span(self, span_value):
+        """Set the certified O2 concentration of the current span gas."""
+        if span_value is None:
+            return self.target_span
+        span_value = float(span_value)
+        if not math.isfinite(span_value) or not 15.0 <= span_value <= 25.0:
+            raise ValueError("span_value must be a finite value between 15.0 and 25.0")
+        self.target_span = span_value
+        return self.target_span
+
     def reset(self):
         self.phase_data = {ch: {"span": [], "air": []} for ch in self.channels}
         self.is_active = False
@@ -159,6 +169,9 @@ class CalibrationHandler:
         self.air_lock = float(lock) if lock is not None else AIR_NOMINAL
         self.air_cal_count = int(cfg.get("air_cal_count", 0))
         self.target_o2 = float(cfg.get("target_o2", AIR_NOMINAL))
+        saved_target_span = cfg.get("target_span")
+        if saved_target_span is not None:
+            self.set_target_span(saved_target_span)
         last_c = cfg.get("blk_u") or {}
         last_d = cfg.get("blk_v") or {}
         for ch in self.channels:
@@ -169,17 +182,29 @@ class CalibrationHandler:
         self.match_gain = dict(cfg.get("match_gain") or {})
         self.match_bias = dict(cfg.get("match_bias") or {})
 
-    def start_new_calibration(self, target_points=None):
+    def start_new_calibration(self, target_points=None, span_value=None):
         if target_points is not None:
             self.set_target_points(target_points)
+        # Keep the original 20.50% behavior when an older caller does not pass
+        # the cylinder value.  New callers can calibrate against any supported
+        # certified span concentration.
+        requested_target_span = SPAN_TRUE if span_value is None else span_value
+        requested_target_span = float(requested_target_span)
+        if not math.isfinite(requested_target_span) or not 15.0 <= requested_target_span <= 25.0:
+            raise ValueError("span_value must be a finite value between 15.0 and 25.0")
         cfg = self._load_existing()
         with self.lock:
             self.reset()
             self._apply_existing(cfg)
+            self.set_target_span(requested_target_span)
             self.cal_mode = "full"
             self.is_active = True
             self.skip_b_update = True
-        logger.info("full cal, points=%s", self.target_points)
+        logger.info(
+            "full cal, points={}, target_span={:.4f}",
+            self.target_points,
+            self.target_span,
+        )
         return True
 
     def start_air_touchup(self, target_points=None):
@@ -254,7 +279,7 @@ class CalibrationHandler:
         if self.cal_mode == "full":
             for ch in self.channels:
                 xs = self._stable_median(self.phase_data[ch]["span"])
-                offs[ch] = SPAN_TRUE - xs if not np.isnan(xs) else offs[ch]
+                offs[ch] = self.target_span - xs if not np.isnan(xs) else offs[ch]
                 self.gains[ch] = 1.0
         air_dry = {}
         air_corr = {}
@@ -297,7 +322,7 @@ class CalibrationHandler:
             "algorithm": "span_offset_g1_air_lock",
             "calibration_time": datetime.now().isoformat(),
             "target_o2": AIR_NOMINAL,
-            "target_span": SPAN_TRUE,
+            "target_span": self.target_span,
             "air_lock": self.air_lock,
             "air_measured": self.air_measured,
             "air_cal_count": self.air_cal_count,
@@ -335,6 +360,7 @@ class CalibrationHandler:
                 "failed": False,
                 "failure_reason": None,
                 "target_points": self.target_points,
+                "target_span": self.target_span,
                 "air_lock": self.air_lock,
                 "air_measured": self.air_measured,
                 "air_cal_count": self.air_cal_count,
