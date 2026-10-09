@@ -13,6 +13,7 @@ from Service.UFC_UGC_ZOS_Service.function.gas_calibration.Gas_Carlibration impor
 )
 from Service.UFC_UGC_ZOS_Service.index.UFC_UGC_ZOS_index import UFC_UGC_ZOS_index
 from public.config_class.global_setting import global_setting
+from public.function.promise.AsyPromise import AsyPromise
 
 
 CHANNELS = ["REF"] + [f"M{i}" for i in range(1, 9)]
@@ -97,6 +98,177 @@ class O2SpanFullAirWorkflowTests(unittest.TestCase):
         )
         positions = [source.index(token) for token in expected_order]
         self.assertEqual(sorted(positions), positions)
+
+    def test_span_handler_handoff_receives_unwrapped_handler(self):
+        handler = _ContinuedO2Handler()
+        received = []
+        service = SimpleNamespace(
+            Startup_air_calibration_obj=SimpleNamespace(
+                continue_full_o2_calibration=lambda value, stop_checker=None: received.append(
+                    (value, stop_checker)
+                )
+            ),
+            Startup_o2_span_air_calibration_obj=SimpleNamespace(
+                is_stop_requested=lambda: False
+            ),
+        )
+
+        AsyPromise.resolve_immediately(None).then(
+            lambda _: AsyPromise.resolve_immediately(handler)
+        ).then(
+            lambda value: UFC_UGC_ZOS_index._handoff_o2_span_handler_to_full_air(
+                service, value
+            )
+        )
+
+        self.assertEqual(handler, received[0][0])
+        self.assertIs(handler, received[0][0])
+
+    def test_span_handler_handoff_rejects_nested_promise_value(self):
+        service = SimpleNamespace(
+            Startup_air_calibration_obj=SimpleNamespace(),
+            Startup_o2_span_air_calibration_obj=SimpleNamespace(
+                is_stop_requested=lambda: False
+            ),
+        )
+
+        with self.assertRaisesRegex(TypeError, "不是有效处理器"):
+            UFC_UGC_ZOS_index._handoff_o2_span_handler_to_full_air(
+                service,
+                AsyPromise.resolve_immediately(_ContinuedO2Handler()),
+            )
+
+    def test_combined_startup_chain_handles_synchronous_callback_steps(self):
+        calls = []
+        handler = _ContinuedO2Handler()
+
+        def step(name, value=None):
+            def executor(resolve, reject):
+                calls.append(name)
+                resolve(value)
+
+            return executor
+
+        class _Signal:
+            @staticmethod
+            def send(*args, **kwargs):
+                calls.append("log")
+
+        air = SimpleNamespace(
+            continue_full_o2_calibration=lambda value, stop_checker=None: calls.append(
+                "handoff"
+            ),
+            start=step("air_start"),
+            wait_air_calibration_prepare=step("air_prepare"),
+            run=step("air_run"),
+            stop=step("air_stop"),
+            clear_continued_o2_calibration=lambda: None,
+        )
+        span = SimpleNamespace(
+            run_span_only=step("span", handler),
+            complete_after_full_air=step("complete"),
+            is_stop_requested=lambda: False,
+            abort_pending_calibration=lambda: None,
+        )
+        service = SimpleNamespace(
+            update_status_main_signal_gui_update=_Signal(),
+            _prepare_startup_calibration_cages=lambda: calls.append("prepare"),
+            UFC_gas_state_check_obj=SimpleNamespace(
+                read_start_status=step("read_status", {"ufc_status": 1})
+            ),
+            UFC_gas_path_system_obj=SimpleNamespace(
+                start=step("ufc_start"),
+                set_startup_status=lambda status: calls.append("remember_status"),
+            ),
+            UGC_gas_path_system_obj=SimpleNamespace(start=step("ugc_start")),
+            ZOS_gas_path_system_obj=SimpleNamespace(start=step("zos_start")),
+            Startup_o2_span_air_calibration_obj=span,
+            Startup_air_calibration_obj=air,
+            _remember_ufc_start_status=lambda status: (
+                calls.append("remember_status") or status
+            ),
+            _handoff_o2_span_handler_to_full_air=lambda value: (
+                UFC_UGC_ZOS_index._handoff_o2_span_handler_to_full_air(
+                    service, value
+                )
+            ),
+            finish_start=step("finish_start"),
+            _reject_o2_span_air_start=lambda error: AsyPromise.reject_immediately(error),
+        )
+
+        result = UFC_UGC_ZOS_index.start_btn_handle_with_o2_span_air_calibration(
+            service
+        )
+
+        self.assertEqual(AsyPromise.RESOLVED, result._state)
+        self.assertEqual(
+            [
+                "prepare",
+                "log",
+                "read_status",
+                "remember_status",
+                "ugc_start",
+                "zos_start",
+                "ufc_start",
+                "span",
+                "handoff",
+                "air_start",
+                "air_prepare",
+                "air_run",
+                "air_stop",
+                "complete",
+                "finish_start",
+            ],
+            calls,
+        )
+
+    def test_failed_startup_rolls_back_ufc_before_ugc_and_zos(self):
+        calls = []
+
+        def stop_step(name, should_fail=False):
+            def executor(resolve, reject):
+                calls.append(name)
+                if should_fail:
+                    reject(f"{name} failed")
+                else:
+                    resolve()
+
+            return executor
+
+        service = SimpleNamespace(
+            stop=lambda: calls.append("thread_stop"),
+        )
+        service._rollback_failed_start_paths = (
+            lambda original_error, paths, index: UFC_UGC_ZOS_index._rollback_failed_start_paths(
+                service, original_error, paths, index
+            )
+        )
+        service._continue_failed_start_rollback = (
+            lambda original_error, module_name, cleanup_error, paths, next_index: UFC_UGC_ZOS_index._continue_failed_start_rollback(
+                service,
+                original_error,
+                module_name,
+                cleanup_error,
+                paths,
+                next_index,
+            )
+        )
+        paths = [
+            ("UFC", SimpleNamespace(stop=stop_step("ufc", should_fail=True))),
+            ("UGC", SimpleNamespace(stop=stop_step("ugc"))),
+            ("ZOS", SimpleNamespace(stop=stop_step("zos"))),
+        ]
+
+        result = UFC_UGC_ZOS_index._rollback_failed_start_paths(
+            service,
+            "startup failed",
+            paths,
+            0,
+        )
+
+        self.assertEqual(["ufc", "ugc", "zos", "thread_stop"], calls)
+        self.assertEqual(AsyPromise.REJECTED, result._state)
+        self.assertEqual("startup failed", result._reason)
 
     def test_co2_zero_forwards_real_ufc_status_dictionary(self):
         expected = {"ufc_status": 1, "air_pump": 0}

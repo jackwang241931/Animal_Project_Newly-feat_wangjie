@@ -404,8 +404,9 @@ class UFC_UGC_ZOS_index(MyQThread):
             "STARTUP_AIR_CALIBRATION",
             {"type": "calibration_failed", "value": f"Air气路启动流程失败: {error}"},
         )
-        return AsyPromise.log_and_reject(
-            error, logger=logger, message_prefix="Air气路启动流程失败"
+        return self._rollback_failed_calibrated_start(
+            error,
+            "Air气路启动流程失败",
         )
 
     def co2_zero_calibration_obj_calibrate_wrapped(self, resolve, reject):
@@ -419,11 +420,8 @@ class UFC_UGC_ZOS_index(MyQThread):
     def _co2_zero_then_read_ufc_start_status(self, resolve, reject):
         """Run CO2 zero first and forward the actual UFC status dictionary.
 
-        AsyPromise does not flatten a promise returned from ``then`` when the
-        previous promise has already resolved.  CO2 zero waits synchronously,
-        so nesting the UFC query in ``then`` forwarded an AsyPromise object
-        instead of the status dictionary.  Bridge both callback-style steps
-        directly to preserve the real result.
+        Keep both callback-style steps explicitly connected so the UFC status
+        dictionary is forwarded unchanged after CO2 zero finishes.
         """
 
         def read_ufc_status_after_zero(*_):
@@ -492,6 +490,12 @@ class UFC_UGC_ZOS_index(MyQThread):
         )
 
     def _handoff_o2_span_handler_to_full_air(self, handler):
+        if isinstance(handler, AsyPromise) or not callable(
+            getattr(handler, "get_status", None)
+        ):
+            raise TypeError(
+                "O2 Span校准结果不是有效处理器，无法进入完整Air空气校准"
+            )
         self.Startup_air_calibration_obj.continue_full_o2_calibration(
             handler,
             stop_checker=self.Startup_o2_span_air_calibration_obj.is_stop_requested,
@@ -500,6 +504,11 @@ class UFC_UGC_ZOS_index(MyQThread):
 
     def _reject_o2_span_air_start(self, error):
         self.Startup_air_calibration_obj.clear_continued_o2_calibration()
+        self.Startup_o2_span_air_calibration_obj.request_stop()
+        try:
+            self.Startup_o2_span_air_calibration_obj._restore_safe_gas_state()
+        except Exception:
+            logger.exception("O2 Span+空气校准失败后的安全气路恢复异常")
         self.Startup_o2_span_air_calibration_obj.abort_pending_calibration()
         self.update_status_main_signal_gui_update.send(
             f"{time_util.get_format_from_time(time.time())} | O₂ Span+空气启动流程失败：{error}",
@@ -509,9 +518,83 @@ class UFC_UGC_ZOS_index(MyQThread):
             "STARTUP_O2_SPAN_AIR_CALIBRATION",
             {"type": "calibration_failed", "value": f"O2 Span+空气校准启动流程失败: {error}"},
         )
-        return AsyPromise.log_and_reject(
-            error, logger=logger, message_prefix="O2 Span+空气校准启动流程失败"
+        return self._rollback_failed_calibrated_start(
+            error,
+            "O2 Span+空气校准启动流程失败",
         )
+
+    def _rollback_failed_calibrated_start(self, error, message_prefix):
+        """Cancel calibration, report startup failure and close partial gas paths."""
+        global stop_flag
+        stop_flag = True
+        global_setting.set_setting("calibration_cancel_requested", True)
+        global_setting.set_setting("is_calibrating", False)
+        global_setting.set_setting("current_calibration_type", None)
+
+        message = f"{message_prefix}：{error}"
+        logger.error(message)
+        queue = global_setting.get_setting("queue", None)
+        if queue:
+            queue.put(ObjectQueueItem(
+                origin="UFC_UGC_ZOS_index",
+                to="MainWindow_index",
+                title="start_experiment_failed",
+                data=message,
+                time=time_util.get_format_from_time(time.time()),
+            ))
+
+        # On abnormal startup, stop UFC first so the pump/flow controller can
+        # no longer keep drawing gas, then close UGC and ZOS.
+        return self._rollback_failed_start_paths(
+            error,
+            [
+                ("UFC", self.UFC_gas_path_system_obj),
+                ("UGC", self.UGC_gas_path_system_obj),
+                ("ZOS", self.ZOS_gas_path_system_obj),
+            ],
+            0,
+        )
+
+    def _rollback_failed_start_paths(self, original_error, paths, index):
+        if index >= len(paths):
+            self.stop()
+            return AsyPromise.reject_immediately(original_error)
+
+        module_name, path_system = paths[index]
+        if path_system is None:
+            return self._rollback_failed_start_paths(
+                original_error, paths, index + 1
+            )
+
+        try:
+            stop_promise = AsyPromise(path_system.stop)
+        except Exception as cleanup_error:
+            logger.exception(f"启动失败后关闭{module_name}异常：{cleanup_error}")
+            return self._rollback_failed_start_paths(
+                original_error, paths, index + 1
+            )
+
+        return stop_promise.then(
+            lambda _: self._rollback_failed_start_paths(
+                original_error, paths, index + 1
+            ),
+            lambda cleanup_error: self._continue_failed_start_rollback(
+                original_error,
+                module_name,
+                cleanup_error,
+                paths,
+                index + 1,
+            ),
+        )
+
+    def _continue_failed_start_rollback(
+        self, original_error, module_name, cleanup_error, paths, next_index
+    ):
+        logger.error(f"启动失败后关闭{module_name}未确认：{cleanup_error}")
+        return self._rollback_failed_start_paths(
+            original_error, paths, next_index
+        )
+
     def _remember_ufc_start_status(self, startup_status):
         self.UFC_gas_path_system_obj.set_startup_status(startup_status)
         return startup_status
@@ -521,30 +604,29 @@ class UFC_UGC_ZOS_index(MyQThread):
         global stop_flag
         stop_flag = False
 
-        p = AsyPromise(self.ZOS_gas_path_system_obj.start).then(
-            lambda _: AsyPromise(self.UGC_gas_path_system_obj.start).then(
-                lambda _: AsyPromise(self.UFC_gas_path_system_obj.start).then(
-                    lambda _: AsyPromise(self.Startup_co2_air_calibration_obj.start).then(
-                        lambda _: AsyPromise(self.Startup_co2_air_calibration_obj.wait_air_calibration_prepare).then(
-                            lambda _: AsyPromise(self.Startup_co2_air_calibration_obj.run).then(
-                                lambda _: AsyPromise(self.Startup_co2_air_calibration_obj.stop).then(
-                                    lambda _: AsyPromise(self.finish_start)
-                                ).catch(self._log_co2_air_failure)
-                            ).catch(self._log_co2_air_failure)
-                        ).catch(self._log_co2_air_failure)
-                    ).catch(self._log_co2_air_failure)
-                ).catch(self._log_co2_air_failure)
-            ).catch(self._log_co2_air_failure)
-        ).catch(self._log_co2_air_failure)
-
-        return p
+        return (
+            AsyPromise(self.ZOS_gas_path_system_obj.start)
+            .then(lambda _: AsyPromise(self.UGC_gas_path_system_obj.start))
+            .then(lambda _: AsyPromise(self.UFC_gas_path_system_obj.start))
+            .then(lambda _: AsyPromise(self.Startup_co2_air_calibration_obj.start))
+            .then(lambda _: AsyPromise(
+                self.Startup_co2_air_calibration_obj.wait_air_calibration_prepare
+            ))
+            .then(lambda _: AsyPromise(self.Startup_co2_air_calibration_obj.run))
+            .then(lambda _: AsyPromise(self.Startup_co2_air_calibration_obj.stop))
+            .then(lambda _: AsyPromise(self.finish_start))
+            .catch(self._log_co2_air_failure)
+        )
 
     def _log_co2_air_failure(self, error):
         self.calibration_log_recorder.record(
             "STARTUP_CO2_AIR_CALIBRATION",
             {"type": "calibration_failed", "value": f"CO2 Air气路启动流程失败: {error}"},
         )
-        logger.error(f"{error}")
+        return self._rollback_failed_calibrated_start(
+            error,
+            "CO2 Air气路启动流程失败",
+        )
 
     def calibration_start(self, resolve, reject):
         self._run_callback_steps(

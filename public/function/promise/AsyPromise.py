@@ -2,21 +2,24 @@ import sys
 import traceback
 
 
+_UNSET = object()
+
+
 class AsyPromise:
     PENDING = 'pending'
     RESOLVED = 'resolved'
     REJECTED = 'rejected'
 
-    def __init__(self, executor=None, reject_with=None, resolve_with=None, **kwargs):
+    def __init__(self, executor=None, reject_with=_UNSET, resolve_with=_UNSET, **kwargs):
         self._state = AsyPromise.PENDING
         self._value = None
         self._reason = None
         self._on_fulfilled = []
         self._on_rejected = []
 
-        if reject_with is not None:
+        if reject_with is not _UNSET:
             self.reject(reject_with)
-        elif resolve_with is not None:
+        elif resolve_with is not _UNSET:
             self.resolve(resolve_with)
         elif executor:
             try:
@@ -138,10 +141,18 @@ class AsyPromise:
             else:
                 raise Exception(str(reason))
 
+        # A callback may return another AsyPromise.  Use the same propagation
+        # path for promises that have already settled and promises that settle
+        # later, otherwise an already-resolved step forwards the AsyPromise
+        # object itself instead of waiting for/unwrapping its result.
         if self._state == AsyPromise.RESOLVED:
-            return AsyPromise(lambda resolve, reject: resolve(_wrap_on_fulfilled(self._value)))
+            nxt = AsyPromise()
+            self._propagate(nxt, _wrap_on_fulfilled, self._value)
+            return nxt
         if self._state == AsyPromise.REJECTED:
-            return AsyPromise(lambda resolve, reject: reject(_wrap_on_rejected(self._reason)))
+            nxt = AsyPromise()
+            self._propagate(nxt, _wrap_on_rejected, self._reason)
+            return nxt
 
         nxt = AsyPromise()
         self._on_fulfilled.append(lambda v: self._propagate(nxt, _wrap_on_fulfilled, v))
