@@ -2151,7 +2151,15 @@ def _patched_open_gas_pump_and_flow_for_zero_v2(self, resolve, reject, port):
 
 
 def _patched_wait_one_minute_for_zero_v2(self, resolve, reject, step_desc):
-    if self.is_STOP:
+    def stop_requested():
+        return bool(
+            self.is_STOP
+            or getattr(self, "_stop_requested", False)
+            or self.isInterruptionRequested()
+            or global_setting.get_setting("calibration_cancel_requested", False)
+        )
+
+    if stop_requested():
         reject("stop")
         return
 
@@ -2161,7 +2169,7 @@ def _patched_wait_one_minute_for_zero_v2(self, resolve, reject, step_desc):
     waited = 0.0
 
     while waited < wait_time:
-        if self.is_STOP:
+        if stop_requested():
             reject("stop")
             return
 
@@ -2169,7 +2177,16 @@ def _patched_wait_one_minute_for_zero_v2(self, resolve, reject, step_desc):
             f"{time_util.get_format_from_time(time.time())} | {self.name}校准：{step_desc}，当前等待 {int(waited)}/{int(wait_time)} 秒",
             title=self.title
         )
-        time.sleep(wait_time_delay)
+        # Keep one progress line per configured interval, but poll the stop
+        # request frequently so experiment shutdown cancels calibration first.
+        interval_end = time.monotonic() + wait_time_delay
+        while time.monotonic() < interval_end:
+            if stop_requested():
+                reject("stop")
+                return
+            remaining = interval_end - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(0.1, remaining))
         waited += wait_time_delay
 
     resolve()

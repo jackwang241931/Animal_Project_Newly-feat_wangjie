@@ -8,7 +8,11 @@ from Module.new_experiment_setting.main import Main_experiment_calibration
 from Service.UFC_UGC_ZOS_Service.function.startup_air_calibration.Startup_Air_Calibration import (
     Startup_Air_Calibration,
 )
+from Service.UFC_UGC_ZOS_Service.function.gas_calibration.Gas_Carlibration import (
+    _patched_wait_one_minute_for_zero_v2,
+)
 from Service.UFC_UGC_ZOS_Service.index.UFC_UGC_ZOS_index import UFC_UGC_ZOS_index
+from public.config_class.global_setting import global_setting
 
 
 CHANNELS = ["REF"] + [f"M{i}" for i in range(1, 9)]
@@ -145,6 +149,28 @@ class O2SpanFullAirWorkflowTests(unittest.TestCase):
         self.assertEqual(["zero", "span"], calls)
         self.assertEqual([], resolved)
         self.assertEqual(["span failed"], rejected)
+
+    def test_calibration_wait_observes_process_wide_stop_request(self):
+        worker = SimpleNamespace(
+            is_STOP=False,
+            _stop_requested=False,
+            isInterruptionRequested=lambda: False,
+        )
+        resolved = []
+        rejected = []
+        global_setting.set_setting("calibration_cancel_requested", True)
+        try:
+            _patched_wait_one_minute_for_zero_v2(
+                worker,
+                lambda: resolved.append(True),
+                rejected.append,
+                "开启气泵后等待一分钟",
+            )
+        finally:
+            global_setting.set_setting("calibration_cancel_requested", False)
+
+        self.assertEqual([], resolved)
+        self.assertEqual(["stop"], rejected)
 
 
 if __name__ == "__main__":

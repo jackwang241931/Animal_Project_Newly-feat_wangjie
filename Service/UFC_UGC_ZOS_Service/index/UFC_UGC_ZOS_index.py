@@ -561,6 +561,11 @@ class UFC_UGC_ZOS_index(MyQThread):
         """Run callback-style startup steps strictly in order."""
 
         def run_step(index):
+            if stop_flag or global_setting.get_setting(
+                "calibration_cancel_requested", False
+            ):
+                reject("实验停止，校准启动链已取消")
+                return
             if index >= len(steps):
                 resolve()
                 return
@@ -693,6 +698,7 @@ class UFC_UGC_ZOS_index(MyQThread):
             self.UFC_gas_path_system_obj.ufc_gas_path_system_start_thread.is_stop=True
         global auto_wait_event,stop_flag
         stop_flag = True
+        global_setting.set_setting("calibration_cancel_requested", True)
         self._stop_requested = True
         self._shutdown_errors = []
         # 先同步设置标定线程的取消标志并等待其退出，再发关气路命令，
@@ -865,6 +871,7 @@ class UFC_UGC_ZOS_index(MyQThread):
         :return:
         """
 
+        global_setting.set_setting("calibration_cancel_requested", False)
         p = AsyPromise(
             self.span_carlibration_obj_calibrate_wrapped
         ).then().catch( lambda e: logger.error(f"{e}"))
@@ -875,6 +882,7 @@ class UFC_UGC_ZOS_index(MyQThread):
         :return:
         """
 
+        global_setting.set_setting("calibration_cancel_requested", False)
         p = AsyPromise(
             self.zero_carlibration_obj_calibrate_wrapped
         ).then().catch( lambda e: logger.error(f"{e}"))
@@ -884,6 +892,7 @@ class UFC_UGC_ZOS_index(MyQThread):
         按钮点击的标定事件
         :return:
         """
+        global_setting.set_setting("calibration_cancel_requested", False)
         return AsyPromise(self.zero_carlibration_obj_calibrate_wrapped).then(
             lambda _: AsyPromise(self.span_carlibration_obj_calibrate_wrapped)
         ).catch(lambda e: logger.error(f"{e}"))
@@ -949,6 +958,7 @@ class UFC_UGC_ZOS_index(MyQThread):
             time.sleep(0.05)
             return
         self._startup_chain_started = True
+        global_setting.set_setting("calibration_cancel_requested", False)
         # 是否自动校准气路
         startup_calibration_mode = global_setting.get_setting("startup_calibration_mode", None)
         is_auto_calibration = global_setting.get_setting("is_auto_calibration", False)
