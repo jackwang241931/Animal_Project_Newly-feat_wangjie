@@ -34,6 +34,34 @@ class MetabolismCalculationTests(unittest.TestCase):
             sample = {**self.sample, **change}
             self.assertTrue(all(value is None for value in calculate_epoch_metabolism(sample).values()))
 
+    def test_negative_calculated_values_are_preserved(self):
+        negative_vco2 = calculate_epoch_metabolism({**self.sample, "UGC_CO2_num": 0.0})
+        self.assertGreater(negative_vco2["vo2_consumption"], 0)
+        self.assertLess(negative_vco2["vco2_production"], 0)
+        self.assertLess(negative_vco2["rer_rq"], 0)
+        self.assertIsNotNone(negative_vco2["ee_energy_expenditure"])
+
+        negative_vo2 = calculate_epoch_metabolism({
+            **self.sample,
+            "ZOS_dry_basis_oxygen_num": 21.2,
+            "UGC_CO2_num": 0.0,
+        })
+        self.assertLess(negative_vo2["vo2_consumption"], 0)
+        self.assertLess(negative_vo2["vco2_production"], 0)
+        self.assertIsNotNone(negative_vo2["rer_rq"])
+        self.assertLess(negative_vo2["ee_energy_expenditure"], 0)
+
+    def test_zero_vo2_only_leaves_rer_unavailable(self):
+        result = calculate_epoch_metabolism({
+            **self.sample,
+            "ZOS_dry_basis_oxygen_num": 20.93,
+            "UGC_CO2_num": 0.04,
+        })
+        self.assertEqual(result["vo2_consumption"], 0)
+        self.assertEqual(result["vco2_production"], 0)
+        self.assertIsNone(result["rer_rq"])
+        self.assertEqual(result["ee_energy_expenditure"], 0)
+
     def test_existing_epoch_tables_gain_persisted_result_columns(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
             path = os.path.join(directory, "data.db")
