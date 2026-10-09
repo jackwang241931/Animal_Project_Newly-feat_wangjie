@@ -11,8 +11,10 @@ import pandas as pd
 from loguru import logger
 
 VALID_CHANNELS = ["REF"] + [f"M{i}" for i in range(1, 9)]
-AIR_NOMINAL = 20.93
-_k17 = 0.75
+AIR_NOMINAL = 20.90
+AIR_LOCK_MIN = 20.86
+AIR_LOCK_MAX = 20.95
+_k17 = 1.0
 
 _COMPENSATOR_LOCK = threading.Lock()
 _COMPENSATOR = None
@@ -66,6 +68,8 @@ class RealtimeO2Compensator:
         self.config_path = Path(config_path or get_default_config_path())
         self.offsets = {ch: 0.0 for ch in VALID_CHANNELS}
         self.gains = {ch: 1.0 for ch in VALID_CHANNELS}
+        self.match_gain = {ch: _k17 for ch in VALID_CHANNELS if ch != "REF"}
+        self.match_bias = {ch: 0.0 for ch in VALID_CHANNELS if ch != "REF"}
         self.air_lock = AIR_NOMINAL
         self.air_corr_last = {ch: None for ch in VALID_CHANNELS}
         self.ref_corr = None
@@ -100,10 +104,18 @@ class RealtimeO2Compensator:
             self.gains[ch] = 1.0
         lock = cfg.get("air_lock", AIR_NOMINAL)
         self.air_lock = float(lock) if lock is not None else AIR_NOMINAL
+        self.air_lock = min(AIR_LOCK_MAX, max(AIR_LOCK_MIN, self.air_lock))
         last = cfg.get("blk_u") or {}
         for ch in VALID_CHANNELS:
             if ch in last and last[ch] is not None:
                 self.air_corr_last[ch] = float(last[ch])
+        match_gain = cfg.get("match_gain") or {}
+        match_bias = cfg.get("match_bias") or {}
+        for ch in VALID_CHANNELS:
+            if ch == "REF":
+                continue
+            self.match_gain[ch] = float(match_gain.get(ch, _k17))
+            self.match_bias[ch] = float(match_bias.get(ch, 0.0))
         self._config_mtime_ns = current
         logger.info("reload calib air_lock=%.4f", self.air_lock)
         return True
@@ -131,10 +143,12 @@ class RealtimeO2Compensator:
             return float(self.air_lock) if self.has_valid_reference_sample() else None
         if not self.has_valid_reference_sample():
             # A chamber value without a real REF sample is not measurable.
-            # Do not substitute air_lock (20.93), because that would turn
+            # Do not substitute air_lock, because that would turn
             # missing reference data into an apparently valid observation.
             return None
-        return float(self.air_lock + _k17 * (corr - self.ref_corr))
+        gain = float(self.match_gain.get(channel, _k17))
+        bias = float(self.match_bias.get(channel, 0.0))
+        return float(self.air_lock + bias + gain * (corr - self.ref_corr))
 
 
 def get_realtime_o2_compensator():

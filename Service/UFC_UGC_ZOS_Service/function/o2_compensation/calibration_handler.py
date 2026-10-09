@@ -14,9 +14,9 @@ from loguru import logger
 
 VALID_CHANNELS = ["REF"] + [f"M{i}" for i in range(1, 9)]
 SPAN_TRUE = 20.50
-AIR_NOMINAL = 20.93
-AIR_ABS_LIMIT = 0.03
-AIR_STEP_LIMIT = 0.03
+AIR_NOMINAL = 20.90
+AIR_LOCK_MIN = 20.86
+AIR_LOCK_MAX = 20.95
 DEFAULT_TARGET_POINTS = 25
 STABLE_FRAC = 0.40
 
@@ -114,6 +114,8 @@ class CalibrationHandler:
         self.target_o2 = AIR_NOMINAL
         self.target_span = SPAN_TRUE
         self._drift = _UnusedDriftModel()
+        self.match_gain = {}
+        self.match_bias = {}
         self.reset()
 
     def set_target_points(self, n):
@@ -164,6 +166,8 @@ class CalibrationHandler:
                 self.air_corr_last[ch] = float(last_c[ch])
             if ch in last_d and last_d[ch] is not None:
                 self.air_dry_last[ch] = float(last_d[ch])
+        self.match_gain = dict(cfg.get("match_gain") or {})
+        self.match_bias = dict(cfg.get("match_bias") or {})
 
     def start_new_calibration(self, target_points=None):
         if target_points is not None:
@@ -242,7 +246,6 @@ class CalibrationHandler:
     def _finish_unlocked(self):
         global _BOOT_AIR_DONE
         cfg = self._load_existing()
-        prev_lock = float(cfg.get("air_lock", AIR_NOMINAL) or AIR_NOMINAL)
         prev_count = int(cfg.get("air_cal_count", 0))
         offs = {
             ch: float((cfg.get("offsets") or {}).get(ch, self.offsets.get(ch, 0.0)))
@@ -263,8 +266,7 @@ class CalibrationHandler:
         if pd.isna(measured):
             measured = float(np.nanmean([v for v in air_corr.values() if not pd.isna(v)]))
         self.air_measured = float(measured)
-        locked = _clip(measured, prev_lock - AIR_STEP_LIMIT, prev_lock + AIR_STEP_LIMIT)
-        locked = _clip(locked, AIR_NOMINAL - AIR_ABS_LIMIT, AIR_NOMINAL + AIR_ABS_LIMIT)
+        locked = _clip(measured, AIR_LOCK_MIN, AIR_LOCK_MAX)
         if self.cal_mode == "air" and not self.skip_b_update:
             shift = locked - measured
             ref_corr = air_corr.get("REF", measured)
@@ -284,6 +286,8 @@ class CalibrationHandler:
         self.completed = True
         self.is_active = False
         _BOOT_AIR_DONE = True
+        self.match_gain = dict(cfg.get("match_gain") or self.match_gain)
+        self.match_bias = dict(cfg.get("match_bias") or self.match_bias)
         self._save_unlocked()
         logger.info("cal done mode=%s air_lock=%.4f", self.cal_mode, self.air_lock)
 
@@ -302,6 +306,8 @@ class CalibrationHandler:
             "gains": {ch: 1.0 for ch in self.channels},
             "blk_u": self.air_corr_last,
             "blk_v": self.air_dry_last,
+            "match_gain": self.match_gain,
+            "match_bias": self.match_bias,
         }
         self.config_path.parent.mkdir(parents=True, exist_ok=True)
         with self.config_path.open("w", encoding="utf-8") as f:
@@ -334,4 +340,6 @@ class CalibrationHandler:
                 "air_cal_count": self.air_cal_count,
                 "blk_u": dict(self.air_corr_last),
                 "config_path": str(self.config_path),
+                "match_gain": dict(self.match_gain),
+                "match_bias": dict(self.match_bias),
             }
