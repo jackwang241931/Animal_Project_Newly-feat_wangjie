@@ -53,11 +53,11 @@ def calculate_epoch_metabolism(values: Mapping):
     vi = vo * no / ni
     vo2 = vi * fi_o2 - vo * fe_o2
     vco2 = vo * fe_co2 - vi * fi_co2
+    if vo2 <= 0 or vco2 < 0:
+        return unavailable
     return {
         "vo2_consumption": vo2,
         "vco2_production": vco2,
-        # Preserve negative computed results for diagnosis. RER alone is
-        # undefined when VO2 is exactly zero, so leave only that field blank.
-        "rer_rq": vco2 / vo2 if vo2 != 0 else None,
+        "rer_rq": vco2 / vo2,
         "ee_energy_expenditure": 60.0 * (3.941 * vo2 + 1.106 * vco2),
     }

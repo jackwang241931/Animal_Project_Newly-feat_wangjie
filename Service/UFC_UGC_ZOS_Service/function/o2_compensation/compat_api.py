@@ -113,16 +113,7 @@ def _has_reference_sample(compensator: Any) -> bool:
             return bool(checker())
         except Exception as exc:
             logger.warning(f"O2 reference sample check failed: {exc}")
-    # The current realtime core stores the most recently accepted REF
-    # correction here instead of exposing the older checker/buffer contract.
-    # ref_corr is assigned only after a REF sample has passed dry-O2 validation.
-    reference_correction = getattr(compensator, "ref_corr", None)
-    if reference_correction is not None:
-        try:
-            if math.isfinite(float(reference_correction)):
-                return True
-        except (TypeError, ValueError, OverflowError):
-            pass
+            return False
 
     # Older supplier implementations expose only the buffer.
     buffer = getattr(compensator, "dry_ref_buffer", None)
