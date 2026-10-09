@@ -1492,7 +1492,9 @@ class ExperimentConfigPage(QWidget):
         mode = global_setting.get_setting("startup_calibration_mode", "none")
         if mode == "air_co2":
             mode = "air"
-        return mode if mode in {"none", "air", "zero", "span", "full"} else "none"
+        return mode if mode in {
+            "none", "air", "zero", "span", "full", "o2_span_air", "co2_o2_span_air"
+        } else "none"
 
     @staticmethod
     def _startup_calibration_label(mode: str) -> str:
@@ -1501,6 +1503,8 @@ class ExperimentConfigPage(QWidget):
             "zero": "校零",
             "span": "校量程",
             "full": "校零+校span",
+            "o2_span_air": "O2 Span+空气校准",
+            "co2_o2_span_air": "CO2校零+O2 Span+空气校准",
         }.get(mode, "不校准")
 
     @staticmethod

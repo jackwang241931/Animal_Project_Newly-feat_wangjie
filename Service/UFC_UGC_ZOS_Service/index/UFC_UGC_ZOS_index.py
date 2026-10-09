@@ -426,7 +426,7 @@ class UFC_UGC_ZOS_index(MyQThread):
             global_setting.set_setting("mouse_cages", cage_ids)
 
     def start_btn_handle_with_o2_span_air_calibration(self, include_co2_zero=False):
-        """Start the normal gas path, run the supplied O2 Span→Air routine, then continue startup."""
+        """Run optional CO2 zero, O2 Span, then the established full Air workflow."""
         global stop_flag
         stop_flag = False
         self._prepare_startup_calibration_cages()
@@ -452,12 +452,31 @@ class UFC_UGC_ZOS_index(MyQThread):
             .then(lambda _: AsyPromise(self.UGC_gas_path_system_obj.start))
             .then(lambda _: AsyPromise(self.ZOS_gas_path_system_obj.start))
             .then(lambda _: AsyPromise(self.UFC_gas_path_system_obj.start))
-            .then(lambda _: AsyPromise(self.Startup_o2_span_air_calibration_obj.run))
+            .then(lambda _: AsyPromise(self.Startup_o2_span_air_calibration_obj.run_span_only))
+            .then(self._handoff_o2_span_handler_to_full_air)
+            .then(lambda _: AsyPromise(self.Startup_air_calibration_obj.start))
+            .then(lambda _: AsyPromise(
+                self.Startup_air_calibration_obj.wait_air_calibration_prepare
+            ))
+            .then(lambda _: AsyPromise(self.Startup_air_calibration_obj.run))
+            .then(lambda _: AsyPromise(self.Startup_air_calibration_obj.stop))
+            .then(lambda _: AsyPromise(
+                self.Startup_o2_span_air_calibration_obj.complete_after_full_air
+            ))
             .then(lambda _: AsyPromise(self.finish_start))
             .catch(self._reject_o2_span_air_start)
         )
 
+    def _handoff_o2_span_handler_to_full_air(self, handler):
+        self.Startup_air_calibration_obj.continue_full_o2_calibration(
+            handler,
+            stop_checker=self.Startup_o2_span_air_calibration_obj.is_stop_requested,
+        )
+        return handler
+
     def _reject_o2_span_air_start(self, error):
+        self.Startup_air_calibration_obj.clear_continued_o2_calibration()
+        self.Startup_o2_span_air_calibration_obj.abort_pending_calibration()
         self.update_status_main_signal_gui_update.send(
             f"{time_util.get_format_from_time(time.time())} | O₂ Span+空气启动流程失败：{error}",
             title=GapSystem_Running_Type.STARTUP_AIR_CALIBRATION,

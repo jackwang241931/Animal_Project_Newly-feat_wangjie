@@ -4103,7 +4103,7 @@ class MainWindow_Index(ThemedWindow):
 # 监听是否自动校准气路模块的框选
     def calibration_gas_state_change(self, state=None):
         current_mode = global_setting.get_setting("startup_calibration_mode", None)
-        if current_mode not in {"none", "air", "zero", "span", "full"}:
+        if current_mode not in {"none", "air", "zero", "span", "full", "o2_span_air", "co2_o2_span_air"}:
             current_mode = "full" if global_setting.get_setting("is_auto_calibration", False) else "none"
 
         msg_box = QMessageBox(self)
@@ -4165,7 +4165,7 @@ def _patched_calibration_gas_state_change(self, state=None):
     current_mode = global_setting.get_setting("startup_calibration_mode", None)
     if current_mode == "air_co2":
         current_mode = "air"
-    if current_mode not in {"none", "air", "zero", "span", "full"}:
+    if current_mode not in {"none", "air", "zero", "span", "full", "o2_span_air", "co2_o2_span_air"}:
         current_mode = "full" if global_setting.get_setting("is_auto_calibration", False) else "none"
 
     msg_box = QMessageBox(self)
@@ -4225,7 +4225,7 @@ def _patched_calibration_gas_state_change_v2(self, state=None):
     current_mode = global_setting.get_setting("startup_calibration_mode", None)
     if current_mode == "air_co2":
         current_mode = "air"
-    if current_mode not in {"none", "air", "zero", "span", "full"}:
+    if current_mode not in {"none", "air", "zero", "span", "full", "o2_span_air", "co2_o2_span_air"}:
         current_mode = "full" if global_setting.get_setting("is_auto_calibration", False) else "none"
 
     msg_box = QMessageBox(self)

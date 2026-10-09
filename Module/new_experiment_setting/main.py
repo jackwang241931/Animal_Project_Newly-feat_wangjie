@@ -214,7 +214,7 @@ class Main_experiment_calibration(BaseModule):
     def normalize_startup_calibration_mode(mode):
         if mode == "air_co2":
             return "air"
-        if mode in {"none", "air", "zero", "span", "full"}:
+        if mode in {"none", "air", "zero", "span", "full", "o2_span_air", "co2_o2_span_air"}:
             return mode
         return "none"
 
@@ -222,7 +222,7 @@ class Main_experiment_calibration(BaseModule):
         mode = global_setting.get_setting("startup_calibration_mode", None)
         if mode == "air_co2":
             mode = "air"
-        if mode not in {"none", "air", "zero", "span", "full"}:
+        if mode not in {"none", "air", "zero", "span", "full", "o2_span_air", "co2_o2_span_air"}:
             mode = "none"
         return mode
 

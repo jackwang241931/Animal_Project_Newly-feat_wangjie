@@ -46,9 +46,35 @@ class Startup_Air_Calibration:
         self.calculation_started_logged = False
         self.o2_failure_notified = False
         self.o2_failure_reason = None
+        self._pending_full_o2_handler = None
+        self._external_stop_checker = None
 
     def update(self):
         self.send_thread.update_status_main_signal_gui_update = self.update_status_main_signal_gui_update
+
+    def continue_full_o2_calibration(self, handler, stop_checker=None):
+        """Continue the Air phase with the active handler that collected Span data."""
+        if handler is None:
+            raise ValueError("缺少O2 Span校准处理器")
+        status = handler.get_status()
+        if not status.get("is_active") or not status.get("need_air"):
+            raise ValueError("O2 Span数据未完成，不能进入完整Air空气校准")
+        self._pending_full_o2_handler = handler
+        self._external_stop_checker = stop_checker
+
+    def clear_continued_o2_calibration(self):
+        self._pending_full_o2_handler = None
+        self._external_stop_checker = None
+
+    def _is_external_stop_requested(self):
+        checker = self._external_stop_checker
+        if not callable(checker):
+            return False
+        try:
+            return bool(checker())
+        except Exception:
+            logger.exception(f"{self.name}: 检查组合校准停止状态失败")
+            return True
 
     def _send_text(self, text):
         if self.update_status_main_signal_gui_update is not None:
@@ -359,9 +385,21 @@ class Startup_Air_Calibration:
             raise RuntimeError(f"加载 Air 校准处理器失败: {exc}")
 
         target_points = self._normalize_target_points()
-        self.o2_calibration_handler = create_o2_calibration_handler(
-            target_points=target_points,
-        )
+        continued_handler = self._pending_full_o2_handler
+        self._pending_full_o2_handler = None
+        if continued_handler is not None:
+            status = continued_handler.get_status()
+            if not status.get("is_active") or not status.get("need_air"):
+                raise RuntimeError("O2 Span校准状态已失效，无法继续完整Air空气校准")
+            continued_handler.set_target_points(target_points)
+            self.o2_calibration_handler = continued_handler
+            self._send_text(
+                f"{self.name}继续使用已完成Span采样的O2处理器，Air阶段目标点数 {target_points}"
+            )
+        else:
+            self.o2_calibration_handler = create_o2_calibration_handler(
+                target_points=target_points,
+            )
         self.co2_calibration_handler = CO2CalibrationHandler(target_points=target_points)
         if sample_interval is not None and active_channel_count is not None:
             channel_gap_window = max(
@@ -373,7 +411,8 @@ class Startup_Air_Calibration:
                 f"{self.name}: CO2 time sync tolerance adjusted to {channel_gap_window:.1f}s "
                 f"for {active_channel_count} sequential channels"
             )
-        self.o2_calibration_handler.start_air_touchup()
+        if continued_handler is None:
+            self.o2_calibration_handler.start_air_touchup()
         self.o2_calibration_filter = WetOxygenReferenceFilter()
         for channel in self.o2_calibration_handler.channels:
             self.o2_calibration_filter.set_initial_references(
@@ -491,6 +530,9 @@ class Startup_Air_Calibration:
             return
 
         for second in range(wait_seconds):
+            if self._is_external_stop_requested():
+                reject(f"{self.name}已收到停止请求")
+                return
             if second == 0 or (second + 1) % 5 == 0 or second == wait_seconds - 1:
                 self._send_text(
                     f"{self.name}等待稳定：当前等待 {second + 1}/{wait_seconds} 秒"
@@ -546,6 +588,9 @@ class Startup_Air_Calibration:
 
         channel_index = 0
         while True:
+            if self._is_external_stop_requested():
+                reject(f"{self.name}已收到停止请求")
+                return
             elapsed_time = time.time() - start_time
             if elapsed_time > max_timeout:
                 reject(f"{self.name}超时，已运行 {int(elapsed_time)} 秒")
@@ -732,4 +777,5 @@ class Startup_Air_Calibration:
     def _finish_stop(self, resolve):
         stop_time_text = time_util.get_format_from_time(time.time())
         self._send_state("set_stop_air_calibration_time", stop_time_text)
+        self._external_stop_checker = None
         resolve()

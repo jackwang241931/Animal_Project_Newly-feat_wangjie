@@ -55,6 +55,9 @@ class Startup_O2_Span_Air_Calibration:
     def request_stop(self):
         self._stop_event.set()
 
+    def is_stop_requested(self):
+        return self._stop_event.is_set()
+
     def wait_until_finished(self, timeout=None):
         return self._finished_event.wait(timeout)
 
@@ -290,6 +293,106 @@ class Startup_O2_Span_Air_Calibration:
                 logger.exception(f"{self.name}: 安全收尾命令失败")
                 first_error = first_error or exc
         return first_error
+
+    def _finish_running_state(self):
+        global_setting.set_setting("is_calibrating", False)
+        global_setting.set_setting("current_calibration_type", None)
+        with self._state_lock:
+            self._running = False
+        self._finished_event.set()
+
+    def abort_pending_calibration(self):
+        """Release an unfinished Span→Air calibration after a downstream failure."""
+        self._stop_event.set()
+        handler = self._handler
+        if handler is not None and getattr(handler, "is_active", False):
+            try:
+                handler.reset()
+            except Exception:
+                logger.exception(f"{self.name}: 清理未完成O2校准状态失败")
+        self._finish_running_state()
+
+    def run_span_only(self, resolve, reject):
+        """Collect Span data, then hand the active handler to the full Air workflow."""
+        with self._state_lock:
+            if self._running:
+                reject("O2 Span+空气校准正在运行")
+                return
+            self._running = True
+        self._finished_event.clear()
+        self._stop_event.clear()
+        failure = None
+        try:
+            port = global_setting.get_setting("port", None)
+            if port is None:
+                raise RuntimeError("未选择串口，无法执行O2 Span校准")
+            target_points = self._target_points()
+            sample_interval = self._sample_interval()
+            span_value = self._span_value()
+            start_new_o2_calibration(
+                target_points=target_points,
+                span_value=span_value,
+            )
+            self._handler = get_o2_calibration_handler(target_points=target_points)
+
+            global_setting.set_setting("is_calibrating", True)
+            global_setting.set_setting("current_calibration_type", self.name)
+            self._send_text(
+                f"开始 O2 Span阶段；Span标准气 {span_value:g}%，"
+                f"每路目标 {target_points} 点，通道间隔 {sample_interval:g} 秒"
+            )
+
+            self._set_coil(4, 9, True, "切换ZOS校准采样状态")
+            self._set_coil(3, 2, True, "开启UGC Span标准气")
+            self._set_coil(3, 0, False, "关闭UGC空气阀")
+            self._set_coil(3, 1, False, "关闭UGC N2阀")
+            self._emit_calibration_time("set_start_span_calibration_time")
+            self._wait_for_gas_flush("Span", self.SPAN_PURGE_SECONDS)
+            self._sample_phase("span", target_points, sample_interval)
+            self._emit_calibration_time("set_stop_span_calibration_time")
+
+            status = self._handler.get_status()
+            if not status.get("need_air"):
+                raise RuntimeError("O2 Span采样未完成，不能进入Air空气校准")
+
+            # Transfer the gas path to Air.  The complete Air workflow will
+            # perform preparation, reference capture, O2/CO2 collection and stop.
+            self._set_coil(3, 0, True, "开启UGC空气阀")
+            self._set_coil(3, 2, False, "关闭UGC Span阀")
+            self._set_coil(3, 1, False, "关闭UGC N2阀")
+            self._send_text("O2 Span采样完成，移交完整Air空气校准流程")
+        except Exception as exc:
+            failure = exc
+            logger.exception(f"{self.name} Span阶段失败")
+
+        if failure is not None:
+            self._restore_safe_gas_state()
+            self.abort_pending_calibration()
+            reject(failure)
+            return
+        resolve(self._handler)
+
+    def complete_after_full_air(self, resolve, reject):
+        """Validate and finish the combined workflow after full Air calibration."""
+        failure = None
+        try:
+            status = self._handler.get_status() if self._handler is not None else {}
+            if not status.get("completed"):
+                raise RuntimeError("完整Air空气校准结束，但O2校准配置未完成")
+            reload_o2_compensation_config()
+            self._send_text(
+                f"O2 Span+完整Air空气校准完成，干基空气锁定值 {status.get('air_lock')}%"
+            )
+        except Exception as exc:
+            failure = exc
+            logger.exception(f"{self.name}: 完整Air空气校准收尾失败")
+        finally:
+            self._finish_running_state()
+
+        if failure is not None:
+            reject(failure)
+        else:
+            resolve(True)
 
     def run(self, resolve, reject):
         with self._state_lock:
