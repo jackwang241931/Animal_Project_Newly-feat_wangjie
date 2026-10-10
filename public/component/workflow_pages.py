@@ -613,7 +613,6 @@ class ExperimentControlPage(_BaseWorkflowPage):
         calibration_card = QFrame(); calibration_card.setProperty("card", True)
         calibration_box = QVBoxLayout(calibration_card); calibration_box.setContentsMargins(14, 12, 14, 12)
         calibration_box.setSpacing(10)
-        calibration_card.setMinimumHeight(370)
         calibration_box.addWidget(QLabel("空气校准"))
         self.calibration_status = QLabel("待校准"); self.calibration_status.setProperty("value", True)
         calibration_box.addWidget(self.calibration_status)
@@ -621,42 +620,13 @@ class ExperimentControlPage(_BaseWorkflowPage):
         air_button = QPushButton("空气校准")
         air_button.clicked.connect(self._start_air_calibration)
         self.calibration_buttons["air"] = air_button
-        calibration_box.addWidget(air_button)
-
-        # Match the legacy monitor page: three distinct start operations,
-        # their matching stop operations, and the real calibration dialog.
-        control_grid = QGridLayout(); control_grid.setHorizontalSpacing(8); control_grid.setVerticalSpacing(8)
-        for column, (key, title) in enumerate((
-            ("zero", "校零"), ("span", "校量程"), ("all", "校零且量程"),
-        )):
-            button = QPushButton(title)
-            button.clicked.connect(lambda _checked=False, key=key: self._start_calibration(key))
-            self.calibration_buttons[key] = button
-            control_grid.addWidget(button, 0, column)
         self.calibration_details_button = QPushButton("显示校准信息详情")
         self.calibration_details_button.clicked.connect(lambda: self._open_calibration_details(None))
-        control_grid.addWidget(self.calibration_details_button, 0, 3)
-        for column, (key, title) in enumerate((
-            ("stop_zero", "停止校零"), ("stop_span", "停止校量程"),
-            ("stop_all", "停止校零且量程"),
-        )):
-            button = QPushButton(title)
-            button.clicked.connect(lambda _checked=False, key=key: self._stop_calibration(key))
-            self.calibration_buttons[key] = button
-            control_grid.addWidget(button, 1, column)
-        calibration_box.addLayout(control_grid)
-        archive_flow_row = QHBoxLayout()
-        for key, title in (
-            ("o2_span_air", "O₂ Span+空气校准"),
-            ("co2_o2_span_air", "CO₂校零+O₂ Span+空气校准"),
-        ):
-            button = QPushButton(title)
-            button.clicked.connect(
-                lambda _checked=False, selected=key: self._select_startup_calibration(selected)
-            )
-            self.calibration_buttons[key] = button
-            archive_flow_row.addWidget(button)
-        calibration_box.addLayout(archive_flow_row)
+        calibration_actions = QHBoxLayout()
+        calibration_actions.setSpacing(8)
+        calibration_actions.addWidget(air_button, 1)
+        calibration_actions.addWidget(self.calibration_details_button, 1)
+        calibration_box.addLayout(calibration_actions)
         self.calibration_evidence = QLabel("校准读数（采样流量、O₂、CO₂、气室压差、气室温度）：未知")
         self.calibration_evidence.setProperty("hint", True); self.calibration_evidence.setVisible(True); calibration_box.addWidget(self.calibration_evidence)
         self._update_calibration_buttons()
@@ -1026,40 +996,10 @@ class ExperimentControlPage(_BaseWorkflowPage):
     def _update_calibration_buttons(self) -> None:
         gas_enabled = not global_setting.get_setting("environment_module_only", False)
         gas_valid = bool(global_setting.get_setting("air_modules_all_valid", False))
-        ready = gas_enabled and gas_valid and self._last_run_status in {"running", "monitoring"}
-        startup_ready = (
-            gas_enabled and gas_valid
-            and self._last_run_status not in {"starting", "running", "monitoring", "stopping"}
-            and not getattr(self, "_last_can_stop", False)
-        )
-        can_stop = gas_enabled and (self._last_run_status in {"running", "monitoring"} or getattr(self, "_last_can_stop", False))
-        active = self._active_calibrations
-        stopping = self._stopping_calibrations
-        for channel, title in (("zero", "校零"), ("span", "校量程")):
-            self.calibration_buttons[channel].setEnabled(
-                (ready and not active) or (startup_ready and not active)
-            )
-            self.calibration_buttons[channel].setText(f"正在{title}中" if channel in active else title)
-            stop_button = self.calibration_buttons[f"stop_{channel}"]
-            stop_button.setEnabled(can_stop and channel in active and channel not in stopping)
-            stop_button.setText(f"正在停止{title}中" if channel in stopping else f"停止{title}")
-        self.calibration_buttons["all"].setEnabled((ready or startup_ready) and not active)
-        self.calibration_buttons["all"].setText("正在校零且量程中" if self._combined_calibration else "校零且量程")
-        self.calibration_buttons["stop_all"].setEnabled(can_stop and bool(active) and not stopping)
-        self.calibration_buttons["stop_all"].setText("正在停止校零且量程中" if stopping == {"zero", "span"} else "停止校零且量程")
         self.calibration_buttons["air"].setEnabled(
             gas_enabled and gas_valid and self._last_run_status not in {"starting", "running", "monitoring", "stopping"}
             and not getattr(self, "_last_can_stop", False)
         )
-
-        selected_mode = global_setting.get_setting("startup_calibration_mode", "none")
-        for key, title in (
-            ("o2_span_air", "O₂ Span+空气校准"),
-            ("co2_o2_span_air", "CO₂校零+O₂ Span+空气校准"),
-        ):
-            button = self.calibration_buttons[key]
-            button.setEnabled(startup_ready and not active)
-            button.setText(f"已选择：{title}" if selected_mode == key else title)
     def on_calibration_event(self, event: str) -> None:
         """React to the same zero/span start and finish events used by the legacy UI."""
         channel, _, phase = event.partition("_")
