@@ -33,6 +33,30 @@ class CO2CalibrationHandler:
         self.k_limit = (0.80, 1.20)
         self.time_sync_tolerance = 2.0
 
+    def set_channels(self, channels):
+        """Limit one calibration run to enabled cages plus the REF channel."""
+        normalized = []
+        for channel in channels or []:
+            channel = str(channel).upper()
+            if channel not in VALID_CHANNELS:
+                raise ValueError(f"invalid CO2 calibration channel: {channel}")
+            if channel not in normalized:
+                normalized.append(channel)
+        if "REF" not in normalized or len(normalized) < 2:
+            raise ValueError("CO2 calibration channels require REF and at least one cage")
+
+        with self.lock:
+            if self.is_active and normalized != self.channels:
+                raise RuntimeError("cannot change CO2 calibration channels while calibration is active")
+            if normalized != self.channels:
+                self.channels = normalized
+                self.data = {channel: [] for channel in self.channels}
+                self.calibrated = False
+                self.is_active = False
+                self.failed = False
+                self.failure_reason = None
+        return self.channels.copy()
+
     def start_new_calibration(self):
         with self.lock:
             self.data = {channel: [] for channel in self.channels}
@@ -210,7 +234,26 @@ class CO2CalibrationHandler:
             return False
 
     def _write_config(self, coefficient_items):
-        config = {
+        try:
+            with self.config_path.open("r", encoding="utf-8") as file:
+                previous_config = json.load(file)
+            if not isinstance(previous_config, dict):
+                previous_config = {}
+        except Exception:
+            previous_config = {}
+
+        channels_config = dict(previous_config.get("channels") or {})
+        for item in coefficient_items:
+            channel = item["Channel"]
+            channels_config[channel] = {
+                "coef_k": item["Coef_K"],
+                "coef_b": item["Coef_B"],
+                "r2": item.get("R2", 1.0),
+                "valid_points": item.get("Valid_Points", 0),
+            }
+
+        config = dict(previous_config)
+        config.update({
             "version": "2.1",
             "sensor_model": "GS5T",
             "calibration_info": {
@@ -218,17 +261,8 @@ class CO2CalibrationHandler:
                 "calibration_points": self.target_points,
                 "method": "Air_Consistency_Alignment_TimeSync",
             },
-            "channels": {},
-        }
-
-        for item in coefficient_items:
-            channel = item["Channel"]
-            config["channels"][channel] = {
-                "coef_k": item["Coef_K"],
-                "coef_b": item["Coef_B"],
-                "r2": item.get("R2", 1.0),
-                "valid_points": item.get("Valid_Points", 0),
-            }
+            "channels": channels_config,
+        })
 
         self.config_path.parent.mkdir(parents=True, exist_ok=True)
         with self.config_path.open("w", encoding="utf-8") as file:

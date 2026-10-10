@@ -56,6 +56,46 @@ def _valid_channels() -> set[str]:
     return set(getattr(_core, "VALID_CHANNELS", ["REF"] + [f"M{i}" for i in range(1, 9)]))
 
 
+def _default_channel_order() -> list[str]:
+    channels = list(getattr(_core, "VALID_CHANNELS", ["REF"] + [f"M{i}" for i in range(1, 9)]))
+    return [str(channel).upper() for channel in channels]
+
+
+def _normalize_calibration_channels(channels) -> list[str]:
+    valid_channels = _valid_channels()
+    normalized = []
+    for channel in channels or []:
+        channel = str(channel).upper()
+        if channel not in valid_channels:
+            raise ValueError(f"invalid O2 calibration channel: {channel}")
+        if channel not in normalized:
+            normalized.append(channel)
+    if "REF" not in normalized or len(normalized) < 2:
+        raise ValueError("O2 calibration channels require REF and at least one cage")
+    return normalized
+
+
+def _configure_handler_channels(handler, channels):
+    normalized = _normalize_calibration_channels(channels)
+    setter = getattr(handler, "set_channels", None)
+    if callable(setter):
+        setter(normalized)
+        return handler
+
+    current = list(getattr(handler, "channels", []))
+    if current == normalized:
+        return handler
+    if getattr(handler, "is_active", False):
+        raise RuntimeError("cannot change O2 calibration channels while calibration is active")
+    if not hasattr(handler, "channels"):
+        raise TypeError("O2 CalibrationHandler supplier contract cannot configure channels")
+    handler.channels = normalized
+    reset = getattr(handler, "reset", None)
+    if callable(reset):
+        reset()
+    return handler
+
+
 def _load_calibration_handler_class():
     """Load and validate the replaceable supplier calibration handler."""
     from .calibration_handler import CalibrationHandler
@@ -76,6 +116,7 @@ def _load_calibration_handler_class():
 def create_o2_calibration_handler(
     target_points: int | None = None,
     config_path: str | Path | None = None,
+    channels=None,
 ):
     """Create a supplier handler while keeping project settings authoritative."""
     points = _configured_target_points() if target_points is None else int(target_points)
@@ -103,7 +144,10 @@ def create_o2_calibration_handler(
     if config_path is not None and ("config_path" in parameters or accepts_kwargs):
         kwargs["config_path"] = str(config_path)
 
-    return handler_class(**kwargs)
+    handler = handler_class(**kwargs)
+    if channels is not None:
+        _configure_handler_channels(handler, channels)
+    return handler
 
 
 def _has_reference_sample(compensator: Any) -> bool:
@@ -138,7 +182,7 @@ def reload_o2_compensation_config():
     return _core.reload_o2_compensation_config()
 
 
-def get_o2_calibration_handler(target_points: int | None = None):
+def get_o2_calibration_handler(target_points: int | None = None, channels=None):
     global _CALIBRATION_HANDLER, _CALIBRATION_HANDLER_TARGET_POINTS
     points = _configured_target_points() if target_points is None else int(target_points)
     with _CALIBRATION_HANDLER_LOCK:
@@ -148,14 +192,21 @@ def get_o2_calibration_handler(target_points: int | None = None):
                 config_path=_PROJECT_ROOT / "config" / "calib_config.json",
             )
             _CALIBRATION_HANDLER_TARGET_POINTS = points
+        if channels is not None:
+            _configure_handler_channels(_CALIBRATION_HANDLER, channels)
         return _CALIBRATION_HANDLER
 
 
 def start_new_o2_calibration(
     target_points: int | None = None,
     span_value: float | None = None,
+    channels=None,
 ):
-    handler = get_o2_calibration_handler(target_points=target_points)
+    selected_channels = _default_channel_order() if channels is None else channels
+    handler = get_o2_calibration_handler(
+        target_points=target_points,
+        channels=selected_channels,
+    )
     return bool(handler.start_new_calibration(span_value=span_value))
 
 

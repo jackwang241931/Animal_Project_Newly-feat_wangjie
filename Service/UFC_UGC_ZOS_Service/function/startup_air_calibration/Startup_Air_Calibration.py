@@ -6,6 +6,10 @@ from blinker.base import _PNamespaceSignal
 from loguru import logger
 
 from Service.UFC_UGC_ZOS_Service.function.Send_Message.Send_Message import Send_Message
+from Service.UFC_UGC_ZOS_Service.function.calibration_channels import (
+    get_enabled_calibration_channels,
+    hardware_channel_to_handler_name,
+)
 from public.config_class.global_setting import global_setting
 from public.entity.enum.Public_Enum import GapSystem_Running_Type
 from public.function.promise.AsyPromise import AsyPromise
@@ -250,9 +254,7 @@ class Startup_Air_Calibration:
 
     @staticmethod
     def _channel_to_handler_name(channel):
-        if int(channel) == 8:
-            return "REF"
-        return f"M{int(channel) + 1}"
+        return hardware_channel_to_handler_name(channel)
 
     @staticmethod
     def _channel_to_display_name(channel):
@@ -264,7 +266,7 @@ class Startup_Air_Calibration:
         return global_setting.get_setting("port", None)
 
     def _get_active_channels(self):
-        return list(range(9))
+        return get_enabled_calibration_channels()
 
     def _capture_pre_calibration_references(self, active_channels):
         """Capture the three stable wet-O2 values used by Air calibration."""
@@ -385,12 +387,17 @@ class Startup_Air_Calibration:
             raise RuntimeError(f"加载 Air 校准处理器失败: {exc}")
 
         target_points = self._normalize_target_points()
+        handler_channels = list(self.pre_calibration_references)
+        if not handler_channels:
+            raise RuntimeError("空气校准缺少已启用通道的参考数据")
         continued_handler = self._pending_full_o2_handler
         self._pending_full_o2_handler = None
         if continued_handler is not None:
             status = continued_handler.get_status()
             if not status.get("is_active") or not status.get("need_air"):
                 raise RuntimeError("O2 Span校准状态已失效，无法继续完整Air空气校准")
+            if set(getattr(continued_handler, "channels", [])) != set(handler_channels):
+                raise RuntimeError("O2 Span与Air阶段的已启用通道不一致")
             continued_handler.set_target_points(target_points)
             self.o2_calibration_handler = continued_handler
             self._send_text(
@@ -399,8 +406,12 @@ class Startup_Air_Calibration:
         else:
             self.o2_calibration_handler = create_o2_calibration_handler(
                 target_points=target_points,
+                channels=handler_channels,
             )
         self.co2_calibration_handler = CO2CalibrationHandler(target_points=target_points)
+        set_co2_channels = getattr(self.co2_calibration_handler, "set_channels", None)
+        if callable(set_co2_channels):
+            set_co2_channels(handler_channels)
         if sample_interval is not None and active_channel_count is not None:
             channel_gap_window = max(
                 float(sample_interval) * max(int(active_channel_count) - 1, 1) + 2.0,
@@ -582,7 +593,7 @@ class Startup_Air_Calibration:
         co2_failure_notified = False
 
         self._send_text(
-            f"{self.name}开始采集 9 路 O2 / CO2 数据并行校准，"
+            f"{self.name}开始采集 {len(active_channels)} 路 O2 / CO2 数据并行校准，"
             f"每 {sample_interval:g} 秒读取 1 个通道，目标点数 {target_points}"
         )
 

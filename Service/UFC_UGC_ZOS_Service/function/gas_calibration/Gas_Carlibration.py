@@ -10,6 +10,9 @@ from blinker.base import _PNamespaceSignal
 from loguru import logger
 
 from Service.UFC_UGC_ZOS_Service.function.Send_Message.Send_Message import Send_Message
+from Service.UFC_UGC_ZOS_Service.function.calibration_channels import (
+    get_enabled_calibration_channels,
+)
 
 
 from public.config_class.global_setting import global_setting
@@ -611,7 +614,10 @@ class Zero_Carlibration(Gas_Carlibration, MyQThread):
             reject("未配置笼子列表")
             return
 
-        active_channels = [8]
+        active_channels = get_enabled_calibration_channels()
+        if not active_channels:
+            reject("未配置已启用笼位，无法执行零点标定")
+            return
 
         total_channels = len(active_channels)
 
@@ -780,7 +786,10 @@ class Zero_Carlibration(Gas_Carlibration, MyQThread):
             reject("未配置笼子列表")
             return
 
-        active_channels = [8]
+        active_channels = get_enabled_calibration_channels()
+        if not active_channels:
+            reject("未配置已启用笼位，无法执行零点标定")
+            return
 
         total_channels = len(active_channels)
 
@@ -1077,9 +1086,10 @@ class Range_Carlibration(Gas_Carlibration, MyQThread):
             reject("未配置笼子列表")
             return
 
-        active_channels = [cage - 1 for cage in mouse_cages_inc]
-        if 8 not in active_channels:
-            active_channels.append(8)
+        active_channels = get_enabled_calibration_channels()
+        if not active_channels:
+            reject("未配置已启用笼位，无法执行量程标定")
+            return
 
         total_channels = len(active_channels)
 
@@ -1259,9 +1269,10 @@ class Range_Carlibration(Gas_Carlibration, MyQThread):
             reject("未配置笼子列表")
             return
 
-        active_channels = [cage - 1 for cage in mouse_cages_inc]
-        if 8 not in active_channels:
-            active_channels.append(8)
+        active_channels = get_enabled_calibration_channels()
+        if not active_channels:
+            reject("未配置已启用笼位，无法执行量程标定")
+            return
 
         total_channels = len(active_channels)
 
@@ -1623,7 +1634,10 @@ def _patched_zero_cyclic_sampling_of_ugc_carbon_sensor(self, resolve, reject, po
         reject("未配置鼠笼列表")
         return
 
-    active_channels = [8]
+    active_channels = get_enabled_calibration_channels()
+    if not active_channels:
+        reject("未配置已启用笼位，无法执行零点标定")
+        return
 
     total_channels = len(active_channels)
     self.update_status_main_signal_gui_update.send(
@@ -1802,7 +1816,10 @@ def _patched_range_cyclic_sampling_of_ugc_carbon_sensor(self, resolve, reject, p
         reject("未配置鼠笼列表")
         return
 
-    active_channels = [8]
+    active_channels = get_enabled_calibration_channels()
+    if not active_channels:
+        reject("未配置已启用笼位，无法执行量程标定")
+        return
 
     total_channels = len(active_channels)
     self.update_status_main_signal_gui_update.send(

@@ -4,6 +4,10 @@ import time
 from loguru import logger
 
 from Service.UFC_UGC_ZOS_Service.function.Send_Message.Send_Message import Send_Message
+from Service.UFC_UGC_ZOS_Service.function.calibration_channels import (
+    get_enabled_calibration_channels,
+    hardware_channel_to_handler_name,
+)
 from Service.UFC_UGC_ZOS_Service.function.o2_compensation import (
     get_o2_calibration_handler,
     reload_o2_compensation_config,
@@ -43,6 +47,7 @@ class Startup_O2_Span_Air_Calibration:
         self._state_lock = threading.Lock()
         self._running = False
         self._handler = None
+        self._active_channels = self.CHANNELS
 
     def update(self):
         self.send_thread.update_status_main_signal_gui_update = self.update_status_main_signal_gui_update
@@ -101,7 +106,11 @@ class Startup_O2_Span_Air_Calibration:
 
     @staticmethod
     def _channel_name(channel):
-        return "REF" if channel == 8 else f"M{channel + 1}"
+        return hardware_channel_to_handler_name(channel)
+
+    @staticmethod
+    def _get_active_channels():
+        return get_enabled_calibration_channels()
 
     @staticmethod
     def _extract_value(items, predicate):
@@ -203,14 +212,15 @@ class Startup_O2_Span_Air_Calibration:
         port = global_setting.get_setting("port", None)
         if port is None:
             raise RuntimeError("未选择串口")
-        timeout = max(target_points * sample_interval * len(self.CHANNELS) * 4, 900)
+        active_channels = self._active_channels
+        timeout = max(target_points * sample_interval * len(active_channels) * 4, 900)
         started = time.monotonic()
         last_log = 0.0
 
         while True:
             if self._stop_event.is_set():
                 raise RuntimeError("用户停止校准")
-            for channel in self.CHANNELS:
+            for channel in active_channels:
                 if self._stop_event.is_set():
                     raise RuntimeError("用户停止校准")
                 sample = self._read_channel(port, channel)
@@ -250,7 +260,7 @@ class Startup_O2_Span_Air_Calibration:
                 counts = self._handler.get_status().get("phase_counts", {}).get(phase, {})
                 progress = "，".join(
                     f"{self._channel_name(ch)}={counts.get(self._channel_name(ch), 0)}/{target_points}"
-                    for ch in self.CHANNELS
+                    for ch in active_channels
                 )
                 self._send_text(f"{phase}采样进度（整轮扫描完成）：{progress}")
                 last_log = elapsed
@@ -261,7 +271,7 @@ class Startup_O2_Span_Air_Calibration:
         counts = status.get("phase_counts", {}).get(phase, {})
         channel_counts = {
             self._channel_name(channel): counts.get(self._channel_name(channel), 0)
-            for channel in self.CHANNELS
+            for channel in self._active_channels
         }
         progress = "，".join(
             f"{name}={count}/{target_points}" for name, count in channel_counts.items()
@@ -329,11 +339,20 @@ class Startup_O2_Span_Air_Calibration:
             target_points = self._target_points()
             sample_interval = self._sample_interval()
             span_value = self._span_value()
+            active_channels = self._get_active_channels()
+            if not active_channels:
+                raise RuntimeError("未配置已启用笼位，无法执行O2 Span校准")
+            self._active_channels = tuple(active_channels)
+            handler_channels = [self._channel_name(channel) for channel in active_channels]
             start_new_o2_calibration(
                 target_points=target_points,
                 span_value=span_value,
+                channels=handler_channels,
             )
-            self._handler = get_o2_calibration_handler(target_points=target_points)
+            self._handler = get_o2_calibration_handler(
+                target_points=target_points,
+                channels=handler_channels,
+            )
 
             global_setting.set_setting("is_calibrating", True)
             global_setting.set_setting("current_calibration_type", self.name)
@@ -411,11 +430,20 @@ class Startup_O2_Span_Air_Calibration:
             target_points = self._target_points()
             sample_interval = self._sample_interval()
             span_value = self._span_value()
+            active_channels = self._get_active_channels()
+            if not active_channels:
+                raise RuntimeError("未配置已启用笼位，无法执行O2 Span+空气校准")
+            self._active_channels = tuple(active_channels)
+            handler_channels = [self._channel_name(channel) for channel in active_channels]
             start_new_o2_calibration(
                 target_points=target_points,
                 span_value=span_value,
+                channels=handler_channels,
             )
-            self._handler = get_o2_calibration_handler(target_points=target_points)
+            self._handler = get_o2_calibration_handler(
+                target_points=target_points,
+                channels=handler_channels,
+            )
 
             global_setting.set_setting("is_calibrating", True)
             global_setting.set_setting("current_calibration_type", self.name)

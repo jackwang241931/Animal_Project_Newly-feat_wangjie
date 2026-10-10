@@ -118,6 +118,26 @@ class CalibrationHandler:
         self.match_bias = {}
         self.reset()
 
+    def set_channels(self, channels):
+        """Limit one calibration run to enabled cages plus the REF channel."""
+        normalized = []
+        for channel in channels or []:
+            channel = str(channel).upper()
+            if channel not in VALID_CHANNELS:
+                raise ValueError(f"invalid O2 calibration channel: {channel}")
+            if channel not in normalized:
+                normalized.append(channel)
+        if "REF" not in normalized or len(normalized) < 2:
+            raise ValueError("O2 calibration channels require REF and at least one cage")
+
+        with self.lock:
+            if self.is_active and normalized != self.channels:
+                raise RuntimeError("cannot change O2 calibration channels while calibration is active")
+            if normalized != self.channels:
+                self.channels = normalized
+                self.reset()
+        return self.channels.copy()
+
     def set_target_points(self, n):
         n = int(n)
         if n < 5:
@@ -317,7 +337,16 @@ class CalibrationHandler:
         logger.info("cal done mode=%s air_lock=%.4f", self.cal_mode, self.air_lock)
 
     def _save_unlocked(self):
-        cfg = {
+        cfg = self._load_existing()
+        offsets = dict(cfg.get("offsets") or {})
+        offsets.update({ch: float(self.offsets[ch]) for ch in self.channels})
+        gains = dict(cfg.get("gains") or {})
+        gains.update({ch: 1.0 for ch in self.channels})
+        blk_u = dict(cfg.get("blk_u") or {})
+        blk_u.update(self.air_corr_last)
+        blk_v = dict(cfg.get("blk_v") or {})
+        blk_v.update(self.air_dry_last)
+        cfg.update({
             "version": "3.1",
             "algorithm": "span_offset_g1_air_lock",
             "calibration_time": datetime.now().isoformat(),
@@ -327,13 +356,13 @@ class CalibrationHandler:
             "air_measured": self.air_measured,
             "air_cal_count": self.air_cal_count,
             "target_points": self.target_points,
-            "offsets": {ch: float(self.offsets[ch]) for ch in self.channels},
-            "gains": {ch: 1.0 for ch in self.channels},
-            "blk_u": self.air_corr_last,
-            "blk_v": self.air_dry_last,
+            "offsets": offsets,
+            "gains": gains,
+            "blk_u": blk_u,
+            "blk_v": blk_v,
             "match_gain": self.match_gain,
             "match_bias": self.match_bias,
-        }
+        })
         self.config_path.parent.mkdir(parents=True, exist_ok=True)
         with self.config_path.open("w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2, ensure_ascii=False)

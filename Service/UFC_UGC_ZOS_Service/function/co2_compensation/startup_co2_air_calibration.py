@@ -5,6 +5,10 @@ from blinker.base import _PNamespaceSignal
 from loguru import logger
 
 from Service.UFC_UGC_ZOS_Service.function.Send_Message.Send_Message import Send_Message
+from Service.UFC_UGC_ZOS_Service.function.calibration_channels import (
+    get_enabled_calibration_channels,
+    hardware_channel_to_handler_name,
+)
 from Service.UFC_UGC_ZOS_Service.function.co2_compensation.co2_calibration_handler import (
     CO2CalibrationHandler,
 )
@@ -122,9 +126,7 @@ class Startup_CO2_Air_Calibration:
 
     @staticmethod
     def _channel_to_handler_name(channel):
-        if int(channel) == 8:
-            return "REF"
-        return f"M{int(channel) + 1}"
+        return hardware_channel_to_handler_name(channel)
 
     @staticmethod
     def _channel_to_display_name(channel):
@@ -136,10 +138,13 @@ class Startup_CO2_Air_Calibration:
         return global_setting.get_setting("port", None)
 
     def _get_active_channels(self):
-        return list(range(9))
+        return get_enabled_calibration_channels()
 
-    def _build_calibration_handler(self):
+    def _build_calibration_handler(self, active_channels):
         self.calibration_handler = CO2CalibrationHandler(target_points=self._normalize_target_points())
+        self.calibration_handler.set_channels(
+            [self._channel_to_handler_name(channel) for channel in active_channels]
+        )
         self.calibration_handler.start_new_calibration()
 
     def _read_ugc_channel_snapshot(self, channel):
@@ -240,7 +245,7 @@ class Startup_CO2_Air_Calibration:
             return
 
         try:
-            self._build_calibration_handler()
+            self._build_calibration_handler(active_channels)
         except Exception as e:
             reject(str(e))
             return
@@ -252,7 +257,10 @@ class Startup_CO2_Air_Calibration:
         start_time = time.time()
         co2_failure_notified = False
 
-        self._send_text(f"{self.name}开始采集 9 路 CO2 数据并执行拟合，目标点数 {target_points}")
+        self._send_text(
+            f"{self.name}开始采集 {len(active_channels)} 路 CO2 数据并执行拟合，"
+            f"目标点数 {target_points}"
+        )
 
         while True:
             elapsed_time = time.time() - start_time
