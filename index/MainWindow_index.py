@@ -22,6 +22,9 @@ from PyQt6.QtCore import Qt
 from Service import main_monitor_data, main_deep_camera, main_infrared_camera
 from Service.UFC_UGC_ZOS_Service.function.gas_path_system.Gas_path_system import ZOS_gas_path_system, \
     UFC_gas_path_system, UGC_gas_path_system, UFC_FLOW_SETPOINT_DEFAULTS
+from Service.UFC_UGC_ZOS_Service.function.calibration_channels import (
+    get_enabled_calibration_channels,
+)
 from Service.UFC_UGC_ZOS_Service.index.UFC_UGC_ZOS_index import UFC_UGC_ZOS_index
 from my_abc.BaseModule import BaseModule
 from public.component.Guide_tutorial_interface.Tutorial_Manager import TutorialManager
@@ -51,6 +54,78 @@ from public.util.time_util import time_util
 from theme.ThemeQt6 import ThemedWindow
 from ui.MainWindow import Ui_MainWindow
 #logger = logger.bind(category="gui_logger")
+
+
+def _calculate_o2_span_full_air_wait_seconds(
+    calibration_config,
+    active_channel_count,
+    include_co2_zero=False,
+):
+    """Return the backend's worst-case combined-calibration duration."""
+
+    def config_float(name, default, minimum=0.0):
+        try:
+            value = float(calibration_config.get(name, default))
+            if not math.isfinite(value):
+                raise ValueError(name)
+        except (TypeError, ValueError):
+            value = float(default)
+        return max(value, minimum)
+
+    def config_int(name, default, minimum=1):
+        try:
+            value = int(float(calibration_config.get(name, default)))
+        except (TypeError, ValueError):
+            value = int(default)
+        return max(value, minimum)
+
+    channel_count = max(int(active_channel_count), 1)
+    sample_interval = config_float(
+        "startup_air_calibration_channel_interval",
+        2,
+        0.5,
+    )
+
+    # Match Startup_O2_Span_Air_Calibration._sample_phase(): five-minute
+    # replacement plus its bounded Span sampling window.
+    span_target_points = config_int("o2_span_air_target_points", 25, 5)
+    span_sampling_timeout = max(
+        span_target_points * sample_interval * channel_count * 4,
+        900,
+    )
+    total = 300 + span_sampling_timeout
+
+    # Match the full Air workflow: stabilization, reference acquisition and
+    # Startup_Air_Calibration.run()'s bounded collection window.
+    air_wait = config_float("startup_air_calibration_wait_time", 1800)
+    air_target_points = config_int("startup_air_calibration_target_points", 120)
+    air_default_timeout = max(
+        air_target_points * sample_interval * channel_count + 300,
+        300,
+    )
+    air_run_timeout = max(
+        config_float("startup_air_calibration_max_timeout", air_default_timeout),
+        air_default_timeout,
+    )
+    reference_attempts = config_int(
+        "startup_air_calibration_reference_max_attempts",
+        10,
+        3,
+    )
+    reference_retry_interval = config_float(
+        "startup_air_calibration_reference_retry_interval",
+        5,
+        0.5,
+    )
+    reference_timeout = (
+        min(reference_attempts - 1, 2) * sample_interval
+        + max(reference_attempts - 3, 0) * reference_retry_interval
+    )
+    total += air_wait + reference_timeout + air_run_timeout + 120
+
+    if include_co2_zero:
+        total += max(config_float("calibration_max_timeout", 300), 300) + 120
+    return total
 
 
 class Start_experiment_thread(MyQThread):
@@ -3135,27 +3210,12 @@ class MainWindow_Index(ThemedWindow):
             self.start_dialog.countdown_seconds = start_wait_times
             self.start_dialog.current_seconds = start_wait_times
         elif startup_calibration_mode in {"o2_span_air", "co2_o2_span_air"}:
-            try:
-                target_points = max(
-                    int(float(calibration_config.get("o2_span_air_target_points", 25))), 5
-                )
-            except (TypeError, ValueError):
-                target_points = 25
-            try:
-                sample_interval = max(
-                    float(calibration_config.get("startup_air_calibration_channel_interval", 2)), 0.5
-                )
-            except (TypeError, ValueError):
-                sample_interval = 2.0
-            # Two five-minute gas flushes plus up to nine channels × target points.
-            calibration_wait = 2 * (300 + target_points * sample_interval * 9)
-            if startup_calibration_mode == "co2_o2_span_air":
-                try:
-                    calibration_wait += max(
-                        float(calibration_config.get("calibration_max_timeout", 300)), 300
-                    ) + 120
-                except (TypeError, ValueError):
-                    calibration_wait += 420
+            active_channel_count = len(get_enabled_calibration_channels()) or 9
+            calibration_wait = _calculate_o2_span_full_air_wait_seconds(
+                calibration_config,
+                active_channel_count,
+                include_co2_zero=(startup_calibration_mode == "co2_o2_span_air"),
+            )
             start_wait_times += calibration_wait
             self.start_dialog.countdown_seconds = start_wait_times
             self.start_dialog.current_seconds = start_wait_times

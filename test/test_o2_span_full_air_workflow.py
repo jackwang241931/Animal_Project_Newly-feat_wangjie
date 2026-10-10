@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from Module.new_experiment_setting.index.Tab_1 import Tab_1
 from Module.new_experiment_setting.main import Main_experiment_calibration
+from index.MainWindow_index import _calculate_o2_span_full_air_wait_seconds
 from Service.UFC_UGC_ZOS_Service.function.startup_air_calibration.Startup_Air_Calibration import (
     Startup_Air_Calibration,
 )
@@ -46,6 +47,37 @@ class _CO2Handler:
 
 
 class O2SpanFullAirWorkflowTests(unittest.TestCase):
+    def test_gui_timeout_covers_the_complete_combined_calibration(self):
+        calibration_config = {
+            "calibration_max_timeout": 300,
+            "o2_span_air_target_points": 25,
+            "startup_air_calibration_channel_interval": 2,
+            "startup_air_calibration_wait_time": 1800,
+            "startup_air_calibration_target_points": 120,
+            "startup_air_calibration_max_timeout": 3000,
+            "startup_air_calibration_reference_max_attempts": 10,
+            "startup_air_calibration_reference_retry_interval": 5,
+        }
+
+        without_co2_zero = _calculate_o2_span_full_air_wait_seconds(
+            calibration_config,
+            active_channel_count=9,
+            include_co2_zero=False,
+        )
+        with_co2_zero = _calculate_o2_span_full_air_wait_seconds(
+            calibration_config,
+            active_channel_count=9,
+            include_co2_zero=True,
+        )
+
+        self.assertEqual(7059, without_co2_zero)
+        self.assertEqual(7479, with_co2_zero)
+        self.assertGreater(
+            without_co2_zero,
+            calibration_config["startup_air_calibration_wait_time"]
+            + calibration_config["startup_air_calibration_max_timeout"],
+        )
+
     def test_new_combined_modes_survive_legacy_normalizers(self):
         for mode in ("o2_span_air", "co2_o2_span_air"):
             self.assertEqual(mode, Tab_1.normalize_startup_calibration_mode(mode))
