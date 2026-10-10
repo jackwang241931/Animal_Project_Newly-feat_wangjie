@@ -223,7 +223,14 @@ class Startup_Air_Calibration:
     @staticmethod
     def _normalize_run_timeout(target_points, sample_interval, channel_count):
         calibration_config = global_setting.get_setting("UFC_UGC_ZOS_config", {}).get("Calibration", {})
-        default_timeout = max(int(target_points * sample_interval * channel_count + 300), 300)
+        # Every channel performs two serial transactions (UGC + ZOS) before
+        # the configured interval.  Counting only sample_interval made the
+        # 9-channel/120-point run expire around 81 points on real hardware.
+        serial_read_budget = 3.0
+        default_timeout = max(
+            int(target_points * (sample_interval + serial_read_budget) * channel_count + 300),
+            300,
+        )
         try:
             max_timeout = int(float(calibration_config.get("startup_air_calibration_max_timeout", default_timeout)))
         except Exception:

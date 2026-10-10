@@ -70,8 +70,8 @@ class O2SpanFullAirWorkflowTests(unittest.TestCase):
             include_co2_zero=True,
         )
 
-        self.assertEqual(7059, without_co2_zero)
-        self.assertEqual(7479, with_co2_zero)
+        self.assertEqual(9759, without_co2_zero)
+        self.assertEqual(10179, with_co2_zero)
         self.assertGreater(
             without_co2_zero,
             calibration_config["startup_air_calibration_wait_time"]

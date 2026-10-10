@@ -99,8 +99,11 @@ def _calculate_o2_span_full_air_wait_seconds(
     # Startup_Air_Calibration.run()'s bounded collection window.
     air_wait = config_float("startup_air_calibration_wait_time", 1800)
     air_target_points = config_int("startup_air_calibration_target_points", 120)
+    # Keep the GUI timer aligned with the backend: every channel performs two
+    # serial reads in addition to the configured inter-channel interval.
+    serial_read_budget = 3.0
     air_default_timeout = max(
-        air_target_points * sample_interval * channel_count + 300,
+        air_target_points * (sample_interval + serial_read_budget) * channel_count + 300,
         300,
     )
     air_run_timeout = max(
