@@ -28,7 +28,7 @@ def _number(value):
 
 
 def calculate_epoch_metabolism(values: Mapping):
-    """Return VO2, VCO2, RER and EE, or four unavailable values.
+    """Return VO2, VCO2, RER and EE, preserving calculated negative values.
 
     Haldane nitrogen balance: Vi = Vo * (1-FeO2-FeCO2)/(1-FiO2-FiCO2).
     EE uses the CV1=3.941 and CV2=1.106: 60 * (CV1*VO2 + CV2*VCO2).
@@ -53,11 +53,9 @@ def calculate_epoch_metabolism(values: Mapping):
     vi = vo * no / ni
     vo2 = vi * fi_o2 - vo * fe_o2
     vco2 = vo * fe_co2 - vi * fi_co2
-    if vo2 <= 0 or vco2 < 0:
-        return unavailable
     return {
         "vo2_consumption": vo2,
         "vco2_production": vco2,
-        "rer_rq": vco2 / vo2,
+        "rer_rq": vco2 / vo2 if vo2 != 0 else None,
         "ee_energy_expenditure": 60.0 * (3.941 * vo2 + 1.106 * vco2),
     }
