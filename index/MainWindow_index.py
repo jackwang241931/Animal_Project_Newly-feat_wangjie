@@ -383,6 +383,7 @@ class read_queue_data_Thread(MyQThread):
                     case 'set_start_air_calibration_time':
                         if self.window is not None:
                             self.operation_progress_signal.emit(5, "空气校准进行中")
+                            self.calibration_event_signal.emit("air_started")
                             self.calibration_detail_update_signal.emit({
                                 "kind": "air_start",
                                 "time": message.data,
@@ -390,10 +391,17 @@ class read_queue_data_Thread(MyQThread):
                     case 'set_stop_air_calibration_time':
                         if self.window is not None:
                             self.operation_progress_signal.emit(100, "空气校准完成")
+                            self.calibration_event_signal.emit("air_finished")
                             self.calibration_detail_update_signal.emit({
                                 "kind": "air_end",
                                 "time": message.data,
                             })
+                    case 'runtime_air_calibration_response':
+                        if self.window is not None:
+                            response = message.data if isinstance(message.data, dict) else {}
+                            if not response.get("success", False):
+                                self.operation_progress_signal.emit(0, "空气校准启动失败")
+                                self.calibration_event_signal.emit("air_failed")
                     case 'set_calibration_values':
                         """
                         设置校准窗口显示值
@@ -1313,10 +1321,10 @@ class MainWindow_Index(ThemedWindow):
 
     def _on_calibration_event(self, event: str) -> None:
         channel, _, phase = event.partition("_")
-        if channel in {"zero", "span"}:
+        if channel in {"zero", "span", "air"}:
             if phase == "started":
                 self._active_calibration_channels.add(channel)
-            elif phase == "finished":
+            elif phase in {"finished", "failed"}:
                 self._active_calibration_channels.discard(channel)
         page = getattr(self, "experiment_control_page", None)
         if page is not None and self.workflow_run_state not in {

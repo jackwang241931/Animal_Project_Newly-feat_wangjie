@@ -1,4 +1,5 @@
 import inspect
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -14,6 +15,7 @@ from Service.UFC_UGC_ZOS_Service.function.gas_calibration.Gas_Carlibration impor
 )
 from Service.UFC_UGC_ZOS_Service.index.UFC_UGC_ZOS_index import UFC_UGC_ZOS_index
 from public.config_class.global_setting import global_setting
+from public.component.workflow_pages import ExperimentControlPage
 from public.function.promise.AsyPromise import AsyPromise
 
 
@@ -47,6 +49,62 @@ class _CO2Handler:
 
 
 class O2SpanFullAirWorkflowTests(unittest.TestCase):
+    def test_air_button_routes_by_experiment_state(self):
+        source = inspect.getsource(ExperimentControlPage._start_air_calibration)
+
+        self.assertIn('_select_startup_calibration("o2_span_air")', source)
+        self.assertIn('_send_monitor_command("start_air_calibration")', source)
+        self.assertNotIn('startup_calibration_mode", "air"', source)
+
+    def test_runtime_air_worker_runs_standalone_sequence(self):
+        calls = []
+
+        def step(name):
+            def executor(resolve, reject):
+                calls.append(name)
+                resolve()
+
+            return executor
+
+        class _Air:
+            name = "运行前 Air 空气校准"
+
+            def clear_continued_o2_calibration(self):
+                calls.append("clear")
+
+            def set_external_stop_checker(self, checker):
+                calls.append("checker")
+                self.checker = checker
+
+            start = staticmethod(step("start"))
+            wait_air_calibration_prepare = staticmethod(step("wait"))
+            run = staticmethod(step("run"))
+            stop = staticmethod(step("stop"))
+
+        air = _Air()
+        service = SimpleNamespace(
+            Startup_air_calibration_obj=air,
+            _runtime_air_stop_event=threading.Event(),
+            _runtime_air_lock=threading.Lock(),
+            _runtime_air_thread=threading.current_thread(),
+            update_status_main_signal_gui_update=None,
+            _run_runtime_air_step=UFC_UGC_ZOS_index._run_runtime_air_step,
+            _publish_runtime_air_result=lambda *_: None,
+        )
+        global_setting.set_setting("is_calibrating", True)
+        global_setting.set_setting("current_calibration_type", "实验中 Air 空气校准")
+
+        UFC_UGC_ZOS_index._run_runtime_air_calibration(service)
+
+        self.assertEqual(
+            ["clear", "checker", "start", "wait", "run", "stop", "clear"],
+            calls,
+        )
+        self.assertEqual("运行前 Air 空气校准", air.name)
+        self.assertIsNone(service._runtime_air_thread)
+        self.assertFalse(global_setting.get_setting("is_calibrating", True))
+        self.assertIsNone(global_setting.get_setting("current_calibration_type", "missing"))
+
     def test_gui_timeout_covers_the_complete_combined_calibration(self):
         calibration_config = {
             "calibration_max_timeout": 300,

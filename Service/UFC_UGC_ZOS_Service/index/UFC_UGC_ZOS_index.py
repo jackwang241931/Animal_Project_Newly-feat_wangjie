@@ -110,6 +110,9 @@ class UFC_UGC_ZOS_index(MyQThread):
         self._startup_chain_started = False
         self._stop_requested = False
         self._shutdown_errors = []
+        self._runtime_air_thread = None
+        self._runtime_air_stop_event = threading.Event()
+        self._runtime_air_lock = threading.Lock()
 
         self.send_message = {
             'port': '',
@@ -781,8 +784,8 @@ class UFC_UGC_ZOS_index(MyQThread):
         global auto_wait_event,stop_flag
         stop_flag = True
         global_setting.set_setting("calibration_cancel_requested", True)
-        self._stop_requested = True
         self._shutdown_errors = []
+        self._request_stop_runtime_air_calibration()
         # 先同步设置标定线程的取消标志并等待其退出，再发关气路命令，
         # 避免校准流程在泵关闭后继续发开阀/开泵指令。
         self._request_stop_active_calibrations()
@@ -791,6 +794,7 @@ class UFC_UGC_ZOS_index(MyQThread):
             if self.Startup_o2_span_air_calibration_obj.is_running:
                 if not self.Startup_o2_span_air_calibration_obj.wait_until_finished(30):
                     self._record_shutdown_error("启动校准", "取消等待超时")
+        self._wait_runtime_air_calibration_stopped(timeout=30)
         auto_wait_event.set()
         auto_wait_event.clear()
 
@@ -958,6 +962,152 @@ class UFC_UGC_ZOS_index(MyQThread):
             self.span_carlibration_obj_calibrate_wrapped
         ).then().catch( lambda e: logger.error(f"{e}"))
         return p
+    def air_calibration_handle(self):
+        """Start the standalone Air workflow without blocking the command loop."""
+        with self._runtime_air_lock:
+            if self._runtime_air_thread is not None and self._runtime_air_thread.is_alive():
+                return {"success": False, "message": "空气校准已在进行中"}
+            if self._stop_requested:
+                return {"success": False, "message": "实验正在停止，无法启动空气校准"}
+            if self.Startup_air_calibration_obj is None:
+                return {"success": False, "message": "空气校准服务尚未初始化"}
+            run_threads = (
+                getattr(self.UFC_gas_path_system_obj, "ufc_gas_path_system_run_thread", None),
+                getattr(self.UGC_gas_path_system_obj, "ugc_gas_path_system_run_thread", None),
+                getattr(self.ZOS_gas_path_system_obj, "zos_gas_path_system_run_thread", None),
+            )
+            if any(
+                thread is None
+                or not callable(getattr(thread, "isRunning", None))
+                or not thread.isRunning()
+                for thread in run_threads
+            ):
+                return {"success": False, "message": "气路尚未全部进入运行状态，无法启动空气校准"}
+            if global_setting.get_setting("is_calibrating", False):
+                calibration_type = global_setting.get_setting("current_calibration_type", "其他校准")
+                return {
+                    "success": False,
+                    "message": f"{calibration_type}正在进行，请等待完成后再启动空气校准",
+                }
+
+            self._runtime_air_stop_event.clear()
+            global_setting.set_setting("calibration_cancel_requested", False)
+            global_setting.set_setting("is_calibrating", True)
+            global_setting.set_setting("current_calibration_type", "实验中 Air 空气校准")
+            self._runtime_air_thread = threading.Thread(
+                target=self._run_runtime_air_calibration,
+                name="RuntimeAirCalibration",
+                daemon=True,
+            )
+            try:
+                self._runtime_air_thread.start()
+            except Exception as error:
+                self._runtime_air_thread = None
+                global_setting.set_setting("is_calibrating", False)
+                global_setting.set_setting("current_calibration_type", None)
+                logger.exception(f"启动实验中 Air 空气校准线程失败：{error}")
+                return {"success": False, "message": f"空气校准线程启动失败：{error}"}
+        return {"success": True, "message": "空气校准请求已接收"}
+
+    @staticmethod
+    def _run_runtime_air_step(step):
+        outcome = {"resolved": False, "error": None, "value": None}
+
+        def resolve(value=None):
+            outcome["resolved"] = True
+            outcome["value"] = value
+
+        def reject(error=None):
+            outcome["error"] = error or "未知错误"
+
+        step(resolve, reject)
+        if outcome["error"] is not None:
+            error = outcome["error"]
+            if isinstance(error, BaseException):
+                raise error
+            raise RuntimeError(str(error))
+        if not outcome["resolved"]:
+            raise RuntimeError("空气校准步骤未返回完成状态")
+        return outcome["value"]
+
+    def _run_runtime_air_calibration(self):
+        air = self.Startup_air_calibration_obj
+        original_name = air.name
+        start_attempted = False
+        stop_notified = False
+        failure_message = None
+        try:
+            air.name = "实验中 Air 空气校准"
+            air.clear_continued_o2_calibration()
+            air.set_external_stop_checker(self._runtime_air_stop_event.is_set)
+            start_attempted = True
+            self._run_runtime_air_step(air.start)
+            self._run_runtime_air_step(air.wait_air_calibration_prepare)
+            self._run_runtime_air_step(air.run)
+            self._run_runtime_air_step(air.stop)
+            stop_notified = True
+        except Exception as error:
+            if self._runtime_air_stop_event.is_set():
+                logger.warning(f"实验中空气校准已按停止请求退出：{error}")
+            else:
+                failure_message = f"实验中空气校准失败：{error}"
+                logger.exception(failure_message)
+                if self.update_status_main_signal_gui_update is not None:
+                    self.update_status_main_signal_gui_update.send(
+                        f"{time_util.get_format_from_time(time.time())} | {failure_message}",
+                        title=GapSystem_Running_Type.STARTUP_AIR_CALIBRATION,
+                    )
+        finally:
+            if start_attempted and not stop_notified:
+                try:
+                    self._run_runtime_air_step(air.stop)
+                    stop_notified = True
+                except Exception as stop_error:
+                    logger.exception(f"实验中空气校准结束指令失败：{stop_error}")
+                    # Keep GUI/thread state consistent even when the hardware
+                    # acknowledgement failed; the failure remains in the log.
+                    air._finish_stop(lambda: None)
+                    stop_notified = True
+            air.clear_continued_o2_calibration()
+            air.name = original_name
+            if global_setting.get_setting("current_calibration_type", None) == "实验中 Air 空气校准":
+                global_setting.set_setting("is_calibrating", False)
+                global_setting.set_setting("current_calibration_type", None)
+            with self._runtime_air_lock:
+                if self._runtime_air_thread is threading.current_thread():
+                    self._runtime_air_thread = None
+            if failure_message:
+                self._publish_runtime_air_result(False, failure_message)
+
+    def _publish_runtime_air_result(self, success, message):
+        queue = global_setting.get_setting("queue", None)
+        if queue:
+            queue.put(ObjectQueueItem(
+                origin="UFC_UGC_ZOS_index",
+                to="MainWindow_index",
+                title="runtime_air_calibration_response",
+                data={"success": bool(success), "message": str(message)},
+                time=time_util.get_format_from_time(time.time()),
+            ))
+
+    def _request_stop_runtime_air_calibration(self):
+        # Use the same lock as the start path.  This prevents a nearly
+        # simultaneous Air click from clearing the stop event and starting a
+        # new calibration while the experiment is already shutting down.
+        with self._runtime_air_lock:
+            self._stop_requested = True
+            self._runtime_air_stop_event.set()
+
+    def _wait_runtime_air_calibration_stopped(self, timeout=30):
+        with self._runtime_air_lock:
+            thread = self._runtime_air_thread
+        if thread is None or thread is threading.current_thread():
+            return True
+        thread.join(timeout=max(float(timeout), 0.0))
+        if thread.is_alive():
+            self._record_shutdown_error("实验中空气校准", "取消等待超时")
+            return False
+        return True
     def zero_calibration_handle(self):
         """
         零点标定

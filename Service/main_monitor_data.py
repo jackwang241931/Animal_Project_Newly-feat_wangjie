@@ -1312,6 +1312,9 @@ class read_queue_data_Thread(MyQThread):
                     case 'start_span_calibration':
                         start_range_calibration()
                         pass
+                    case 'start_air_calibration':
+                        start_air_calibration()
+                        pass
                     case 'start_calibration':
                         start_calibration()
                         pass
@@ -3343,6 +3346,32 @@ def start_range_calibration():
     if ufc_ugc_zos_thread is not None:
         ufc_ugc_zos_thread.range_calibration_handle()
     pass
+def start_air_calibration():
+    """Start a standalone Air calibration while the experiment is running."""
+    if _environment_module_only_enabled():
+        message = "仅环境模块模式不运行气路，空气校准请求已拒绝"
+        logger.warning(message)
+        _send_main_window_status(
+            "runtime_air_calibration_response",
+            {"success": False, "message": message},
+        )
+        return
+    if ufc_ugc_zos_thread is None:
+        message = "气路服务未运行，无法启动空气校准"
+        logger.warning(message)
+        _send_main_window_status(
+            "runtime_air_calibration_response",
+            {"success": False, "message": message},
+        )
+        return
+    result = ufc_ugc_zos_thread.air_calibration_handle()
+    if not result.get("success", False):
+        logger.warning(result.get("message", "空气校准请求被拒绝"))
+        _send_main_window_status(
+            "calibration_msg",
+            result.get("message", "空气校准请求被拒绝"),
+        )
+    _send_main_window_status("runtime_air_calibration_response", result)
 def start_calibration():
     """
       校0 和span

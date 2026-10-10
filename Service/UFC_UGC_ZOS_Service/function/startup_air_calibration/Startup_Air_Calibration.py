@@ -70,6 +70,10 @@ class Startup_Air_Calibration:
         self._pending_full_o2_handler = None
         self._external_stop_checker = None
 
+    def set_external_stop_checker(self, checker):
+        """Attach a stop checker for a standalone runtime Air calibration."""
+        self._external_stop_checker = checker
+
     def _is_external_stop_requested(self):
         checker = self._external_stop_checker
         if not callable(checker):

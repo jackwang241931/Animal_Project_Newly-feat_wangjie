@@ -618,6 +618,7 @@ class ExperimentControlPage(_BaseWorkflowPage):
         calibration_box.addWidget(self.calibration_status)
         self.calibration_buttons: dict[str, QPushButton] = {}
         air_button = QPushButton("空气校准")
+        air_button.setToolTip("实验前选择完整 O₂ Span+Air；实验运行中启动单独 Air 空气校准")
         air_button.clicked.connect(self._start_air_calibration)
         self.calibration_buttons["air"] = air_button
         self.calibration_details_button = QPushButton("显示校准信息详情")
@@ -900,7 +901,7 @@ class ExperimentControlPage(_BaseWorkflowPage):
 
     def _calibration_ready(self, for_stop: bool = False) -> bool:
         if self._last_run_status not in {"running", "monitoring"} and not (for_stop and getattr(self, "_last_can_stop", False)):
-            self.operation_hint.setText("请等待实验启动完成后再执行校零或量程校准。")
+            self.operation_hint.setText("请等待实验启动完成后再执行气体校准。")
             return False
         if global_setting.get_setting("environment_module_only", False):
             self.operation_hint.setText("仅环境模块模式不运行气路，无法执行气体校准。")
@@ -996,50 +997,68 @@ class ExperimentControlPage(_BaseWorkflowPage):
     def _update_calibration_buttons(self) -> None:
         gas_enabled = not global_setting.get_setting("environment_module_only", False)
         gas_valid = bool(global_setting.get_setting("air_modules_all_valid", False))
-        self.calibration_buttons["air"].setEnabled(
-            gas_enabled and gas_valid and self._last_run_status not in {"starting", "running", "monitoring", "stopping"}
+        state = self._last_run_status
+        before_experiment = (
+            state not in {"starting", "running", "monitoring", "stopping"}
             and not getattr(self, "_last_can_stop", False)
         )
+        during_experiment = state in {"running", "monitoring"}
+        self.calibration_buttons["air"].setEnabled(
+            gas_enabled
+            and gas_valid
+            and (before_experiment or during_experiment)
+            and not self._active_calibrations
+            and not self._stopping_calibrations
+        )
     def on_calibration_event(self, event: str) -> None:
-        """React to the same zero/span start and finish events used by the legacy UI."""
+        """React to calibration start, finish and failed events from the backend."""
         channel, _, phase = event.partition("_")
-        if channel not in {"zero", "span"}:
+        if channel not in {"zero", "span", "air"}:
             return
         if phase == "started":
             self._active_calibrations.add(channel)
-            self.set_operation_progress(5, "校零进行中" if channel == "zero" else "校量程进行中")
-        elif phase == "finished":
+            progress_text = {
+                "zero": "校零进行中",
+                "span": "校量程进行中",
+                "air": "空气校准进行中",
+            }[channel]
+            self.set_operation_progress(5, progress_text)
+            if channel == "air":
+                self.calibration_status.setText("空气校准中")
+                self.operation_hint.setText("正在执行单独的空气校准流程，请等待完成。")
+        elif phase in {"finished", "failed"}:
             self._active_calibrations.discard(channel)
             self._stopping_calibrations.discard(channel)
             if not self._active_calibrations:
                 self._combined_calibration = False
+            if channel == "air":
+                if phase == "finished":
+                    self.calibration_status.setText("空气校准完成")
+                    self.operation_hint.setText("单独空气校准流程已完成。")
+                else:
+                    self.calibration_status.setText("空气校准启动失败")
+                    self.operation_hint.setText("空气校准未能启动，请查看运行日志中的具体原因。")
         self._update_calibration_buttons()
 
     def _start_air_calibration(self) -> None:
-        """Select startup Air calibration; execute it when the experiment starts."""
-        if self._last_run_status in {"starting", "running", "monitoring", "stopping"} or getattr(self, "_last_can_stop", False):
-            self.operation_hint.setText("空气校准仅支持在开始实验前选择。")
-            return
-        if global_setting.get_setting("environment_module_only", False):
-            self.operation_hint.setText("仅环境模块模式不运行气路，无法选择空气校准。")
-            return
-        if not global_setting.get_setting("air_modules_all_valid", False):
-            self.operation_hint.setText("请先确认串口并完成检测，UFC、UGC、ZOS 全部通过后才能选择空气校准。")
+        """Select full Span+Air before start, or run standalone Air while running."""
+        if self._last_run_status not in {"running", "monitoring"}:
+            self._select_startup_calibration("o2_span_air")
             return
 
-        global_setting.set_setting("startup_calibration_mode", "air")
-        global_setting.set_setting("is_auto_calibration", True)
-        selection_signal = getattr(self.main_window, "calibration_selection_changed_signal", None)
-        if selection_signal is not None:
-            selection_signal.emit(True, "air")
-        self.calibration_status.setText("已选择空气校准")
-        self.operation_hint.setText("已选择空气校准，请点击“开始实验”进行校准。")
+        if not self._calibration_ready():
+            return
+        if self._active_calibrations:
+            self.operation_hint.setText("已有气体校准正在进行，请等待完成后再操作。")
+            return
+        if not self._send_monitor_command("start_air_calibration"):
+            return
+        self._active_calibrations.add("air")
+        self._stopping_calibrations.discard("air")
+        self.calibration_status.setText("空气校准启动中")
+        self.set_operation_progress(0, "空气校准请求已发送")
+        self.operation_hint.setText("已请求单独空气校准，等待后台确认启动。")
         self._update_calibration_buttons()
-        QMessageBox.information(
-            self,
-            "选择空气校准",
-            "已选择空气校准，请点击“开始实验”进行校准。",
-        )
     def _start_experiment(self) -> None:
         if callable(getattr(self.main_window, "start_experiment", None)):
             self.set_operation_progress(0, "正在检查启动条件")
