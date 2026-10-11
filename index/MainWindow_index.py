@@ -275,6 +275,33 @@ class read_queue_data_Thread(MyQThread):
                                 if self.window.workflow_run_state == ExperimentRunState.STOPPING:
                                     self.window._append_workflow_runtime_log(message.data, "停止")
                                     return
+                                startup_mode = global_setting.get_setting(
+                                    "startup_calibration_mode", "none"
+                                )
+                                startup_calibration_active = (
+                                    self.window.workflow_run_state == ExperimentRunState.STARTING
+                                    and startup_mode in {
+                                        "air", "zero", "span", "full",
+                                        "o2_span_air", "co2_o2_span_air",
+                                    }
+                                )
+                                calibration_active = bool(
+                                    getattr(self.window, "_active_calibration_channels", set())
+                                ) or startup_calibration_active
+                                runtime_text = str(message.data)
+                                if calibration_active and any(
+                                    marker in runtime_text for marker in ("等待", "置换")
+                                ):
+                                    # Some gas-path wait/countdown events use the
+                                    # general runtime channel instead of
+                                    # calibration_msg. Mirror them into the
+                                    # calibration detail window during a run so
+                                    # stage handoffs do not look idle there.
+                                    self.calibration_detail_update_signal.emit({
+                                        "kind": "detail_message",
+                                        "message": runtime_text,
+                                        "has_time": True,
+                                    })
                                 match = re.search(r"已运行\s*(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)\s*秒", str(message.data))
                                 if match:
                                     elapsed, total = float(match.group(1)), float(match.group(2))
@@ -1378,6 +1405,13 @@ class MainWindow_Index(ThemedWindow):
                 self.status_bar.update_tip(message)
             self.cache_calibration_detail_log(
                 message,
+                has_time=bool(update.get("has_time", True)),
+            )
+            return
+
+        if kind == "detail_message":
+            self.cache_calibration_detail_only_log(
+                update.get("message"),
                 has_time=bool(update.get("has_time", True)),
             )
             return
@@ -3387,6 +3421,16 @@ class MainWindow_Index(ThemedWindow):
             return
         self.calibration_detail_log_buffer.append((message, has_time))
         self._append_workflow_runtime_log(message, "校准")
+        if len(self.calibration_detail_log_buffer) > 1000:
+            self.calibration_detail_log_buffer = self.calibration_detail_log_buffer[-1000:]
+        if self.calibration_details_windows is not None:
+            self.calibration_details_windows.addLog(message, has_time=has_time)
+
+    def cache_calibration_detail_only_log(self, message, has_time=True):
+        """Keep runtime-channel wait messages in the calibration detail history."""
+        if self._is_uncalibrated_stop_housekeeping(message):
+            return
+        self.calibration_detail_log_buffer.append((message, has_time))
         if len(self.calibration_detail_log_buffer) > 1000:
             self.calibration_detail_log_buffer = self.calibration_detail_log_buffer[-1000:]
         if self.calibration_details_windows is not None:
