@@ -428,6 +428,13 @@ class read_queue_data_Thread(MyQThread):
                                 "values": dict(message.data) if isinstance(message.data, dict) else {},
                                 "time": message.time,
                             })
+                    case 'set_calibration_span_values':
+                        if self.window is not None and message.data is not None:
+                            self.calibration_detail_update_signal.emit({
+                                "kind": "span_values",
+                                "values": dict(message.data) if isinstance(message.data, dict) else {},
+                                "time": message.time,
+                            })
                     case _:
                         pass
 
@@ -926,6 +933,9 @@ class MainWindow_Index(ThemedWindow):
         # 校准气路的窗口
         self.calibration_details_windows: CalibrationDialog = None
         self.calibration_detail_log_buffer = []
+        self.calibration_detail_span_values = {
+            "oxygen_value": global_setting.get_setting("span_standard_oxygen_value", 20.9),
+        }
         # GUI-owned lifecycle log.  The legacy start/stop dialogs stay hidden,
         # but every line they receive is mirrored here for the workflow page.
         self.workflow_runtime_log_buffer = []
@@ -1370,6 +1380,24 @@ class MainWindow_Index(ThemedWindow):
                 message,
                 has_time=bool(update.get("has_time", True)),
             )
+            return
+
+        if kind == "span_values":
+            if self.workflow_run_state in {
+                ExperimentRunState.STOPPING,
+                ExperimentRunState.STOPPED,
+                ExperimentRunState.STOP_FAILED,
+            }:
+                return
+            span_values = update.get("values") or {}
+            if "oxygen_value" in span_values:
+                self.calibration_detail_span_values["oxygen_value"] = span_values["oxygen_value"]
+                if self.calibration_details_windows is not None:
+                    self.calibration_details_windows.updateO2Span(
+                        span_values["oxygen_value"],
+                        event_time=update.get("time"),
+                        log_event=False,
+                    )
             return
 
         event_time = update.get("time")
@@ -3324,6 +3352,9 @@ class MainWindow_Index(ThemedWindow):
         self.release_calibration_windows()
         self.calibration_detail_log_buffer.clear()
         self.calibration_detail_status_text = None
+        self.calibration_detail_span_values = {
+            "oxygen_value": global_setting.get_setting("span_standard_oxygen_value", 20.9),
+        }
         self._active_calibration_channels.clear()
         self.calibration_detail_zero_start_time = None
         self.calibration_detail_zero_end_time = None
@@ -3398,10 +3429,18 @@ class MainWindow_Index(ThemedWindow):
             self.calibration_details_windows.log_history = []
             self.calibration_details_windows.log_sequence = 0
             self.calibration_details_windows.log_list.clear()
-            self.calibration_details_windows.updateO2Span(global_setting.get_setting('span_standard_oxygen_value',0), log_event=False)
             self.calibration_details_windows.updateCO2Span(global_setting.get_setting('span_standard_carbon_value',0), log_event=False)
             self.calibration_details_windows.updatePressureSpan(float(global_setting.get_setting('UFC_UGC_ZOS_config')['ZOS']['pressure_steady_default']), log_event=False)
             self.restore_calibration_detail_window_state()
+        # Refresh on every open as well as on the calibration-start message;
+        # the dialog can outlive configuration edits between runs.
+        self.calibration_details_windows.updateO2Span(
+            self.calibration_detail_span_values.get(
+                "oxygen_value",
+                global_setting.get_setting("span_standard_oxygen_value", 20.9),
+            ),
+            log_event=False,
+        )
     def show_calibration_windows(self,data):
         # A delayed signal must never reopen the calibration dialog while the
         # experiment is stopping or after it has stopped.

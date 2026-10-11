@@ -74,6 +74,17 @@ class Startup_O2_Span_Air_Calibration:
                 title=self.title,
             )
 
+    def _send_span_values(self, oxygen_value):
+        """Publish the certified Span concentration actually used this run."""
+        if self.update_status_main_signal_gui_update is not None:
+            self.update_status_main_signal_gui_update.send(
+                {
+                    "type": "set_calibration_span_values",
+                    "value": {"oxygen_value": oxygen_value},
+                },
+                title=self.title,
+            )
+
     @staticmethod
     def _calibration_config():
         config = global_setting.get_setting("UFC_UGC_ZOS_config", {}) or {}
@@ -346,6 +357,7 @@ class Startup_O2_Span_Air_Calibration:
             target_points = self._target_points()
             sample_interval = self._sample_interval()
             span_value = self._span_value()
+            self._send_span_values(span_value)
             active_channels = self._get_active_channels()
             if not active_channels:
                 raise RuntimeError("未配置已启用笼位，无法执行O2 Span校准")
@@ -405,7 +417,7 @@ class Startup_O2_Span_Air_Calibration:
 
     def prepare_air_path(self, resolve, reject):
         """Switch from the completed CO2 Span stage to the shared Air stage."""
-        if self._is_stop_requested():
+        if self.is_stop_requested():
             reject("已收到停止请求，取消切换Air空气校准气路")
             return
         try:
@@ -464,6 +476,7 @@ class Startup_O2_Span_Air_Calibration:
             target_points = self._target_points()
             sample_interval = self._sample_interval()
             span_value = self._span_value()
+            self._send_span_values(span_value)
             active_channels = self._get_active_channels()
             if not active_channels:
                 raise RuntimeError("未配置已启用笼位，无法执行O2 Span+空气校准")

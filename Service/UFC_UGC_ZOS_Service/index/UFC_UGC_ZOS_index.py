@@ -248,6 +248,13 @@ class UFC_UGC_ZOS_index(MyQThread):
                                                         data=text.get('value',{}),
                                                         time=time_util.get_format_from_time(time.time())))
                                     pass
+                                case 'set_calibration_span_values':
+                                    queue.put(
+                                        ObjectQueueItem(origin='UFC_UGC_ZOS_index', to='MainWindow_index',
+                                                        title='set_calibration_span_values',
+                                                        data=text.get('value',{}),
+                                                        time=time_util.get_format_from_time(time.time())))
+                                    pass
                                 case _:
                                     pass
                         else:
