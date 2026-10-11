@@ -289,14 +289,28 @@ class read_queue_data_Thread(MyQThread):
                                     getattr(self.window, "_active_calibration_channels", set())
                                 ) or startup_calibration_active
                                 runtime_text = str(message.data)
-                                if calibration_active and any(
+                                is_wait_or_purge = any(
                                     marker in runtime_text for marker in ("等待", "置换")
+                                )
+                                is_gas_stage_transition = (
+                                    any(
+                                        marker in runtime_text
+                                        for marker in ("开始", "完成", "切换", "启动", "开启", "关闭", "结束", "采集")
+                                    )
+                                    and any(
+                                        marker in runtime_text
+                                        for marker in ("Air", "空气", "Span", "CO2", "O2", "UFC", "UGC", "ZOS", "校准", "气路")
+                                    )
+                                )
+                                if calibration_active and (
+                                    is_wait_or_purge or is_gas_stage_transition
                                 ):
-                                    # Some gas-path wait/countdown events use the
-                                    # general runtime channel instead of
-                                    # calibration_msg. Mirror them into the
-                                    # calibration detail window during a run so
-                                    # stage handoffs do not look idle there.
+                                    # Gas-path countdowns and stage transitions
+                                    # may use the general runtime channel rather
+                                    # than calibration_msg. Mirror these while
+                                    # calibration is active, including Air-stage
+                                    # valve handoffs, so the detail timeline
+                                    # does not appear to pause between phases.
                                     self.calibration_detail_update_signal.emit({
                                         "kind": "detail_message",
                                         "message": runtime_text,
