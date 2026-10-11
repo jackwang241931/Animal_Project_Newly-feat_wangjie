@@ -342,10 +342,17 @@ class UFC_UGC_ZOS_index(MyQThread):
 
                                                    time=time_util.get_format_from_time(time.time())))
             pass
-    def start_btn_handle_with_calibration(self):
-        """先按流程完成调零+调span，再重新启动正常实验气路"""
+    def _prepare_new_start(self):
+        """Reset shutdown state shared by every experiment startup path."""
         global stop_flag
         stop_flag = False
+        self._stop_requested = False
+        self._shutdown_errors = []
+        global_setting.set_setting("calibration_cancel_requested", False)
+
+    def start_btn_handle_with_calibration(self):
+        """先按流程完成调零+调span，再重新启动正常实验气路"""
+        self._prepare_new_start()
 
         return AsyPromise(
             lambda resolve, reject: self._run_callback_steps(
@@ -363,8 +370,7 @@ class UFC_UGC_ZOS_index(MyQThread):
 
     def start_btn_handle_with_single_calibration(self, calibration):
         """执行选定的单项校准后，再按正常流程启动气路。"""
-        global stop_flag
-        stop_flag = False
+        self._prepare_new_start()
         calibration_handler = (
             self.zero_carlibration_obj_calibrate_wrapped
             if calibration == "zero"
@@ -386,8 +392,7 @@ class UFC_UGC_ZOS_index(MyQThread):
 
     def start_btn_handle_with_air_calibration(self):
         """启动气路，并在进入正常实验前执行 Air 空气校准。"""
-        global stop_flag
-        stop_flag = False
+        self._prepare_new_start()
 
         return (
             # 步骤0必须位于所有气路启动命令之前。
@@ -493,8 +498,7 @@ class UFC_UGC_ZOS_index(MyQThread):
         O2/CO2 Air acquisition.  The historical O2-only mode remains available
         for saved configurations and keeps its previous behavior.
         """
-        global stop_flag
-        stop_flag = False
+        self._prepare_new_start()
         self._prepare_startup_calibration_cages()
         if include_co2_zero:
             self.update_status_main_signal_gui_update.send(
@@ -670,8 +674,7 @@ class UFC_UGC_ZOS_index(MyQThread):
 
     def start_btn_handle_with_co2_air_calibration(self):
         """启动气路，并在进入正常实验前执行 CO2 Air 空气校准。"""
-        global stop_flag
-        stop_flag = False
+        self._prepare_new_start()
 
         return (
             AsyPromise(self.ZOS_gas_path_system_obj.start)
@@ -759,10 +762,7 @@ class UFC_UGC_ZOS_index(MyQThread):
         pass
 
     def start_btn_handle(self):
-        global stop_flag
-        stop_flag = False
-        self._stop_requested = False
-        self._shutdown_errors = []
+        self._prepare_new_start()
         p = AsyPromise(self.ZOS_gas_path_system_obj.start).then(
             lambda _:AsyPromise(
                 self.UFC_gas_path_system_obj.start,
