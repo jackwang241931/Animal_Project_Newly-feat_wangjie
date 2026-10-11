@@ -420,6 +420,14 @@ class UFC_UGC_ZOS_index(MyQThread):
         finally:
             self.Zero_carlibration_obj.co2_only_mode = False
 
+    def co2_span_calibration_obj_calibrate_wrapped(self, resolve, reject):
+        """Run only the CO2 half of the established Span calibration worker."""
+        self.Range_carlibration_obj.co2_only_mode = True
+        try:
+            self.span_carlibration_obj_calibrate_wrapped(resolve, reject)
+        finally:
+            self.Range_carlibration_obj.co2_only_mode = False
+
     def _co2_zero_then_read_ufc_start_status(self, resolve, reject):
         """Run CO2 zero first and forward the actual UFC status dictionary.
 
@@ -441,6 +449,24 @@ class UFC_UGC_ZOS_index(MyQThread):
         except Exception as exc:
             reject(exc)
 
+    def _restart_ufc_after_co2_span(self, resolve, reject):
+        """Restart UFC after the legacy CO2 Span worker's safe shutdown."""
+
+        def start_with_current_status(startup_status):
+            try:
+                self._remember_ufc_start_status(startup_status)
+                self.UFC_gas_path_system_obj.start(resolve, reject)
+            except Exception as exc:
+                reject(exc)
+
+        try:
+            self.UFC_gas_state_check_obj.read_start_status(
+                start_with_current_status,
+                reject,
+            )
+        except Exception as exc:
+            reject(exc)
+
     def _prepare_startup_calibration_cages(self):
         experiment_settings = global_setting.get_setting("experiment_setting", None)
         groups = getattr(experiment_settings, "groups", []) if experiment_settings is not None else []
@@ -454,13 +480,18 @@ class UFC_UGC_ZOS_index(MyQThread):
             global_setting.set_setting("mouse_cages", cage_ids)
 
     def start_btn_handle_with_o2_span_air_calibration(self, include_co2_zero=False):
-        """Run optional CO2 zero, O2 Span, then the established full Air workflow."""
+        """Run the documented startup calibration sequence before the experiment.
+
+        The complete mode is CO2 zero -> O2 Span -> CO2 Span -> shared
+        O2/CO2 Air acquisition.  The historical O2-only mode remains available
+        for saved configurations and keeps its previous behavior.
+        """
         global stop_flag
         stop_flag = False
         self._prepare_startup_calibration_cages()
         if include_co2_zero:
             self.update_status_main_signal_gui_update.send(
-                f"{time_util.get_format_from_time(time.time())} | 启动组合校准：先执行旧版CO₂校零，再执行O₂ Span和空气校准",
+                f"{time_util.get_format_from_time(time.time())} | 启动完整空气校准：CO₂校零 → O₂ Span → CO₂ Span → O₂/CO₂ Air同时采集",
                 title=GapSystem_Running_Type.STARTUP_AIR_CALIBRATION,
             )
             chain = AsyPromise(self._co2_zero_then_read_ufc_start_status)
@@ -471,14 +502,42 @@ class UFC_UGC_ZOS_index(MyQThread):
             )
             chain = AsyPromise(self.UFC_gas_state_check_obj.read_start_status)
 
-        return (
+        chain = (
             chain
             .then(self._remember_ufc_start_status)
             .then(lambda _: AsyPromise(self.UGC_gas_path_system_obj.start))
             .then(lambda _: AsyPromise(self.ZOS_gas_path_system_obj.start))
             .then(lambda _: AsyPromise(self.UFC_gas_path_system_obj.start))
-            .then(lambda _: AsyPromise(self.Startup_o2_span_air_calibration_obj.run_span_only))
-            .then(self._handoff_o2_span_handler_to_full_air)
+        )
+
+        if include_co2_zero:
+            chain = (
+                chain
+                .then(lambda _: AsyPromise(
+                    self.Startup_o2_span_air_calibration_obj.run_span_only_keep_span
+                ))
+                .then(self._handoff_o2_span_handler_to_full_air)
+                .then(lambda _: AsyPromise(
+                    self.co2_span_calibration_obj_calibrate_wrapped
+                ))
+                .then(lambda _: AsyPromise(
+                    self.Startup_o2_span_air_calibration_obj.prepare_air_path
+                ))
+                .then(lambda _: AsyPromise(
+                    self._restart_ufc_after_co2_span
+                ))
+            )
+        else:
+            chain = (
+                chain
+                .then(lambda _: AsyPromise(
+                    self.Startup_o2_span_air_calibration_obj.run_span_only
+                ))
+                .then(self._handoff_o2_span_handler_to_full_air)
+            )
+
+        return (
+            chain
             .then(lambda _: AsyPromise(self.Startup_air_calibration_obj.start))
             .then(lambda _: AsyPromise(
                 self.Startup_air_calibration_obj.wait_air_calibration_prepare
@@ -799,10 +858,22 @@ class UFC_UGC_ZOS_index(MyQThread):
         auto_wait_event.clear()
 
         self.close_timers()
+        # Documented hardware shutdown order:
+        # ZOS -> cage, UFC pump off -> wait, UGC air off, UFC off.
+        # The UFC close worker invokes the UGC hook after its pump wait and
+        # immediately before sending the UFC-off command.
+        if (
+            self.UFC_gas_path_system_obj is not None
+            and self.UFC_gas_path_system_obj.ufc_gas_path_system_close_thread is not None
+            and self.UGC_gas_path_system_obj is not None
+        ):
+            self.UFC_gas_path_system_obj.ufc_gas_path_system_close_thread.before_close_ufc = (
+                self.UGC_gas_path_system_obj.close_air_valve_for_shutdown
+            )
         return self._stop_gas_paths_then_finish(
-            [("UGC", self.UGC_gas_path_system_obj),
+            [("ZOS", self.ZOS_gas_path_system_obj),
              ("UFC", self.UFC_gas_path_system_obj),
-             ("ZOS", self.ZOS_gas_path_system_obj)],
+             ("UGC", self.UGC_gas_path_system_obj)],
             index=0,
         )
 

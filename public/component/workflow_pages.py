@@ -958,7 +958,10 @@ class ExperimentControlPage(_BaseWorkflowPage):
             "span": ("span", "校量程"),
             "all": ("full", "校零且量程"),
             "o2_span_air": ("o2_span_air", "O₂ Span+空气校准"),
-            "co2_o2_span_air": ("co2_o2_span_air", "CO₂校零+O₂ Span+空气校准"),
+            "co2_o2_span_air": (
+                "co2_o2_span_air",
+                "CO₂校零+O₂/CO₂ Span+空气校准",
+            ),
         }[key]
         current_mode = global_setting.get_setting("startup_calibration_mode", "none")
         if current_mode == mode:
@@ -1043,7 +1046,10 @@ class ExperimentControlPage(_BaseWorkflowPage):
     def _start_air_calibration(self) -> None:
         """Select full Span+Air before start, or run standalone Air while running."""
         if self._last_run_status not in {"running", "monitoring"}:
-            self._select_startup_calibration("o2_span_air")
+            # The single pre-experiment Air button represents the complete
+            # documented workflow: CO2 zero, O2 Span, CO2 Span, then the
+            # shared O2/CO2 Air acquisition.
+            self._select_startup_calibration("co2_o2_span_air")
             return
 
         if not self._calibration_ready():

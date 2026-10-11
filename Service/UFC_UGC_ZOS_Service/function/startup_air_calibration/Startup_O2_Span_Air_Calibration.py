@@ -324,6 +324,13 @@ class Startup_O2_Span_Air_Calibration:
 
     def run_span_only(self, resolve, reject):
         """Collect Span data, then hand the active handler to the full Air workflow."""
+        self._run_span_only(resolve, reject, switch_to_air=True)
+
+    def run_span_only_keep_span(self, resolve, reject):
+        """Collect O2 Span data while keeping the Span gas path for CO2 Span."""
+        self._run_span_only(resolve, reject, switch_to_air=False)
+
+    def _run_span_only(self, resolve, reject, switch_to_air):
         with self._state_lock:
             if self._running:
                 reject("O2 Span+空气校准正在运行")
@@ -374,12 +381,17 @@ class Startup_O2_Span_Air_Calibration:
             if not status.get("need_air"):
                 raise RuntimeError("O2 Span采样未完成，不能进入Air空气校准")
 
-            # Transfer the gas path to Air.  The complete Air workflow will
-            # perform preparation, reference capture, O2/CO2 collection and stop.
-            self._set_coil(3, 0, True, "开启UGC空气阀")
-            self._set_coil(3, 2, False, "关闭UGC Span阀")
-            self._set_coil(3, 1, False, "关闭UGC N2阀")
-            self._send_text("O2 Span采样完成，移交完整Air空气校准流程")
+            if switch_to_air:
+                # Backward-compatible route used by the historical O2-only
+                # startup mode.
+                self._set_coil(3, 0, True, "开启UGC空气阀")
+                self._set_coil(3, 2, False, "关闭UGC Span阀")
+                self._set_coil(3, 1, False, "关闭UGC N2阀")
+                self._send_text("O2 Span采样完成，移交完整Air空气校准流程")
+            else:
+                self._send_text(
+                    "O2 Span采样完成，保持Span气路并移交CO2 Span阶段"
+                )
         except Exception as exc:
             failure = exc
             logger.exception(f"{self.name} Span阶段失败")
@@ -390,6 +402,28 @@ class Startup_O2_Span_Air_Calibration:
             reject(failure)
             return
         resolve(self._handler)
+
+    def prepare_air_path(self, resolve, reject):
+        """Switch from the completed CO2 Span stage to the shared Air stage."""
+        if self._is_stop_requested():
+            reject("已收到停止请求，取消切换Air空气校准气路")
+            return
+        try:
+            self._set_coil(3, 0, True, "开启UGC空气阀")
+            self._set_coil(3, 2, False, "关闭UGC Span阀")
+            self._set_coil(3, 1, False, "关闭UGC N2阀")
+            # The legacy CO2 Span worker clears the shared calibration flag
+            # during its own finish callback.  Restore ownership for the
+            # pending O2 Span -> shared Air calibration before UFC restarts.
+            global_setting.set_setting("is_calibrating", True)
+            global_setting.set_setting("current_calibration_type", self.name)
+            self._send_text(
+                "CO2 Span完成，已切换空气气路，开始O2/CO2同时Air采集"
+            )
+        except Exception as exc:
+            reject(exc)
+            return
+        resolve()
 
     def complete_after_full_air(self, resolve, reject):
         """Validate and finish the combined workflow after full Air calibration."""

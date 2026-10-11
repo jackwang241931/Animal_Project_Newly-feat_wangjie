@@ -452,6 +452,9 @@ class UFC_gas_path_system_close_thread(MyQThread):
             update_status_main_signal_gui_update=self.update_status_main_signal_gui_update,
             send_message=self.send_message)
         self.close_error = None
+        # Optional shutdown hook injected by the service coordinator.  The
+        # documented order is pump off -> wait -> air valve off -> UFC off.
+        self.before_close_ufc = None
         super().__init__(name=name)
     def before_Runing_work(self):
         pass
@@ -466,6 +469,7 @@ class UFC_gas_path_system_close_thread(MyQThread):
 
     def _finish_close_failure(self, error):
         self.close_error = str(error)
+        self.before_close_ufc = None
         logger.error(f"UFC关闭失败：{error}")
         global wait_UFC_stop_finish_event
         wait_UFC_stop_finish_event.set()
@@ -497,7 +501,7 @@ class UFC_gas_path_system_close_thread(MyQThread):
             lambda _: resolve()
         ).catch(reject)
     def close_UFC_valve(self,resolve,reject,port):
-        """2.UFC阀门关闭 让步骤3延迟1分钟在关闭"""
+        """Wait for flow shutdown, close the air valve hook, then close UFC."""
         queue = global_setting.get_setting("queue", None)
         # 等待时间
         time_index = 0
@@ -509,6 +513,15 @@ class UFC_gas_path_system_close_thread(MyQThread):
                                     time=time_util.get_format_from_time(time.time())))
             time_index += 1
             time.sleep(float(global_setting.get_setting('UFC_UGC_ZOS_config')['UFC']['wait_time_delay']))
+        hook = self.before_close_ufc
+        if callable(hook):
+            AsyPromise(hook).then(
+                lambda _: self._send_close_ufc_command(resolve, reject, port)
+            ).catch(reject)
+            return
+        self._send_close_ufc_command(resolve, reject, port)
+
+    def _send_close_ufc_command(self, resolve, reject, port):
         self.send_message = {
             'port': port,
             'data': number_util.set_int_to_4_bytes_list(f"000B0000"),
@@ -533,6 +546,7 @@ class UFC_gas_path_system_close_thread(MyQThread):
         ).catch(reject)
 
     def finish_close(self,resolve,reject):
+        self.before_close_ufc = None
         global_setting.set_setting("ufc_start_time_state", False)
         # 释放 正在等待ufc启动的地方
         global wait_UFC_stop_finish_event
@@ -997,6 +1011,7 @@ class UGC_gas_path_system(Gas_path_system):
     process_nums =1
     def __init__(self):
         super().__init__()
+        self._air_closed_for_shutdown = False
         # 运行线程
         self.ugc_gas_path_system_run_thread = UGC_gas_path_system_run_thread(
             name="UGC_gas_path_system_run_thread",
@@ -1024,6 +1039,7 @@ class UGC_gas_path_system(Gas_path_system):
                 f"{time_util.get_format_from_time(time.time())} | 启动失败，未选择串口！")
             reject()
         # 1.打开reference气电磁阀（空气伐）
+        self._air_closed_for_shutdown = False
         self.send_message = {
             'port': port,
             'data': number_util.set_int_to_4_bytes_list("0000FF00"),
@@ -1139,9 +1155,36 @@ class UGC_gas_path_system(Gas_path_system):
     """
     run_no_circulation_read end
     """
+    def close_air_valve_for_shutdown(self, resolve, reject):
+        """Close the UGC air valve between the pump wait and UFC shutdown."""
+        if self._air_closed_for_shutdown:
+            resolve()
+            return
+        port = global_setting.get_setting("port", None)
+        if port is None:
+            reject("未选择串口，无法关闭UGC空气阀")
+            return
+        self.send_message = {
+            'port': port,
+            'data': number_util.set_int_to_4_bytes_list("00000000"),
+            'slave_id': '3',
+            'function_code': '5',
+            'timeout': 1,
+        }
+        self.send_thread.send_message = self.send_message
+        self.update_status_main_signal_gui_update.send(
+            f"{time_util.get_format_from_time(time.time())} | UGC-停止 关闭空气阀"
+        )
+
+        def finish(_):
+            self._air_closed_for_shutdown = True
+            resolve()
+
+        AsyPromise(self.send_thread.Send).then(finish).catch(reject)
+
     def stop(self, resolve, reject):
         """
-        停止气路（新流程：直接停止线程，断电即可，无需发指令）
+        停止气路；若统一停止流程尚未关闭空气阀，则在这里补关。
         :return:
         """
         self.update_status_main_signal_gui_update.send(f"{time_util.get_format_from_time(time.time())} | UGC 正在停止{'.'*100}")
@@ -1149,7 +1192,9 @@ class UGC_gas_path_system(Gas_path_system):
             self.ugc_gas_path_system_run_thread.stop()
             self.ugc_gas_path_system_run_thread.deleteLater()
             self.ugc_gas_path_system_run_thread = None
-        AsyPromise(self.stop_finished).then(lambda _: resolve()).catch(lambda e: reject(e))
+        AsyPromise(self.close_air_valve_for_shutdown).then(
+            lambda _: AsyPromise(self.stop_finished)
+        ).then(lambda _: resolve()).catch(lambda e: reject(e))
 
     pass
     def stop_finished(self,resolve,reject):
@@ -1711,7 +1756,7 @@ class ZOS_gas_path_system(Gas_path_system):
     """run end"""
     def stop(self,resolve,reject):
         """
-        停止气路
+        停止气路：先把ZOS切回鼠笼采样状态，再完成线程收尾。
         :return:
         """
         self.update_status_main_signal_gui_update.send(f"{time_util.get_format_from_time(time.time())} | ZOS 正在停止{'.'*100}")
@@ -1720,6 +1765,26 @@ class ZOS_gas_path_system(Gas_path_system):
             self.zos_gas_path_system_run_thread.deleteLater()
             self.zos_gas_path_system_run_thread=None
         self.is_stop = True
+        port = global_setting.get_setting("port", None)
+        if port is None:
+            reject("未选择串口，无法将ZOS切回鼠笼")
+            return
+        self.send_message = {
+            'port': port,
+            'data': number_util.set_int_to_4_bytes_list("00090000"),
+            'slave_id': '4',
+            'function_code': '5',
+            'timeout': 1,
+        }
+        self.send_thread.send_message = self.send_message
+        self.update_status_main_signal_gui_update.send(
+            f"{time_util.get_format_from_time(time.time())} | ZOS-停止 切换为鼠笼采样状态")
+        AsyPromise(self.send_thread.Send).then(
+            lambda _: self._finish_stop_after_cage_switch(resolve)
+        ).catch(reject)
+
+    def _finish_stop_after_cage_switch(self, resolve):
+        self.zos_start_status = False
         self.update_status_main_signal_gui_update.send(
             f"{time_util.get_format_from_time(time.time())} | ZOS 已停止{'.' * 100}")
         # 返回响应

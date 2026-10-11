@@ -1504,7 +1504,7 @@ class ExperimentConfigPage(QWidget):
             "span": "校量程",
             "full": "校零+校span",
             "o2_span_air": "O2 Span+空气校准",
-            "co2_o2_span_air": "CO2校零+O2 Span+空气校准",
+            "co2_o2_span_air": "CO2校零+O2/CO2 Span+空气校准",
         }.get(mode, "不校准")
 
     @staticmethod

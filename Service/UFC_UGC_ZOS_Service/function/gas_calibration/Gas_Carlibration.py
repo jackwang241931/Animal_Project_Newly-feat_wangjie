@@ -629,7 +629,7 @@ class Zero_Carlibration(Gas_Carlibration, MyQThread):
         start_time = time.time()
 
         max_timeout = float(config.get('calibration_max_timeout', 300))
-        stable_duration = float(config.get('reference_channel_stable_duration', 30))
+        stable_duration = float(config.get('calibration_stable_duration', 15))
         sample_interval = float(config.get('calibration_sample_interval', 1))
         threshold = float(config.get('zero_calibration_carbon_threshold', 5))
         min_range = float(config.get('zero_calibration_co2_min', 0))
@@ -1008,6 +1008,10 @@ class Range_Carlibration(Gas_Carlibration, MyQThread):
 
     def __init__(self):
         self.title = GapSystem_Running_Type.RANGE_CALIBRATION
+        # The complete startup workflow reuses this worker for the CO2 Span
+        # stage after the new O2 Span sampler has already finished.  Keep the
+        # legacy combined mode as the default for all existing callers.
+        self.co2_only_mode = False
         Gas_Carlibration.__init__(self, title=self.title, type=Gas_Carlibration_Type.SPAN)
         MyQThread.__init__(self, name='Range_Carlibration_thread')
         self.port = None
@@ -1647,7 +1651,7 @@ def _patched_zero_cyclic_sampling_of_ugc_carbon_sensor(self, resolve, reject, po
     config = global_setting.get_setting("UFC_UGC_ZOS_config")['Calibration']
     start_time = time.time()
     max_timeout = float(config.get('calibration_max_timeout', 300))
-    stable_duration = float(config.get('reference_channel_stable_duration', 30))
+    stable_duration = float(config.get('calibration_stable_duration', 15))
     sample_interval = float(config.get('calibration_sample_interval', 1))
     threshold = float(config.get('zero_calibration_carbon_threshold', 5))
 
@@ -1829,7 +1833,7 @@ def _patched_range_cyclic_sampling_of_ugc_carbon_sensor(self, resolve, reject, p
     config = global_setting.get_setting("UFC_UGC_ZOS_config")['Calibration']
     start_time = time.time()
     max_timeout = float(config.get('calibration_max_timeout', 300))
-    stable_duration = float(config.get('reference_channel_stable_duration', 30))
+    stable_duration = float(config.get('calibration_stable_duration', 15))
     sample_interval = float(config.get('calibration_sample_interval', 1))
     threshold = float(config.get('span_calibration_carbon_threshold', 15))
     tolerance = float(config.get('span_calibration_co2_tolerance', 25))
@@ -2167,7 +2171,13 @@ def _patched_open_gas_pump_and_flow_for_zero_v2(self, resolve, reject, port):
     ).catch(lambda e: reject(e))
 
 
-def _patched_wait_one_minute_for_zero_v2(self, resolve, reject, step_desc):
+def _patched_wait_one_minute_for_zero_v2(
+    self,
+    resolve,
+    reject,
+    step_desc,
+    wait_seconds=None,
+):
     def stop_requested():
         return bool(
             self.is_STOP
@@ -2181,7 +2191,11 @@ def _patched_wait_one_minute_for_zero_v2(self, resolve, reject, step_desc):
         return
 
     ufc_config = global_setting.get_setting("UFC_UGC_ZOS_config")['UFC']
-    wait_time = float(ufc_config.get('wait_time', 60))
+    wait_time = (
+        float(ufc_config.get('wait_time', 60))
+        if wait_seconds is None
+        else max(0.0, float(wait_seconds))
+    )
     wait_time_delay = float(ufc_config.get('wait_time_delay', 1))
     waited = 0.0
 
@@ -2313,6 +2327,12 @@ def _patched_zero_dosomething_v2(self):
         title=self.title
     )
     if getattr(self, "co2_only_mode", False):
+        calibration_config = global_setting.get_setting(
+            "UFC_UGC_ZOS_config", {}
+        ).get("Calibration", {})
+        co2_zero_purge_time = float(
+            calibration_config.get("co2_zero_purge_time", 120)
+        )
         self.update_status_main_signal_gui_update.send(
             f"{time_util.get_format_from_time(time.time())} | 组合流程：执行旧CO2零点逻辑，跳过旧O2零点采样",
             title=self.title,
@@ -2321,7 +2341,11 @@ def _patched_zero_dosomething_v2(self):
             lambda _: AsyPromise(self.open_zos_zero_or_span_valve, port=self.port).then(
                 lambda __: AsyPromise(self.start_ufc_if_needed_for_zero, port=self.port).then(
                     lambda ___: AsyPromise(self.open_gas_pump_and_flow_for_zero, port=self.port).then(
-                        lambda ____: AsyPromise(self.wait_one_minute_for_zero, step_desc="开启气泵后等待一分钟").then(
+                        lambda ____: AsyPromise(
+                            self.wait_one_minute_for_zero,
+                            step_desc="开启气泵后等待CO2校零气体置换",
+                            wait_seconds=co2_zero_purge_time,
+                        ).then(
                             lambda _____: AsyPromise(
                                 self.cyclic_sampling_of_ugc_carbon_sensor, port=self.port
                             ).then(
@@ -2356,6 +2380,49 @@ def _patched_zero_dosomething_v2(self):
 def _patched_range_dosomething_v2(self):
     self.ufc_started_by_calibration = False
     self.defer_zos_close_until_finalize = True
+    if getattr(self, "co2_only_mode", False):
+        calibration_config = global_setting.get_setting(
+            "UFC_UGC_ZOS_config", {}
+        ).get("Calibration", {})
+        co2_span_purge_time = float(
+            calibration_config.get("co2_span_purge_time", 120)
+        )
+        self.update_status_main_signal_gui_update.send(
+            f"{time_util.get_format_from_time(time.time())} | 组合流程：O2 Span已完成，本阶段只执行CO2 Span",
+            title=self.title,
+        )
+        AsyPromise(self.open_ugc_zero_or_span_valve, port=self.port).then(
+            lambda _: AsyPromise(self.open_zos_zero_or_span_valve, port=self.port).then(
+                lambda __: AsyPromise(self.start_ufc_if_needed_for_zero, port=self.port).then(
+                    lambda ___: AsyPromise(self.open_gas_pump_and_flow_for_zero, port=self.port).then(
+                        lambda ____: AsyPromise(
+                            self.wait_one_minute_for_zero,
+                            step_desc="开启气泵后等待CO2 Span气体置换",
+                            wait_seconds=co2_span_purge_time,
+                        ).then(
+                            lambda _____: AsyPromise(
+                                self.set_ugc_standard_gas_co2,
+                                port=self.port,
+                            ).then(
+                                lambda ______: AsyPromise(
+                                    self.cyclic_sampling_of_ugc_carbon_sensor,
+                                    port=self.port,
+                                ).then(
+                                    lambda _______: AsyPromise(
+                                        self.span_finalize_flow,
+                                        port=self.port,
+                                    ).then(
+                                        lambda ________: self.stop()
+                                    ).catch(lambda e: self.stop())
+                                ).catch(lambda e: self.stop())
+                            ).catch(lambda e: self.stop())
+                        ).catch(lambda e: self.stop())
+                    ).catch(lambda e: self.stop())
+                ).catch(lambda e: self.stop())
+            ).catch(lambda e: self.stop())
+        ).catch(lambda e: self.stop())
+        return
+
     AsyPromise(self.open_ugc_zero_or_span_valve, port=self.port).then(
         lambda _: AsyPromise(self.open_zos_zero_or_span_valve, port=self.port).then(
             lambda __: AsyPromise(self.start_ufc_if_needed_for_zero, port=self.port).then(

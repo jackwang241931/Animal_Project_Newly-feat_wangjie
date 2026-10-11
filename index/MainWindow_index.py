@@ -127,7 +127,22 @@ def _calculate_o2_span_full_air_wait_seconds(
     total += air_wait + reference_timeout + air_run_timeout + 120
 
     if include_co2_zero:
-        total += max(config_float("calibration_max_timeout", 300), 300) + 120
+        # Complete mode adds CO2-only zero and CO2-only Span.  Include each
+        # documented two-minute replacement period as well as the bounded
+        # sampling and safe shutdown allowance, otherwise the GUI can report
+        # startup failure while the backend is still calibrating.
+        calibration_timeout = max(config_float("calibration_max_timeout", 300), 300)
+        co2_zero_purge = config_float("co2_zero_purge_time", 120, 0)
+        co2_span_purge = config_float("co2_span_purge_time", 120, 0)
+        safe_shutdown_allowance = 120
+        total += (
+            co2_zero_purge
+            + calibration_timeout
+            + safe_shutdown_allowance
+            + co2_span_purge
+            + calibration_timeout
+            + safe_shutdown_allowance
+        )
     return total
 
 
