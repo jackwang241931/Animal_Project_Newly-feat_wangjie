@@ -485,6 +485,39 @@ class Startup_Air_Calibration:
             standard_pressure = 1013.25
         return round(float(raw_co2_ppm) * standard_pressure / float(gas_pressure), 4)
 
+    def _seed_co2_reference_for_time_alignment(self, active_channels):
+        """Collect one REF point before cage polling so M1 has a time peer."""
+        reference_channel = 8
+        if reference_channel not in active_channels:
+            return False
+
+        for attempt in range(3):
+            co2_snapshot = self._read_ugc_channel_snapshot(reference_channel)
+            zos_snapshot = self._read_zos_channel_snapshot(reference_channel)
+            if co2_snapshot is not None and zos_snapshot is not None:
+                compensated_co2 = self._calculate_pressure_compensated_co2(
+                    co2_snapshot.get("raw_co2_ppm"),
+                    zos_snapshot.get("gas_pressure"),
+                )
+                if compensated_co2 is not None:
+                    self.co2_calibration_handler.add_data(
+                        self._channel_to_handler_name(reference_channel),
+                        compensated_co2,
+                    )
+                    self._send_text(
+                        f"{self.name}CO2时间对齐：正式轮询前REF预采样完成（1点）"
+                    )
+                    return True
+            logger.warning(
+                f"{self.name}CO2时间对齐：REF预采样失败，"
+                f"正在重试 {attempt + 1}/3"
+            )
+
+        self._send_text(
+            f"{self.name}CO2时间对齐失败：正式轮询前未取得REF参考点"
+        )
+        return False
+
     def _read_zos_channel_snapshot(self, channel):
         port = self._get_port()
         self.send_message = {
@@ -597,6 +630,9 @@ class Startup_Air_Calibration:
             )
         except Exception as exc:
             reject(str(exc))
+            return
+        if not self._seed_co2_reference_for_time_alignment(active_channels):
+            reject(f"{self.name}无法开始：CO2时间对齐缺少REF预采样数据")
             return
         max_timeout = self._normalize_run_timeout(target_points, sample_interval, len(active_channels))
         last_progress_log_time = 0.0
