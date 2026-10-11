@@ -108,7 +108,11 @@ class UFC_UGC_ZOS_index(MyQThread):
         # second chain before the first one completes, producing many repeated
         # "ZOS 正在启动" commands and stale callbacks during shutdown.
         self._startup_chain_started = False
-        self._stop_requested = False
+        # Keep experiment shutdown state separate from MyQThread's own
+        # _stop_requested flag. The startup worker stops itself after the gas
+        # paths enter run mode, but that does not mean the experiment is
+        # stopping.
+        self._experiment_stop_requested = False
         self._shutdown_errors = []
         self._runtime_air_thread = None
         self._runtime_air_stop_event = threading.Event()
@@ -346,7 +350,7 @@ class UFC_UGC_ZOS_index(MyQThread):
         """Reset shutdown state shared by every experiment startup path."""
         global stop_flag
         stop_flag = False
-        self._stop_requested = False
+        self._experiment_stop_requested = False
         self._shutdown_errors = []
         global_setting.set_setting("calibration_cancel_requested", False)
 
@@ -1045,7 +1049,7 @@ class UFC_UGC_ZOS_index(MyQThread):
         with self._runtime_air_lock:
             if self._runtime_air_thread is not None and self._runtime_air_thread.is_alive():
                 return {"success": False, "message": "空气校准已在进行中"}
-            if self._stop_requested:
+            if self._experiment_stop_requested:
                 return {"success": False, "message": "实验正在停止，无法启动空气校准"}
             if self.Startup_air_calibration_obj is None:
                 return {"success": False, "message": "空气校准服务尚未初始化"}
@@ -1173,7 +1177,7 @@ class UFC_UGC_ZOS_index(MyQThread):
         # simultaneous Air click from clearing the stop event and starting a
         # new calibration while the experiment is already shutting down.
         with self._runtime_air_lock:
-            self._stop_requested = True
+            self._experiment_stop_requested = True
             self._runtime_air_stop_event.set()
 
     def _wait_runtime_air_calibration_stopped(self, timeout=30):
@@ -1285,7 +1289,7 @@ class UFC_UGC_ZOS_index(MyQThread):
             self.start_btn_handle_with_calibration().then(
                 lambda _: self.run_btn_handle().then(
                     lambda __: self.gas_state_check_handle().then(
-                        self.stop()
+                        self.stop
                     ).catch(lambda e: logger.error(f"{e}"))
                 ).catch(lambda e: logger.error(f"{e}"))
             ).catch(lambda e: logger.error(f"{e}"))
@@ -1305,7 +1309,7 @@ class UFC_UGC_ZOS_index(MyQThread):
             self.start_btn_handle_with_air_calibration().then(
                 lambda _: self.run_btn_handle().then(
                     lambda _: self.gas_state_check_handle().then(
-                        self.stop()
+                        self.stop
                     ).catch(lambda e: logger.error(f"{e}"))
                 ).catch(lambda e: logger.error(f"{e}"))
             ).catch(lambda e: logger.error(f"{e}"))
@@ -1316,7 +1320,7 @@ class UFC_UGC_ZOS_index(MyQThread):
             ).then(
                 lambda _: self.run_btn_handle().then(
                     lambda __: self.gas_state_check_handle().then(
-                        self.stop()
+                        self.stop
                     ).catch(lambda e: logger.error(f"{e}"))
                 ).catch(lambda e: logger.error(f"{e}"))
             ).catch(lambda e: logger.error(f"{e}"))
@@ -1324,7 +1328,7 @@ class UFC_UGC_ZOS_index(MyQThread):
             self.start_btn_handle().then(
                 lambda _: self.run_btn_handle().then(
                     lambda _: self.gas_state_check_handle().then(
-                        self.stop()
+                        self.stop
                     ).catch(lambda e: logger.error(f"{e}"))
                 ).catch(lambda e: logger.error(f"{e}"))
             ).catch(lambda e: logger.error(f"{e}"))
