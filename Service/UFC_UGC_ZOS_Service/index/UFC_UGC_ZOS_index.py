@@ -497,7 +497,7 @@ class UFC_UGC_ZOS_index(MyQThread):
     def start_btn_handle_with_o2_span_air_calibration(self, include_co2_zero=False):
         """Run the documented startup calibration sequence before the experiment.
 
-        The complete mode is CO2 zero -> O2 Span -> CO2 Span -> shared
+        The complete mode is CO2 zero -> CO2 Span -> O2 Span -> shared
         O2/CO2 Air acquisition.  The historical O2-only mode remains available
         for saved configurations and keeps its previous behavior.
         """
@@ -505,7 +505,7 @@ class UFC_UGC_ZOS_index(MyQThread):
         self._prepare_startup_calibration_cages()
         if include_co2_zero:
             self.update_status_main_signal_gui_update.send(
-                f"{time_util.get_format_from_time(time.time())} | 启动完整空气校准：CO₂校零 → O₂ Span → CO₂ Span → O₂/CO₂ Air同时采集",
+                f"{time_util.get_format_from_time(time.time())} | 启动完整空气校准：CO₂校零 → CO₂ Span → O₂ Span → O₂/CO₂ Air同时采集",
                 title=GapSystem_Running_Type.STARTUP_AIR_CALIBRATION,
             )
             chain = AsyPromise(self._co2_zero_then_read_ufc_start_status)
@@ -528,17 +528,17 @@ class UFC_UGC_ZOS_index(MyQThread):
             chain = (
                 chain
                 .then(lambda _: AsyPromise(
+                    self.co2_span_calibration_obj_calibrate_wrapped
+                ))
+                .then(lambda _: AsyPromise(
+                    self._restart_ufc_after_co2_span
+                ))
+                .then(lambda _: AsyPromise(
                     self.Startup_o2_span_air_calibration_obj.run_span_only_keep_span
                 ))
                 .then(self._handoff_o2_span_handler_to_full_air)
                 .then(lambda _: AsyPromise(
-                    self.co2_span_calibration_obj_calibrate_wrapped
-                ))
-                .then(lambda _: AsyPromise(
                     self.Startup_o2_span_air_calibration_obj.prepare_air_path
-                ))
-                .then(lambda _: AsyPromise(
-                    self._restart_ufc_after_co2_span
                 ))
             )
         else:
