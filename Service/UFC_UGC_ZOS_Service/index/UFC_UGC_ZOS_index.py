@@ -483,6 +483,37 @@ class UFC_UGC_ZOS_index(MyQThread):
         except Exception as exc:
             reject(exc)
 
+    def _ensure_ufc_running_before_co2_span(self, resolve, reject):
+        """Verify the physical UFC/pump state before CO2 Span starts."""
+
+        def handle_status(startup_status):
+            try:
+                self._remember_ufc_start_status(startup_status)
+                ufc_status = int(startup_status.get("ufc_status", 0))
+                air_pump = int(startup_status.get("air_pump", 0))
+                if ufc_status == 1 and air_pump == 1:
+                    self.update_status_main_signal_gui_update.send(
+                        f"{time_util.get_format_from_time(time.time())} | "
+                        "CO2 Span启动前确认：UFC和气泵均已开启",
+                        title=GapSystem_Running_Type.STARTUP_AIR_CALIBRATION,
+                    )
+                    resolve(startup_status)
+                    return
+
+                self.update_status_main_signal_gui_update.send(
+                    f"{time_util.get_format_from_time(time.time())} | "
+                    "CO2 Span启动前检测到UFC或气泵未开启，正在重新启动",
+                    title=GapSystem_Running_Type.STARTUP_AIR_CALIBRATION,
+                )
+                self.UFC_gas_path_system_obj.start(resolve, reject)
+            except Exception as exc:
+                reject(exc)
+
+        try:
+            self.UFC_gas_state_check_obj.read_start_status(handle_status, reject)
+        except Exception as exc:
+            reject(exc)
+
     def _prepare_startup_calibration_cages(self):
         experiment_settings = global_setting.get_setting("experiment_setting", None)
         groups = getattr(experiment_settings, "groups", []) if experiment_settings is not None else []
@@ -532,6 +563,9 @@ class UFC_UGC_ZOS_index(MyQThread):
                     self.Startup_o2_span_air_calibration_obj.run_span_only_keep_span
                 ))
                 .then(self._handoff_o2_span_handler_to_full_air)
+                .then(lambda _: AsyPromise(
+                    self._ensure_ufc_running_before_co2_span
+                ))
                 .then(lambda _: AsyPromise(
                     self.co2_span_calibration_obj_calibrate_wrapped
                 ))
@@ -759,9 +793,16 @@ class UFC_UGC_ZOS_index(MyQThread):
         pass
 
     def span_carlibration_obj_calibrate_wrapped(self, resolve, reject):
+        self.Range_carlibration_obj.calibration_error = None
         AsyPromise(self.Range_carlibration_obj.calibrate).catch(lambda e: logger.error(f"{e}"))
         global wait_span_calibration_finished_event
         wait_span_calibration_finished_event.wait()
+        calibration_error = getattr(
+            self.Range_carlibration_obj, "calibration_error", None
+        )
+        if calibration_error is not None:
+            reject(calibration_error)
+            return
         resolve()
         pass
 
