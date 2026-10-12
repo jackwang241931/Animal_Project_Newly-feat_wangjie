@@ -207,7 +207,6 @@ class UFC_UGC_ZOS_index(MyQThread):
                                     self.resume_running_gap_system()
                                     global wait_zero_calibration_finished_event
                                     wait_zero_calibration_finished_event.set()
-                                    wait_zero_calibration_finished_event.clear()
                                     pass
                                 case 'set_start_span_calibration_time':
                                     queue.put(
@@ -228,7 +227,6 @@ class UFC_UGC_ZOS_index(MyQThread):
                                     self.resume_running_gap_system()
                                     global wait_span_calibration_finished_event
                                     wait_span_calibration_finished_event.set()
-                                    wait_span_calibration_finished_event.clear()
                                     pass
                                 case 'set_start_air_calibration_time':
                                     queue.put(
@@ -347,11 +345,22 @@ class UFC_UGC_ZOS_index(MyQThread):
 
     def _prepare_new_start(self):
         """Reset shutdown state shared by every experiment startup path."""
-        global stop_flag
+        global stop_flag, wait_zero_calibration_finished_event, wait_span_calibration_finished_event
         stop_flag = False
         self._experiment_stop_requested = False
         self._shutdown_errors = []
         global_setting.set_setting("calibration_cancel_requested", False)
+        # Do not let a previous run's completion signal release the next
+        # calibration stage immediately.  The queue thread clears these after
+        # publishing the UI event, but a new start can race that clear.
+        wait_zero_calibration_finished_event.clear()
+        wait_span_calibration_finished_event.clear()
+        # A failed/aborted combined run must not leave the legacy workers in
+        # CO2-only or keep-gas-path mode for the next experiment.
+        for worker in (self.Zero_carlibration_obj, self.Range_carlibration_obj):
+            if worker is not None:
+                worker.co2_only_mode = False
+                worker.keep_gas_path_open_after_calibration = False
 
     def start_btn_handle_with_calibration(self):
         """先按流程完成调零+调span，再重新启动正常实验气路"""
@@ -429,19 +438,59 @@ class UFC_UGC_ZOS_index(MyQThread):
 
     def co2_zero_calibration_obj_calibrate_wrapped(self, resolve, reject):
         """Run the established CO2 zero-calibration worker without its legacy O2 zero stage."""
-        self.Zero_carlibration_obj.co2_only_mode = True
+        worker = self.Zero_carlibration_obj
+        previous_co2_only_mode = worker.co2_only_mode
+        previous_keep_gas_path = getattr(
+            worker, "keep_gas_path_open_after_calibration", False
+        )
+        worker.co2_only_mode = True
+        worker.keep_gas_path_open_after_calibration = True
+
+        def restore_worker_flags():
+            worker.co2_only_mode = previous_co2_only_mode
+            worker.keep_gas_path_open_after_calibration = previous_keep_gas_path
+
+        def on_resolve(*args):
+            restore_worker_flags()
+            resolve(*args)
+
+        def on_reject(error=None):
+            restore_worker_flags()
+            reject(error)
+
         try:
-            self.zero_carlibration_obj_calibrate_wrapped(resolve, reject)
-        finally:
-            self.Zero_carlibration_obj.co2_only_mode = False
+            self.zero_carlibration_obj_calibrate_wrapped(on_resolve, on_reject)
+        except Exception as exc:
+            restore_worker_flags()
+            reject(exc)
 
     def co2_span_calibration_obj_calibrate_wrapped(self, resolve, reject):
         """Run only the CO2 half of the established Span calibration worker."""
-        self.Range_carlibration_obj.co2_only_mode = True
+        worker = self.Range_carlibration_obj
+        previous_co2_only_mode = worker.co2_only_mode
+        previous_keep_gas_path = getattr(
+            worker, "keep_gas_path_open_after_calibration", False
+        )
+        worker.co2_only_mode = True
+        worker.keep_gas_path_open_after_calibration = True
+
+        def restore_worker_flags():
+            worker.co2_only_mode = previous_co2_only_mode
+            worker.keep_gas_path_open_after_calibration = previous_keep_gas_path
+
+        def on_resolve(*args):
+            restore_worker_flags()
+            resolve(*args)
+
+        def on_reject(error=None):
+            restore_worker_flags()
+            reject(error)
+
         try:
-            self.span_carlibration_obj_calibrate_wrapped(resolve, reject)
-        finally:
-            self.Range_carlibration_obj.co2_only_mode = False
+            self.span_carlibration_obj_calibrate_wrapped(on_resolve, on_reject)
+        except Exception as exc:
+            restore_worker_flags()
+            reject(exc)
 
     def _co2_zero_then_read_ufc_start_status(self, resolve, reject):
         """Run CO2 zero first and forward the actual UFC status dictionary.
@@ -459,24 +508,6 @@ class UFC_UGC_ZOS_index(MyQThread):
         try:
             self.co2_zero_calibration_obj_calibrate_wrapped(
                 read_ufc_status_after_zero,
-                reject,
-            )
-        except Exception as exc:
-            reject(exc)
-
-    def _restart_ufc_after_co2_span(self, resolve, reject):
-        """Restart UFC after the legacy CO2 Span worker's safe shutdown."""
-
-        def start_with_current_status(startup_status):
-            try:
-                self._remember_ufc_start_status(startup_status)
-                self.UFC_gas_path_system_obj.start(resolve, reject)
-            except Exception as exc:
-                reject(exc)
-
-        try:
-            self.UFC_gas_state_check_obj.read_start_status(
-                start_with_current_status,
                 reject,
             )
         except Exception as exc:
@@ -530,9 +561,8 @@ class UFC_UGC_ZOS_index(MyQThread):
                 .then(lambda _: AsyPromise(
                     self.co2_span_calibration_obj_calibrate_wrapped
                 ))
-                .then(lambda _: AsyPromise(
-                    self._restart_ufc_after_co2_span
-                ))
+                # CO2零点前后及CO2 Span阶段都保持UFC/气泵开启，
+                # 按1011文档直接进入O2 Span，不再重复启动UFC。
                 .then(lambda _: AsyPromise(
                     self.Startup_o2_span_air_calibration_obj.run_span_only_keep_span
                 ))
@@ -751,15 +781,17 @@ class UFC_UGC_ZOS_index(MyQThread):
         run_step(0)
 
     def zero_carlibration_obj_calibrate_wrapped(self, resolve, reject):
-        AsyPromise(self.Zero_carlibration_obj.calibrate).catch(lambda e: logger.error(f"{e}"))
         global wait_zero_calibration_finished_event
+        wait_zero_calibration_finished_event.clear()
+        AsyPromise(self.Zero_carlibration_obj.calibrate).catch(lambda e: logger.error(f"{e}"))
         wait_zero_calibration_finished_event.wait()
         resolve()
         pass
 
     def span_carlibration_obj_calibrate_wrapped(self, resolve, reject):
-        AsyPromise(self.Range_carlibration_obj.calibrate).catch(lambda e: logger.error(f"{e}"))
         global wait_span_calibration_finished_event
+        wait_span_calibration_finished_event.clear()
+        AsyPromise(self.Range_carlibration_obj.calibrate).catch(lambda e: logger.error(f"{e}"))
         wait_span_calibration_finished_event.wait()
         resolve()
         pass

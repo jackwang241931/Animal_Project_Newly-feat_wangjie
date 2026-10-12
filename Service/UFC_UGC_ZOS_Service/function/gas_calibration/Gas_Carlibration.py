@@ -97,6 +97,10 @@ class Gas_Carlibration:
             update_status_main_signal_gui_update=self.update_status_main_signal_gui_update,
             send_message=self.send_message, update_status_main_signal_gui_update_type=title)
         self.ufc_started_by_calibration = False
+        # 组合校准（CO2零点 -> CO2 Span -> O2 Span -> Air）中，
+        # CO2阶段结束后气泵和UFC仍由后续阶段继续使用，不能在阶段收尾时关闭。
+        # 单独校准时保持False，沿用原有的独立收尾逻辑。
+        self.keep_gas_path_open_after_calibration = False
         # span 标定时，本次下发给设备的目标值
         self.ugc_span_target_co2_ppm = None
         self.zos_span_target_o2_percent = None
@@ -2265,6 +2269,14 @@ def _patched_close_ufc_if_open_for_zero_v2(self, resolve, reject, port):
         reject("stop")
         return
 
+    if getattr(self, "keep_gas_path_open_after_calibration", False):
+        self.update_status_main_signal_gui_update.send(
+            f"{time_util.get_format_from_time(time.time())} | {self.name}校准：组合流程继续使用UFC，跳过关闭指令",
+            title=self.title,
+        )
+        resolve()
+        return
+
     if not getattr(self, "ufc_started_by_calibration", False):
         self.update_status_main_signal_gui_update.send(
             f"{time_util.get_format_from_time(time.time())} | {self.name}校准：本次标定未启动UFC，跳过关闭指令",
@@ -2299,42 +2311,56 @@ def _patched_close_ufc_if_open_for_zero_v2(self, resolve, reject, port):
     ).catch(lambda e: reject(e))
 
 
-def _patched_zero_finalize_flow_v2(self, resolve, reject, port):
-    AsyPromise(self.close_gas_pump_and_flow_for_zero, port=port).then(
-        lambda _: AsyPromise(self.wait_one_minute_for_zero, step_desc="关闭气泵后等待一分钟").then(
-            lambda __: AsyPromise(self.close_ugc_zero_or_span_valve, port=port).then(
-                lambda ___: (
-                    setattr(self, "defer_zos_close_until_finalize", False),
-                    AsyPromise(self.close_zos_zero_or_span_valve, port=port).then(
-                        lambda ____: AsyPromise(self.close_ufc_if_open_for_zero, port=port).then(
-                            lambda _____: AsyPromise(self.finish_calibration, port=port).then(
-                                lambda ______: resolve()
-                            ).catch(lambda e: reject(e))
-                        ).catch(lambda e: reject(e))
+def _patched_finalize_calibration_flow_v3(self, resolve, reject, port, stage_name):
+    """Finish one calibration stage without stealing the shared gas path.
+
+    The 1011 procedure keeps the pump/UFC alive between CO2 zero, CO2 Span,
+    O2 Span and Air. The old common finalizer always stopped the pump and then
+    closed UFC, which was correct for standalone calibration but wrong for the
+    chained startup workflow.
+    """
+
+    def close_stage_valves(_=None):
+        self.defer_zos_close_until_finalize = False
+        AsyPromise(self.close_ugc_zero_or_span_valve, port=port).then(
+            lambda _: AsyPromise(self.close_zos_zero_or_span_valve, port=port).then(
+                lambda __: AsyPromise(
+                    self.close_ufc_if_open_for_zero,
+                    port=port,
+                ).then(
+                    lambda ___: AsyPromise(self.finish_calibration, port=port).then(
+                        lambda ____: resolve()
                     ).catch(lambda e: reject(e))
-                )[1]
+                ).catch(lambda e: reject(e))
             ).catch(lambda e: reject(e))
         ).catch(lambda e: reject(e))
+
+    if getattr(self, "keep_gas_path_open_after_calibration", False):
+        self.update_status_main_signal_gui_update.send(
+            f"{time_util.get_format_from_time(time.time())} | {self.name}校准：{stage_name}完成，组合流程保留气泵和UFC，继续后续校准",
+            title=self.title,
+        )
+        close_stage_valves()
+        return
+
+    AsyPromise(self.close_gas_pump_and_flow_for_zero, port=port).then(
+        lambda _: AsyPromise(
+            self.wait_one_minute_for_zero,
+            step_desc="关闭气泵后等待一分钟",
+        ).then(close_stage_valves)
     ).catch(lambda e: reject(e))
 
 
-def _patched_span_finalize_flow_v2(self, resolve, reject, port):
-    AsyPromise(self.close_gas_pump_and_flow_for_zero, port=port).then(
-        lambda _: AsyPromise(self.wait_one_minute_for_zero, step_desc="关闭气泵后等待一分钟").then(
-            lambda __: AsyPromise(self.close_ugc_zero_or_span_valve, port=port).then(
-                lambda ___: (
-                    setattr(self, "defer_zos_close_until_finalize", False),
-                    AsyPromise(self.close_zos_zero_or_span_valve, port=port).then(
-                        lambda ____: AsyPromise(self.close_ufc_if_open_for_zero, port=port).then(
-                            lambda _____: AsyPromise(self.finish_calibration, port=port).then(
-                                lambda ______: resolve()
-                            ).catch(lambda e: reject(e))
-                        ).catch(lambda e: reject(e))
-                    ).catch(lambda e: reject(e))
-                )[1]
-            ).catch(lambda e: reject(e))
-        ).catch(lambda e: reject(e))
-    ).catch(lambda e: reject(e))
+def _patched_zero_finalize_flow_v3(self, resolve, reject, port):
+    return _patched_finalize_calibration_flow_v3(
+        self, resolve, reject, port, "CO2零点"
+    )
+
+
+def _patched_span_finalize_flow_v3(self, resolve, reject, port):
+    return _patched_finalize_calibration_flow_v3(
+        self, resolve, reject, port, "CO2 Span"
+    )
 
 
 def _patched_zero_dosomething_v2(self):
@@ -2476,8 +2502,8 @@ Gas_Carlibration.open_gas_pump_and_flow_for_zero = _patched_open_gas_pump_and_fl
 Gas_Carlibration.wait_one_minute_for_zero = _patched_wait_one_minute_for_zero_v2
 Gas_Carlibration.close_gas_pump_and_flow_for_zero = _patched_close_gas_pump_and_flow_for_zero_v2
 Gas_Carlibration.close_ufc_if_open_for_zero = _patched_close_ufc_if_open_for_zero_v2
-Gas_Carlibration.zero_finalize_flow = _patched_zero_finalize_flow_v2
-Gas_Carlibration.span_finalize_flow = _patched_span_finalize_flow_v2
+Gas_Carlibration.zero_finalize_flow = _patched_zero_finalize_flow_v3
+Gas_Carlibration.span_finalize_flow = _patched_span_finalize_flow_v3
 Zero_Carlibration.dosomething = _patched_zero_dosomething_v2
 Zero_Carlibration.cyclic_sampling_of_ugc_carbon_sensor = _patched_zero_cyclic_sampling_of_ugc_carbon_sensor
 Range_Carlibration.dosomething = _patched_range_dosomething_v2

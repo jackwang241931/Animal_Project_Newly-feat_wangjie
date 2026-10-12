@@ -232,11 +232,10 @@ class O2SpanFullAirWorkflowTests(unittest.TestCase):
             UFC_UGC_ZOS_index.start_btn_handle_with_o2_span_air_calibration
         )
         expected_order = (
+            "co2_span_calibration_obj_calibrate_wrapped",
             "run_span_only_keep_span",
             "_handoff_o2_span_handler_to_full_air",
-            "co2_span_calibration_obj_calibrate_wrapped",
             "prepare_air_path",
-            "_restart_ufc_after_co2_span",
             "Startup_air_calibration_obj.start",
             "Startup_air_calibration_obj.wait_air_calibration_prepare",
             "Startup_air_calibration_obj.run",
@@ -286,7 +285,7 @@ class O2SpanFullAirWorkflowTests(unittest.TestCase):
                 AsyPromise.resolve_immediately(_ContinuedO2Handler()),
             )
 
-    def test_complete_mode_runs_co2_span_then_restarts_ufc_before_air(self):
+    def test_complete_mode_keeps_ufc_running_between_co2_span_o2_span_and_air(self):
         calls = []
         handler = _ContinuedO2Handler()
 
@@ -321,6 +320,7 @@ class O2SpanFullAirWorkflowTests(unittest.TestCase):
         )
         service = SimpleNamespace(
             update_status_main_signal_gui_update=_Signal(),
+            _prepare_new_start=lambda: None,
             _prepare_startup_calibration_cages=lambda: calls.append("prepare"),
             _co2_zero_then_read_ufc_start_status=step(
                 "co2_zero", {"ufc_status": 0, "air_pump": 0}
@@ -339,7 +339,6 @@ class O2SpanFullAirWorkflowTests(unittest.TestCase):
                 )
             ),
             co2_span_calibration_obj_calibrate_wrapped=step("co2_span"),
-            _restart_ufc_after_co2_span=step("restart_ufc"),
             finish_start=step("finish_start"),
             _reject_o2_span_air_start=lambda error: AsyPromise.reject_immediately(error),
         )
@@ -359,11 +358,10 @@ class O2SpanFullAirWorkflowTests(unittest.TestCase):
                 "ugc_start",
                 "zos_start",
                 "ufc_start",
+                "co2_span",
                 "o2_span",
                 "handoff",
-                "co2_span",
                 "prepare_air",
-                "restart_ufc",
                 "air_start",
                 "air_prepare",
                 "air_run",
@@ -432,6 +430,7 @@ class O2SpanFullAirWorkflowTests(unittest.TestCase):
         )
         service = SimpleNamespace(
             update_status_main_signal_gui_update=_Signal(),
+            _prepare_new_start=lambda: None,
             _prepare_startup_calibration_cages=lambda: calls.append("prepare"),
             UFC_gas_state_check_obj=SimpleNamespace(
                 read_start_status=step("read_status", {"ufc_status": 1})

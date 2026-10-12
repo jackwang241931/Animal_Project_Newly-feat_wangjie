@@ -338,7 +338,7 @@ class Startup_O2_Span_Air_Calibration:
         self._run_span_only(resolve, reject, switch_to_air=True)
 
     def run_span_only_keep_span(self, resolve, reject):
-        """Collect O2 Span data while keeping the Span gas path for CO2 Span."""
+        """Collect O2 Span data while keeping the Span gas path until Air."""
         self._run_span_only(resolve, reject, switch_to_air=False)
 
     def _run_span_only(self, resolve, reject, switch_to_air):
@@ -402,7 +402,7 @@ class Startup_O2_Span_Air_Calibration:
                 self._send_text("O2 Span采样完成，移交完整Air空气校准流程")
             else:
                 self._send_text(
-                    "O2 Span采样完成，保持Span气路并移交CO2 Span阶段"
+                    "O2 Span采样完成，保持Span气路，准备切换Air空气校准"
                 )
         except Exception as exc:
             failure = exc
@@ -416,7 +416,7 @@ class Startup_O2_Span_Air_Calibration:
         resolve(self._handler)
 
     def prepare_air_path(self, resolve, reject):
-        """Switch from the completed CO2 Span stage to the shared Air stage."""
+        """Switch from the completed O2 Span stage to the shared Air stage."""
         if self.is_stop_requested():
             reject("已收到停止请求，取消切换Air空气校准气路")
             return
@@ -424,13 +424,13 @@ class Startup_O2_Span_Air_Calibration:
             self._set_coil(3, 0, True, "开启UGC空气阀")
             self._set_coil(3, 2, False, "关闭UGC Span阀")
             self._set_coil(3, 1, False, "关闭UGC N2阀")
-            # The legacy CO2 Span worker clears the shared calibration flag
-            # during its own finish callback.  Restore ownership for the
-            # pending O2 Span -> shared Air calibration before UFC restarts.
+            # The CO2 Span worker clears the shared calibration flag during
+            # its own finish callback.  Restore ownership for the remaining
+            # O2 Span -> shared Air transition; UFC stays running throughout.
             global_setting.set_setting("is_calibrating", True)
             global_setting.set_setting("current_calibration_type", self.name)
             self._send_text(
-                "CO2 Span完成，已切换空气气路，开始O2/CO2同时Air采集"
+                "O2 Span完成，已切换空气气路，开始O2/CO2同时Air采集"
             )
         except Exception as exc:
             reject(exc)
