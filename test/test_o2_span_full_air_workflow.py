@@ -234,7 +234,6 @@ class O2SpanFullAirWorkflowTests(unittest.TestCase):
         expected_order = (
             "run_span_only_keep_span",
             "_handoff_o2_span_handler_to_full_air",
-            "_ensure_ufc_running_before_co2_span",
             "co2_span_calibration_obj_calibrate_wrapped",
             "prepare_air_path",
             "_restart_ufc_after_co2_span",
@@ -339,7 +338,6 @@ class O2SpanFullAirWorkflowTests(unittest.TestCase):
                     service, value
                 )
             ),
-            _ensure_ufc_running_before_co2_span=step("ensure_ufc"),
             co2_span_calibration_obj_calibrate_wrapped=step("co2_span"),
             _restart_ufc_after_co2_span=step("restart_ufc"),
             finish_start=step("finish_start"),
@@ -363,7 +361,6 @@ class O2SpanFullAirWorkflowTests(unittest.TestCase):
                 "ufc_start",
                 "o2_span",
                 "handoff",
-                "ensure_ufc",
                 "co2_span",
                 "prepare_air",
                 "restart_ufc",
@@ -376,65 +373,6 @@ class O2SpanFullAirWorkflowTests(unittest.TestCase):
             ],
             calls,
         )
-
-    def test_co2_span_precheck_restarts_ufc_when_hardware_is_off(self):
-        calls = []
-        service = SimpleNamespace(
-            UFC_gas_state_check_obj=SimpleNamespace(
-                read_start_status=lambda resolve, reject: resolve(
-                    {"ufc_status": 0, "air_pump": 0}
-                )
-            ),
-            UFC_gas_path_system_obj=SimpleNamespace(
-                start=lambda resolve, reject: (
-                    calls.append("start_ufc"),
-                    resolve(),
-                )
-            ),
-            _remember_ufc_start_status=lambda status: (
-                calls.append(("status", status)) or status
-            ),
-            update_status_main_signal_gui_update=SimpleNamespace(
-                send=lambda *args, **kwargs: calls.append("log")
-            ),
-        )
-        resolved = []
-
-        UFC_UGC_ZOS_index._ensure_ufc_running_before_co2_span(
-            service,
-            lambda *_: resolved.append(True),
-            self.fail,
-        )
-
-        self.assertEqual([True], resolved)
-        self.assertIn("start_ufc", calls)
-
-    def test_co2_span_precheck_keeps_confirmed_running_ufc(self):
-        calls = []
-        service = SimpleNamespace(
-            UFC_gas_state_check_obj=SimpleNamespace(
-                read_start_status=lambda resolve, reject: resolve(
-                    {"ufc_status": 1, "air_pump": 1}
-                )
-            ),
-            UFC_gas_path_system_obj=SimpleNamespace(
-                start=lambda resolve, reject: calls.append("unexpected_start")
-            ),
-            _remember_ufc_start_status=lambda status: status,
-            update_status_main_signal_gui_update=SimpleNamespace(
-                send=lambda *args, **kwargs: calls.append("log")
-            ),
-        )
-        resolved = []
-
-        UFC_UGC_ZOS_index._ensure_ufc_running_before_co2_span(
-            service,
-            lambda *_: resolved.append(True),
-            self.fail,
-        )
-
-        self.assertEqual([True], resolved)
-        self.assertNotIn("unexpected_start", calls)
 
     def test_co2_span_wrapper_restores_legacy_range_mode(self):
         range_worker = SimpleNamespace(co2_only_mode=False)

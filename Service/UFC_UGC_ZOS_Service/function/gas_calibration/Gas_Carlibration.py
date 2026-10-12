@@ -97,7 +97,6 @@ class Gas_Carlibration:
             update_status_main_signal_gui_update=self.update_status_main_signal_gui_update,
             send_message=self.send_message, update_status_main_signal_gui_update_type=title)
         self.ufc_started_by_calibration = False
-        self.calibration_error = None
         # span 标定时，本次下发给设备的目标值
         self.ugc_span_target_co2_ppm = None
         self.zos_span_target_o2_percent = None
@@ -2140,26 +2139,9 @@ def _patched_start_ufc_if_needed_for_zero_v2(self, resolve, reject, port):
     )
     self.send_thread.send_message = self.send_message
 
-    def _send_success(result):
-        if not isinstance(result, dict) or not result.get("send_state", False):
-            error = RuntimeError(
-                f"{self.name}校准：UFC启动指令发送失败，已停止当前校准流程"
-            )
-            self.update_status_main_signal_gui_update.send(
-                f"{time_util.get_format_from_time(time.time())} | {error}",
-                title=self.title
-            )
-            global_setting.set_setting("ufc_start_time_state", False)
-            self.ufc_started_by_calibration = False
-            reject(error)
-            return
+    def _send_success(_):
         global_setting.set_setting("ufc_start_time_state", True)
         self.ufc_started_by_calibration = True
-        self.update_status_main_signal_gui_update.send(
-            f"{time_util.get_format_from_time(time.time())} | "
-            f"{self.name}校准：UFC启动指令回包确认成功",
-            title=self.title
-        )
         resolve()
 
     AsyPromise(self.send_thread.Send).then(
@@ -2184,56 +2166,9 @@ def _patched_open_gas_pump_and_flow_for_zero_v2(self, resolve, reject, port):
         title=self.title
     )
     self.send_thread.send_message = self.send_message
-
-    def _send_success(result):
-        if not isinstance(result, dict) or not result.get("send_state", False):
-            error = RuntimeError(
-                f"{self.name}校准：气泵及流量控制器启动指令发送失败，"
-                "已停止当前校准流程"
-            )
-            self.update_status_main_signal_gui_update.send(
-                f"{time_util.get_format_from_time(time.time())} | {error}",
-                title=self.title
-            )
-            reject(error)
-            return
-        self.update_status_main_signal_gui_update.send(
-            f"{time_util.get_format_from_time(time.time())} | "
-            f"{self.name}校准：气泵及流量控制器启动指令回包确认成功",
-            title=self.title
-        )
-        resolve()
-
-    AsyPromise(self.send_thread.Send).then(_send_success).catch(reject)
-
-
-def _patched_fail_calibration_flow_v2(self, error):
-    """Publish an asynchronous calibration failure and release its waiter."""
-    if getattr(self, "calibration_error", None) is not None:
-        return
-
-    failure = error if isinstance(error, Exception) else RuntimeError(str(error))
-    self.calibration_error = failure
-    self.set_calibration_running_state(False)
-    self.update_status_main_signal_gui_update.send(
-        f"{time_util.get_format_from_time(time.time())} | "
-        f"{self.name}校准失败：{failure}",
-        title=self.title,
-    )
-
-    signal_type = (
-        "set_stop_span_calibration_time"
-        if self.type == Gas_Carlibration_Type.SPAN
-        else "set_stop_zero_calibration_time"
-    )
-    self.update_status_main_signal_gui_update.send(
-        {
-            "type": signal_type,
-            "value": time_util.get_format_from_time(time.time()),
-        },
-        title=self.title,
-    )
-    self.stop()
+    AsyPromise(self.send_thread.Send).then(
+        lambda _: resolve()
+    ).catch(lambda e: reject(e))
 
 
 def _patched_wait_one_minute_for_zero_v2(
@@ -2478,14 +2413,14 @@ def _patched_range_dosomething_v2(self):
                                         port=self.port,
                                     ).then(
                                         lambda ________: self.stop()
-                                    ).catch(self.fail_calibration_flow)
-                                ).catch(self.fail_calibration_flow)
-                            ).catch(self.fail_calibration_flow)
-                        ).catch(self.fail_calibration_flow)
-                    ).catch(self.fail_calibration_flow)
-                ).catch(self.fail_calibration_flow)
-            ).catch(self.fail_calibration_flow)
-        ).catch(self.fail_calibration_flow)
+                                    ).catch(lambda e: self.stop())
+                                ).catch(lambda e: self.stop())
+                            ).catch(lambda e: self.stop())
+                        ).catch(lambda e: self.stop())
+                    ).catch(lambda e: self.stop())
+                ).catch(lambda e: self.stop())
+            ).catch(lambda e: self.stop())
+        ).catch(lambda e: self.stop())
         return
 
     AsyPromise(self.open_ugc_zero_or_span_valve, port=self.port).then(
@@ -2520,7 +2455,6 @@ Gas_Carlibration.close_zos_zero_or_span_valve = _patched_close_zos_zero_or_span_
 Gas_Carlibration.is_ufc_started_for_zero = _patched_is_ufc_started_for_zero_v2
 Gas_Carlibration.start_ufc_if_needed_for_zero = _patched_start_ufc_if_needed_for_zero_v2
 Gas_Carlibration.open_gas_pump_and_flow_for_zero = _patched_open_gas_pump_and_flow_for_zero_v2
-Gas_Carlibration.fail_calibration_flow = _patched_fail_calibration_flow_v2
 Gas_Carlibration.wait_one_minute_for_zero = _patched_wait_one_minute_for_zero_v2
 Gas_Carlibration.close_gas_pump_and_flow_for_zero = _patched_close_gas_pump_and_flow_for_zero_v2
 Gas_Carlibration.close_ufc_if_open_for_zero = _patched_close_ufc_if_open_for_zero_v2

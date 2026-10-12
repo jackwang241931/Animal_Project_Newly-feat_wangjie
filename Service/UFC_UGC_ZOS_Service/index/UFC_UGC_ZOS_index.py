@@ -17,7 +17,8 @@ from Service.UFC_UGC_ZOS_Service.function.gas_path_system.Gas_path_system import
     UGC_gas_path_system, UFC_gas_path_system
 from Service.UFC_UGC_ZOS_Service.function.gas_state_check.Gas_State_Check import UFC_Gas_State_Check
 from Service.UFC_UGC_ZOS_Service.function.startup_air_calibration import Startup_Air_Calibration
-from Service.UFC_UGC_ZOS_Service.function.startup_air_calibration.Startup_O2_Span_Air_Calibration import Startup_O2_Span_Air_Calibration
+from Service.UFC_UGC_ZOS_Service.function.startup_air_calibration.Startup_O2_Span_Air_Calibration import \
+    Startup_O2_Span_Air_Calibration
 from public.config_class.global_setting import global_setting
 from public.config_class.ini_parser import ini_parser
 from public.entity.MyQThread import MyQThread, MyThread
@@ -83,7 +84,7 @@ class Monitor_start_state_Thread(MyQThread):
         self.UGC_gas_path_system_obj: UGC_gas_path_system = UGC_gas_path_system_obj
         # ZOS气路系统
         self.ZOS_gas_path_system_obj: ZOS_gas_path_system = ZOS_gas_path_system_obj
-        self.update_start_state_signal =update_start_state_signal
+        self.update_start_state_signal = update_start_state_signal
 
         super().__init__(name)
 
@@ -101,7 +102,7 @@ class Monitor_start_state_Thread(MyQThread):
 
 class UFC_UGC_ZOS_index(MyQThread):
     def __init__(self):
-        super().__init__(name="UFC_UGC_ZOS_index" )
+        super().__init__(name="UFC_UGC_ZOS_index")
         self.ispause = False
         # dosomething() is driven by MyQThread's loop, while the gas startup
         # chain itself is asynchronous.  Without this guard the loop starts a
@@ -141,7 +142,7 @@ class UFC_UGC_ZOS_index(MyQThread):
         self.gas_state_check_timer: PeriodicTimer = None
         self.monitor_start_state_Thread: MyQThread = None
 
-        self.update_status_main_signal_gui_update: Signal=None
+        self.update_status_main_signal_gui_update: Signal = None
         self.calibration_log_recorder = CalibrationLogRecorder(
             on_error=lambda error: logger.error(f"校准日志自动保存失败: {error}"),
             on_created=lambda path: logger.info(f"校准日志自动保存文件: {path}"),
@@ -162,7 +163,7 @@ class UFC_UGC_ZOS_index(MyQThread):
         serial_lock = threading.Lock()
         global_setting.set_setting("serial_lock", serial_lock)
 
-    def logger_info(self, text,**kwargs):
+    def logger_info(self, text, **kwargs):
         title = kwargs.get("title", GapSystem_Running_Type.DEFAULT)
         self.calibration_log_recorder.record(getattr(title, "name", ""), text)
 
@@ -181,17 +182,17 @@ class UFC_UGC_ZOS_index(MyQThread):
                                 |None,
                         'value':''|{} 
                     }
-                    
+
                     """
                     queue = global_setting.get_setting("queue", None)
                     if queue:
-                        if isinstance(text,dict):
-                            match text.get("type",None):
+                        if isinstance(text, dict):
+                            match text.get("type", None):
                                 case 'set_start_zero_calibration_time':
                                     queue.put(
                                         ObjectQueueItem(origin='UFC_UGC_ZOS_index', to='MainWindow_index',
                                                         title='set_start_zero_calibration_time',
-                                                        data=text.get('value',''),
+                                                        data=text.get('value', ''),
                                                         time=time_util.get_format_from_time(time.time())))
                                     # 暂停正在运行的气路模块
                                     self.pause_running_gap_system()
@@ -200,9 +201,9 @@ class UFC_UGC_ZOS_index(MyQThread):
                                     queue.put(
                                         ObjectQueueItem(origin='UFC_UGC_ZOS_index', to='MainWindow_index',
                                                         title='set_stop_zero_calibration_time',
-                                                        data=text.get('value',''),
+                                                        data=text.get('value', ''),
                                                         time=time_util.get_format_from_time(time.time())))
-                                    #解除运行线程暂停
+                                    # 解除运行线程暂停
                                     self.resume_running_gap_system()
                                     global wait_zero_calibration_finished_event
                                     wait_zero_calibration_finished_event.set()
@@ -212,7 +213,7 @@ class UFC_UGC_ZOS_index(MyQThread):
                                     queue.put(
                                         ObjectQueueItem(origin='UFC_UGC_ZOS_index', to='MainWindow_index',
                                                         title='set_start_span_calibration_time',
-                                                        data=text.get('value',''),
+                                                        data=text.get('value', ''),
                                                         time=time_util.get_format_from_time(time.time())))
                                     # 暂停正在运行的气路模块
                                     self.pause_running_gap_system()
@@ -221,7 +222,7 @@ class UFC_UGC_ZOS_index(MyQThread):
                                     queue.put(
                                         ObjectQueueItem(origin='UFC_UGC_ZOS_index', to='MainWindow_index',
                                                         title='set_stop_span_calibration_time',
-                                                        data=text.get('value',''),
+                                                        data=text.get('value', ''),
                                                         time=time_util.get_format_from_time(time.time())))
                                     # 解除运行线程暂停
                                     self.resume_running_gap_system()
@@ -249,23 +250,23 @@ class UFC_UGC_ZOS_index(MyQThread):
                                     queue.put(
                                         ObjectQueueItem(origin='UFC_UGC_ZOS_index', to='MainWindow_index',
                                                         title='set_calibration_values',
-                                                        data=text.get('value',{}),
+                                                        data=text.get('value', {}),
                                                         time=time_util.get_format_from_time(time.time())))
                                     pass
                                 case 'set_calibration_span_values':
                                     queue.put(
                                         ObjectQueueItem(origin='UFC_UGC_ZOS_index', to='MainWindow_index',
                                                         title='set_calibration_span_values',
-                                                        data=text.get('value',{}),
+                                                        data=text.get('value', {}),
                                                         time=time_util.get_format_from_time(time.time())))
                                     pass
                                 case _:
                                     pass
                         else:
                             queue.put(ObjectQueueItem(origin='UFC_UGC_ZOS_index', to='MainWindow_index',
-                                                                   title='calibration_msg',
-                                                                   data=text,
-                                                                   time=time_util.get_format_from_time(time.time())))
+                                                      title='calibration_msg',
+                                                      data=text,
+                                                      time=time_util.get_format_from_time(time.time())))
                             # calibration_msg already feeds both the P3 runtime
                             # log and calibration detail history. Sending the
                             # same text through gap_system_running_state as well
@@ -274,13 +275,15 @@ class UFC_UGC_ZOS_index(MyQThread):
                 case GapSystem_Running_Type.DEFAULT:
                     queue = global_setting.get_setting("queue", None)
                     if queue:
-                        queue.put(ObjectQueueItem(origin="UFC_UGC_ZOS_index", to="MainWindow_index", title="gap_system_running_state",data=text,
-                                      time=time_util.get_format_from_time(time.time())))
+                        queue.put(ObjectQueueItem(origin="UFC_UGC_ZOS_index", to="MainWindow_index",
+                                                  title="gap_system_running_state", data=text,
+                                                  time=time_util.get_format_from_time(time.time())))
                 case _:
                     queue = global_setting.get_setting("queue", None)
                     if queue:
-                        queue.put(ObjectQueueItem(origin="UFC_UGC_ZOS_index", to="MainWindow_index", title="gap_system_running_state",data=text,
-                                      time=time_util.get_format_from_time(time.time())))
+                        queue.put(ObjectQueueItem(origin="UFC_UGC_ZOS_index", to="MainWindow_index",
+                                                  title="gap_system_running_state", data=text,
+                                                  time=time_util.get_format_from_time(time.time())))
 
             logger.debug(text)
 
@@ -289,9 +292,6 @@ class UFC_UGC_ZOS_index(MyQThread):
         self.update_status_main_signal_gui_update.connect(self.logger_info)
         self.update_start_state_signal = signal('update_start_state')
         self.update_start_state_signal.connect(self.update_start_state)
-
-
-
 
         self.UFC_gas_path_system_obj = UFC_gas_path_system()
         self.UGC_gas_path_system_obj = UGC_gas_path_system()
@@ -326,26 +326,25 @@ class UFC_UGC_ZOS_index(MyQThread):
         if read_queue_data_thread is not None and not read_queue_data_thread.isRunning():
             read_queue_data_thread.start()
 
-
-
     def update_start_state(self, sender, **kwargs):
         if self.monitor_start_state_Thread is not None:
             self.monitor_start_state_Thread.stop()
         self.close_timers()
 
         self.update_status_main_signal_gui_update.send(f"{time_util.get_format_from_time(time.time())} | 气路启动完成")
-        logger.info(f"更新启动完成状态{'-'*100 }")
+        logger.info(f"更新启动完成状态{'-' * 100}")
         global auto_wait_event
         auto_wait_event.set()
         auto_wait_event.clear()
         queue = global_setting.get_setting("queue", None)
-        if queue is not None :
-
+        if queue is not None:
             # 通知主界面将主界面的开始实验弹窗给关闭
-            queue.put(ObjectQueueItem(origin='UFC_UGC_ZOS_index', to='MainWindow_index', title='close_start_experiment_dialog',
+            queue.put(ObjectQueueItem(origin='UFC_UGC_ZOS_index', to='MainWindow_index',
+                                      title='close_start_experiment_dialog',
 
-                                                   time=time_util.get_format_from_time(time.time())))
+                                      time=time_util.get_format_from_time(time.time())))
             pass
+
     def _prepare_new_start(self):
         """Reset shutdown state shared by every experiment startup path."""
         global stop_flag
@@ -483,37 +482,6 @@ class UFC_UGC_ZOS_index(MyQThread):
         except Exception as exc:
             reject(exc)
 
-    def _ensure_ufc_running_before_co2_span(self, resolve, reject):
-        """Verify the physical UFC/pump state before CO2 Span starts."""
-
-        def handle_status(startup_status):
-            try:
-                self._remember_ufc_start_status(startup_status)
-                ufc_status = int(startup_status.get("ufc_status", 0))
-                air_pump = int(startup_status.get("air_pump", 0))
-                if ufc_status == 1 and air_pump == 1:
-                    self.update_status_main_signal_gui_update.send(
-                        f"{time_util.get_format_from_time(time.time())} | "
-                        "CO2 Span启动前确认：UFC和气泵均已开启",
-                        title=GapSystem_Running_Type.STARTUP_AIR_CALIBRATION,
-                    )
-                    resolve(startup_status)
-                    return
-
-                self.update_status_main_signal_gui_update.send(
-                    f"{time_util.get_format_from_time(time.time())} | "
-                    "CO2 Span启动前检测到UFC或气泵未开启，正在重新启动",
-                    title=GapSystem_Running_Type.STARTUP_AIR_CALIBRATION,
-                )
-                self.UFC_gas_path_system_obj.start(resolve, reject)
-            except Exception as exc:
-                reject(exc)
-
-        try:
-            self.UFC_gas_state_check_obj.read_start_status(handle_status, reject)
-        except Exception as exc:
-            reject(exc)
-
     def _prepare_startup_calibration_cages(self):
         experiment_settings = global_setting.get_setting("experiment_setting", None)
         groups = getattr(experiment_settings, "groups", []) if experiment_settings is not None else []
@@ -564,9 +532,6 @@ class UFC_UGC_ZOS_index(MyQThread):
                 ))
                 .then(self._handoff_o2_span_handler_to_full_air)
                 .then(lambda _: AsyPromise(
-                    self._ensure_ufc_running_before_co2_span
-                ))
-                .then(lambda _: AsyPromise(
                     self.co2_span_calibration_obj_calibrate_wrapped
                 ))
                 .then(lambda _: AsyPromise(
@@ -602,7 +567,7 @@ class UFC_UGC_ZOS_index(MyQThread):
 
     def _handoff_o2_span_handler_to_full_air(self, handler):
         if isinstance(handler, AsyPromise) or not callable(
-            getattr(handler, "get_status", None)
+                getattr(handler, "get_status", None)
         ):
             raise TypeError(
                 "O2 Span校准结果不是有效处理器，无法进入完整Air空气校准"
@@ -699,7 +664,7 @@ class UFC_UGC_ZOS_index(MyQThread):
         )
 
     def _continue_failed_start_rollback(
-        self, original_error, module_name, cleanup_error, paths, next_index
+            self, original_error, module_name, cleanup_error, paths, next_index
     ):
         logger.error(f"启动失败后关闭{module_name}未确认：{cleanup_error}")
         return self._rollback_failed_start_paths(
@@ -754,7 +719,7 @@ class UFC_UGC_ZOS_index(MyQThread):
 
         def run_step(index):
             if stop_flag or global_setting.get_setting(
-                "calibration_cancel_requested", False
+                    "calibration_cancel_requested", False
             ):
                 reject("实验停止，校准启动链已取消")
                 return
@@ -793,48 +758,38 @@ class UFC_UGC_ZOS_index(MyQThread):
         pass
 
     def span_carlibration_obj_calibrate_wrapped(self, resolve, reject):
-        self.Range_carlibration_obj.calibration_error = None
         AsyPromise(self.Range_carlibration_obj.calibrate).catch(lambda e: logger.error(f"{e}"))
         global wait_span_calibration_finished_event
         wait_span_calibration_finished_event.wait()
-        calibration_error = getattr(
-            self.Range_carlibration_obj, "calibration_error", None
-        )
-        if calibration_error is not None:
-            reject(calibration_error)
-            return
         resolve()
         pass
 
     def start_btn_handle(self):
         self._prepare_new_start()
         p = AsyPromise(self.ZOS_gas_path_system_obj.start).then(
-            lambda _:AsyPromise(
+            lambda _: AsyPromise(
                 self.UFC_gas_path_system_obj.start,
             ).then(
-                lambda _:AsyPromise(self.UGC_gas_path_system_obj.start).then(
-                        # 添加UFC运行但是不读取数值 UGC运行但是不读取数值
-                        # lambda _: AsyPromise(self.UFC_gas_path_system_obj.run_no_circulation_read).then(
-                        #     lambda _: AsyPromise(self.UGC_gas_path_system_obj.run_no_circulation_read).then(
-                        #         lambda _: AsyPromise(self.ZOS_gas_path_system_obj.start_zos_cage_pressure_init).then(
-                                    lambda _: AsyPromise(
-                                        self.finish_start).then(
+                lambda _: AsyPromise(self.UGC_gas_path_system_obj.start).then(
+                    # 添加UFC运行但是不读取数值 UGC运行但是不读取数值
+                    # lambda _: AsyPromise(self.UFC_gas_path_system_obj.run_no_circulation_read).then(
+                    #     lambda _: AsyPromise(self.UGC_gas_path_system_obj.run_no_circulation_read).then(
+                    #         lambda _: AsyPromise(self.ZOS_gas_path_system_obj.start_zos_cage_pressure_init).then(
+                    lambda _: AsyPromise(
+                        self.finish_start).then(
 
-                                    ).catch(lambda e: logger.error(f"{e}"))
-                        #         ).catch(lambda e: logger.error(f"{e}"))
-                        #     ).catch(lambda e: logger.error(f"{e}"))
-                        # ).catch(lambda e: logger.error(f"{e}"))
-                ).catch( lambda e: logger.error(f"{e}"))
-            ).catch( lambda e: logger.error(f"{e}"))
-        ).catch( lambda e: logger.error(f"{e}"))
-
-
-
-
+                    ).catch(lambda e: logger.error(f"{e}"))
+                    #         ).catch(lambda e: logger.error(f"{e}"))
+                    #     ).catch(lambda e: logger.error(f"{e}"))
+                    # ).catch(lambda e: logger.error(f"{e}"))
+                ).catch(lambda e: logger.error(f"{e}"))
+            ).catch(lambda e: logger.error(f"{e}"))
+        ).catch(lambda e: logger.error(f"{e}"))
 
         return p
-    def finish_start(self,resolve,reject):
-        logger.info(f"结束气路启动{'-'*100}")
+
+    def finish_start(self, resolve, reject):
+        logger.info(f"结束气路启动{'-' * 100}")
         if self.monitor_start_state_Thread is None:
             self.monitor_start_state_Thread = Monitor_start_state_Thread(
                 name="Monitor_start_state_Thread",
@@ -845,9 +800,10 @@ class UFC_UGC_ZOS_index(MyQThread):
             )
         self.monitor_start_state_Thread.start()
         resolve()
+
     def run_btn_handle(self):
 
-        global auto_wait_event,stop_flag
+        global auto_wait_event, stop_flag
         auto_wait_event.wait()
         barrier = global_setting.get_setting("barrier")
         if stop_flag:
@@ -858,10 +814,10 @@ class UFC_UGC_ZOS_index(MyQThread):
         # wait_UFC_UGC_ZOS_start_event = global_setting.get_setting("wait_UFC_UGC_ZOS_start_event")
         # wait_UFC_UGC_ZOS_start_event.set()
         # wait_UFC_UGC_ZOS_start_event.clear()  # 重置事件
-        #每轮运行发送报文数量 赋值0
+        # 每轮运行发送报文数量 赋值0
         global_setting.set_setting("messages_sent_epoch_for_running", 0)
         global_setting.set_setting("start_time_messages_sent_epoch_for_running", time.time())
-        if self.zos_start_timer is not None :
+        if self.zos_start_timer is not None:
             self.zos_start_timer.stop()
         p = AsyPromise(self.UFC_gas_path_system_obj.run).then(
             lambda v: AsyPromise(
@@ -871,11 +827,11 @@ class UFC_UGC_ZOS_index(MyQThread):
                 # .then(
                 #     lambda v3: AsyPromise(self.remove_waitting_ufc_ugc_zos_event)
                 # ).catch( lambda e: logger.error(f"{e}"))
-            ).catch( lambda e: logger.error(f"{e}"))
-        ).catch( lambda e: logger.error(f"{e}"))
-
+            ).catch(lambda e: logger.error(f"{e}"))
+        ).catch(lambda e: logger.error(f"{e}"))
 
         return p
+
     # def remove_waitting_ufc_ugc_zos_event(self,resolve,reject):
     #     # 只是第一次执行完才通知鼠笼传感器解除阻塞开始运行 后面的执行不会进入
     #     wait_UFC_UGC_ZOS_start_event = global_setting.get_setting("wait_UFC_UGC_ZOS_start_event")
@@ -889,10 +845,10 @@ class UFC_UGC_ZOS_index(MyQThread):
         #     self.monitor_start_state_Thread = None
         # 如果此时正在启动就关闭，就需要把启动的时候一直在循环的线程和被阻塞的线程给唤醒然后给stop掉
         if self.ZOS_gas_path_system_obj is not None:
-            self.ZOS_gas_path_system_obj.is_stop=True
+            self.ZOS_gas_path_system_obj.is_stop = True
         if self.UFC_gas_path_system_obj is not None and self.UFC_gas_path_system_obj.ufc_gas_path_system_start_thread is not None:
-            self.UFC_gas_path_system_obj.ufc_gas_path_system_start_thread.is_stop=True
-        global auto_wait_event,stop_flag
+            self.UFC_gas_path_system_obj.ufc_gas_path_system_start_thread.is_stop = True
+        global auto_wait_event, stop_flag
         stop_flag = True
         global_setting.set_setting("calibration_cancel_requested", True)
         self._shutdown_errors = []
@@ -915,9 +871,9 @@ class UFC_UGC_ZOS_index(MyQThread):
         # The UFC close worker invokes the UGC hook after its pump wait and
         # immediately before sending the UFC-off command.
         if (
-            self.UFC_gas_path_system_obj is not None
-            and self.UFC_gas_path_system_obj.ufc_gas_path_system_close_thread is not None
-            and self.UGC_gas_path_system_obj is not None
+                self.UFC_gas_path_system_obj is not None
+                and self.UFC_gas_path_system_obj.ufc_gas_path_system_close_thread is not None
+                and self.UGC_gas_path_system_obj is not None
         ):
             self.UFC_gas_path_system_obj.ufc_gas_path_system_close_thread.before_close_ufc = (
                 self.UGC_gas_path_system_obj.close_air_valve_for_shutdown
@@ -1018,7 +974,7 @@ class UFC_UGC_ZOS_index(MyQThread):
         self._request_stop_active_calibrations()
         return AsyPromise(self.finished_stop)
 
-    def finished_stop(self,resolve,reject):
+    def finished_stop(self, resolve, reject):
         """
         完成停止
         :return:
@@ -1026,7 +982,7 @@ class UFC_UGC_ZOS_index(MyQThread):
         if self.UFC_gas_path_system_obj is not None and self.UFC_gas_path_system_obj.ufc_gas_path_system_close_thread is not None:
             self.UFC_gas_path_system_obj.ufc_gas_path_system_close_thread.stop()
             self.UFC_gas_path_system_obj.ufc_gas_path_system_close_thread.deleteLater()
-            self.UFC_gas_path_system_obj.ufc_gas_path_system_close_thread=None
+            self.UFC_gas_path_system_obj.ufc_gas_path_system_close_thread = None
         # 将信号解绑
         if self.update_status_main_signal_gui_update is not None:
             self.update_status_main_signal_gui_update.disconnect(self.logger_info)
@@ -1036,11 +992,11 @@ class UFC_UGC_ZOS_index(MyQThread):
             self.update_start_state_signal = None
 
         if self.UFC_gas_path_system_obj is not None:
-            self.UFC_gas_path_system_obj=None
+            self.UFC_gas_path_system_obj = None
         if self.UGC_gas_path_system_obj is not None:
-            self.UGC_gas_path_system_obj=None
+            self.UGC_gas_path_system_obj = None
         if self.ZOS_gas_path_system_obj is not None:
-            self.ZOS_gas_path_system_obj=None
+            self.ZOS_gas_path_system_obj = None
 
         # 返回响应；若某个模块未确认关闭，明确将其作为异常说明回报。
         if self._shutdown_errors:
@@ -1059,21 +1015,23 @@ class UFC_UGC_ZOS_index(MyQThread):
         resolve()
 
     def pause_running_gap_system(self):
-        #暂停正在运行的气路模块
+        # 暂停正在运行的气路模块
         if self.UFC_gas_path_system_obj is not None and self.UFC_gas_path_system_obj.ufc_gas_path_system_run_thread is not None and not self.UFC_gas_path_system_obj.ufc_gas_path_system_run_thread.isPaused():
             self.UFC_gas_path_system_obj.ufc_gas_path_system_run_thread.pause()
         if self.UGC_gas_path_system_obj is not None and self.UGC_gas_path_system_obj.ugc_gas_path_system_run_thread is not None and not self.UGC_gas_path_system_obj.ugc_gas_path_system_run_thread.isPaused():
             self.UGC_gas_path_system_obj.ugc_gas_path_system_run_thread.pause()
         if self.ZOS_gas_path_system_obj is not None and self.ZOS_gas_path_system_obj.zos_gas_path_system_run_thread is not None and not self.ZOS_gas_path_system_obj.zos_gas_path_system_run_thread.isPaused():
             self.ZOS_gas_path_system_obj.zos_gas_path_system_run_thread.pause()
+
     def resume_running_gap_system(self):
-        #解除暂停正在运行的气路模块
+        # 解除暂停正在运行的气路模块
         if self.UFC_gas_path_system_obj is not None and self.UFC_gas_path_system_obj.ufc_gas_path_system_run_thread is not None and self.UFC_gas_path_system_obj.ufc_gas_path_system_run_thread.isPaused():
             self.UFC_gas_path_system_obj.ufc_gas_path_system_run_thread.resume()
         if self.UGC_gas_path_system_obj is not None and self.UGC_gas_path_system_obj.ugc_gas_path_system_run_thread is not None and self.UGC_gas_path_system_obj.ugc_gas_path_system_run_thread.isPaused():
             self.UGC_gas_path_system_obj.ugc_gas_path_system_run_thread.resume()
         if self.ZOS_gas_path_system_obj is not None and self.ZOS_gas_path_system_obj.zos_gas_path_system_run_thread is not None and self.ZOS_gas_path_system_obj.zos_gas_path_system_run_thread.isPaused():
             self.ZOS_gas_path_system_obj.zos_gas_path_system_run_thread.resume()
+
     def range_calibration_handle(self):
         """
         量程标定
@@ -1083,8 +1041,9 @@ class UFC_UGC_ZOS_index(MyQThread):
         global_setting.set_setting("calibration_cancel_requested", False)
         p = AsyPromise(
             self.span_carlibration_obj_calibrate_wrapped
-        ).then().catch( lambda e: logger.error(f"{e}"))
+        ).then().catch(lambda e: logger.error(f"{e}"))
         return p
+
     def air_calibration_handle(self):
         """Start the standalone Air workflow without blocking the command loop."""
         with self._runtime_air_lock:
@@ -1100,10 +1059,10 @@ class UFC_UGC_ZOS_index(MyQThread):
                 getattr(self.ZOS_gas_path_system_obj, "zos_gas_path_system_run_thread", None),
             )
             if any(
-                thread is None
-                or not callable(getattr(thread, "isRunning", None))
-                or not thread.isRunning()
-                for thread in run_threads
+                    thread is None
+                    or not callable(getattr(thread, "isRunning", None))
+                    or not thread.isRunning()
+                    for thread in run_threads
             ):
                 return {"success": False, "message": "气路尚未全部进入运行状态，无法启动空气校准"}
             if global_setting.get_setting("is_calibrating", False):
@@ -1231,6 +1190,7 @@ class UFC_UGC_ZOS_index(MyQThread):
             self._record_shutdown_error("实验中空气校准", "取消等待超时")
             return False
         return True
+
     def zero_calibration_handle(self):
         """
         零点标定
@@ -1240,8 +1200,9 @@ class UFC_UGC_ZOS_index(MyQThread):
         global_setting.set_setting("calibration_cancel_requested", False)
         p = AsyPromise(
             self.zero_carlibration_obj_calibrate_wrapped
-        ).then().catch( lambda e: logger.error(f"{e}"))
+        ).then().catch(lambda e: logger.error(f"{e}"))
         return p
+
     def calibration_btn_start(self):
         """
         按钮点击的标定事件
@@ -1292,21 +1253,21 @@ class UFC_UGC_ZOS_index(MyQThread):
             ).catch(lambda e: logger.error(f"{e}"))
         ).catch(lambda e: logger.error(f"{e}"))
         return p
+
     def gas_state_check_handle(self):
         global stop_flag
         if stop_flag:
             return AsyPromise.reject_immediately("gas_state_check_handle 在启动过程中时遇到停止指令")
         self.set_gas_state_check_timer()
-        p = AsyPromise(lambda r,e:r()).then().catch( lambda e: logger.error(f"{e}"))
+        p = AsyPromise(lambda r, e: r()).then().catch(lambda e: logger.error(f"{e}"))
         return p
+
     def gas_state_check(self):
         p = AsyPromise(self.UFC_gas_state_check_obj.state_check).then(
-        ).catch( lambda e: logger.error(f"{e}"))
+        ).catch(lambda e: logger.error(f"{e}"))
         return p
         # p = AsyPromise(lambda r, e: r()).then().catch( lambda e: logger.error(f"{e}"))
         # return p
-
-
 
     def dosomething(self):
         if self._startup_chain_started:
@@ -1417,7 +1378,6 @@ class UFC_UGC_ZOS_index(MyQThread):
         if self.zos_start_timer is not None and self.zos_start_timer.is_active():
             self.zos_start_timer.pause()
 
-
         if self.gas_state_check_timer is not None and self.gas_state_check_timer.is_active():
             self.gas_state_check_timer.pause()
 
@@ -1425,16 +1385,14 @@ class UFC_UGC_ZOS_index(MyQThread):
         if self.zos_start_timer is not None:
             self.zos_start_timer.resume()
 
-
         if self.gas_state_check_timer is not None:
             self.gas_state_check_timer.resume()
 
     def close_timers(self):
-        if self.zos_start_timer is not None :
+        if self.zos_start_timer is not None:
             self.zos_start_timer.stop()
 
-
-        if self.gas_state_check_timer is not None  :
+        if self.gas_state_check_timer is not None:
             self.gas_state_check_timer.stop()
 
     def set_gas_state_check_timer(self):
@@ -1448,8 +1406,6 @@ class UFC_UGC_ZOS_index(MyQThread):
         )
         self.gas_state_check_timer.set_task(self.gas_state_check)
         self.gas_state_check_timer.start()
-
-
 
     def set_zos_start_timer(self):
         self.zos_start_timer = PeriodicTimer(
