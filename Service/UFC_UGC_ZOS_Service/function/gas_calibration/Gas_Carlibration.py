@@ -2117,7 +2117,7 @@ def _patched_start_ufc_if_needed_for_zero_v2(self, resolve, reject, port):
         reject("stop")
         return
 
-    if False and self.is_ufc_started_for_zero():
+    if self.is_ufc_started_for_zero():
         self.ufc_started_by_calibration = False
         self.update_status_main_signal_gui_update.send(
             f"{time_util.get_format_from_time(time.time())} | {self.name}校准：当前UFC已开启，跳过启动指令",
@@ -2139,7 +2139,10 @@ def _patched_start_ufc_if_needed_for_zero_v2(self, resolve, reject, port):
     )
     self.send_thread.send_message = self.send_message
 
-    def _send_success(_):
+    def _send_success(result):
+        if not isinstance(result, dict) or not result.get("send_state", False):
+            reject("启动UFC指令未获得有效响应")
+            return
         global_setting.set_setting("ufc_start_time_state", True)
         self.ufc_started_by_calibration = True
         resolve()
@@ -2166,8 +2169,14 @@ def _patched_open_gas_pump_and_flow_for_zero_v2(self, resolve, reject, port):
         title=self.title
     )
     self.send_thread.send_message = self.send_message
+    def _send_success(result):
+        if not isinstance(result, dict) or not result.get("send_state", False):
+            reject("开启气泵及流量控制器指令未获得有效响应")
+            return
+        resolve()
+
     AsyPromise(self.send_thread.Send).then(
-        lambda _: resolve()
+        _send_success
     ).catch(lambda e: reject(e))
 
 
@@ -2240,8 +2249,14 @@ def _patched_close_gas_pump_and_flow_for_zero_v2(self, resolve, reject, port):
         title=self.title
     )
     self.send_thread.send_message = self.send_message
+    def _send_success(result):
+        if not isinstance(result, dict) or not result.get("send_state", False):
+            reject("关闭气泵及流量控制器指令未获得有效响应")
+            return
+        resolve()
+
     AsyPromise(self.send_thread.Send).then(
-        lambda _: resolve()
+        _send_success
     ).catch(lambda e: reject(e))
 
 
@@ -2271,7 +2286,10 @@ def _patched_close_ufc_if_open_for_zero_v2(self, resolve, reject, port):
     )
     self.send_thread.send_message = self.send_message
 
-    def _send_success(_):
+    def _send_success(result):
+        if not isinstance(result, dict) or not result.get("send_state", False):
+            reject("关闭UFC指令未获得有效响应")
+            return
         global_setting.set_setting("ufc_start_time_state", False)
         self.ufc_started_by_calibration = False
         resolve()
@@ -2388,7 +2406,7 @@ def _patched_range_dosomething_v2(self):
             calibration_config.get("co2_span_purge_time", 120)
         )
         self.update_status_main_signal_gui_update.send(
-            f"{time_util.get_format_from_time(time.time())} | 组合流程：O2 Span已完成，本阶段只执行CO2 Span",
+            f"{time_util.get_format_from_time(time.time())} | 组合流程：进入CO2 Span阶段，本阶段只执行CO2 Span",
             title=self.title,
         )
         AsyPromise(self.open_ugc_zero_or_span_valve, port=self.port).then(
