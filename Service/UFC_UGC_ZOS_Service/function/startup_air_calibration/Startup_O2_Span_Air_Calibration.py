@@ -58,7 +58,14 @@ class Startup_O2_Span_Air_Calibration:
             return self._running
 
     def request_stop(self):
-        self._stop_event.set()
+        with self._state_lock:
+            self._stop_event.set()
+
+    def reset_stop(self):
+        """Clear a prior run's cancellation only at a new experiment start."""
+        with self._state_lock:
+            if not self._running:
+                self._stop_event.clear()
 
     def is_stop_requested(self):
         return self._stop_event.is_set()
@@ -338,17 +345,34 @@ class Startup_O2_Span_Air_Calibration:
         self._run_span_only(resolve, reject, switch_to_air=True)
 
     def run_span_only_keep_span(self, resolve, reject):
-        """Collect O2 Span data while keeping the Span gas path until Air."""
-        self._run_span_only(resolve, reject, switch_to_air=False)
+        """Reuse the CO2 Span path, then keep it open until the Air switch."""
+        self._run_span_only(
+            resolve,
+            reject,
+            switch_to_air=False,
+            span_path_prepared=True,
+        )
 
-    def _run_span_only(self, resolve, reject, switch_to_air):
+    def _run_span_only(
+        self,
+        resolve,
+        reject,
+        switch_to_air,
+        span_path_prepared=False,
+    ):
         with self._state_lock:
             if self._running:
                 reject("O2 Span+空气校准正在运行")
                 return
+            if (
+                self._stop_event.is_set()
+                or global_setting.get_setting("calibration_cancel_requested", False)
+            ):
+                self._finished_event.set()
+                reject("实验停止，取消启动O2 Span校准")
+                return
             self._running = True
         self._finished_event.clear()
-        self._stop_event.clear()
         failure = None
         try:
             port = global_setting.get_setting("port", None)
@@ -380,12 +404,16 @@ class Startup_O2_Span_Air_Calibration:
                 f"每路目标 {target_points} 点，通道间隔 {sample_interval:g} 秒"
             )
 
-            self._set_coil(4, 9, True, "切换ZOS校准采样状态")
-            self._set_coil(3, 2, True, "开启UGC Span标准气")
-            self._set_coil(3, 0, False, "关闭UGC空气阀")
-            self._set_coil(3, 1, False, "关闭UGC N2阀")
+            if not span_path_prepared:
+                self._set_coil(4, 9, True, "切换ZOS校准采样状态")
+                self._set_coil(3, 2, True, "开启UGC Span标准气")
+                self._set_coil(3, 0, False, "关闭UGC空气阀")
+                self._set_coil(3, 1, False, "关闭UGC N2阀")
+            else:
+                self._send_text("复用CO2 Span阶段已稳定的气路，不重复切阀")
             self._emit_calibration_time("set_start_span_calibration_time")
-            self._wait_for_gas_flush("Span", self.SPAN_PURGE_SECONDS)
+            if not span_path_prepared:
+                self._wait_for_gas_flush("Span", self.SPAN_PURGE_SECONDS)
             self._sample_phase("span", target_points, sample_interval)
             self._emit_calibration_time("set_stop_span_calibration_time")
 
@@ -464,9 +492,15 @@ class Startup_O2_Span_Air_Calibration:
             if self._running:
                 reject("O2 Span+空气校准正在运行")
                 return
+            if (
+                self._stop_event.is_set()
+                or global_setting.get_setting("calibration_cancel_requested", False)
+            ):
+                self._finished_event.set()
+                reject("实验停止，取消启动O2 Span+空气校准")
+                return
             self._running = True
         self._finished_event.clear()
-        self._stop_event.clear()
         failure = None
         with_co2 = bool(global_setting.get_setting("startup_calibration_mode") == "co2_o2_span_air")
         try:

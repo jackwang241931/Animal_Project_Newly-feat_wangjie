@@ -78,13 +78,17 @@ class WetOxygenReferenceFilter:
             }
 
         if previous is None:
-            references = self._references.get(channel, [])
+            references = self._references.setdefault(channel, [])
             if len(references) < 3:
+                # If no separate pre-samples were supplied, initialize the
+                # anomaly guard from the first three samples in the normal
+                # Air acquisition loop.  They remain valid calibration points.
+                references.append(current)
                 return {
                     "value": current,
                     "replaced": False,
-                    "accepted": False,
-                    "reason": "waiting_for_three_references",
+                    "accepted": True,
+                    "reason": "collecting_initial_references",
                 }
 
             deltas = [abs(current - reference) for reference in references]

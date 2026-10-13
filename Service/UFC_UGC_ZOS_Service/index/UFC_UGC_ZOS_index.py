@@ -350,6 +350,10 @@ class UFC_UGC_ZOS_index(MyQThread):
         self._experiment_stop_requested = False
         self._shutdown_errors = []
         global_setting.set_setting("calibration_cancel_requested", False)
+        o2_calibration = getattr(self, "Startup_o2_span_air_calibration_obj", None)
+        reset_o2_stop = getattr(o2_calibration, "reset_stop", None)
+        if callable(reset_o2_stop):
+            reset_o2_stop()
         # Do not let a previous run's completion signal release the next
         # calibration stage immediately.  The queue thread clears these after
         # publishing the UI event, but a new start can race that clear.
@@ -628,11 +632,25 @@ class UFC_UGC_ZOS_index(MyQThread):
     def _reject_o2_span_air_start(self, error):
         self.Startup_air_calibration_obj.clear_continued_o2_calibration()
         self.Startup_o2_span_air_calibration_obj.request_stop()
+        self.Startup_o2_span_air_calibration_obj.abort_pending_calibration()
+
+        # A stop-button cancellation is not a failed calibration.  The stop
+        # handler owns the one documented hardware shutdown sequence; running
+        # the startup-failure rollback here would race it and can reopen gas
+        # paths after the pump has already been switched off.
+        if self._experiment_stop_requested:
+            message = f"实验停止请求已取消启动校准流程：{error}；继续执行统一结束流程"
+            logger.info(message)
+            self.update_status_main_signal_gui_update.send(
+                f"{time_util.get_format_from_time(time.time())} | {message}",
+                title=GapSystem_Running_Type.STARTUP_AIR_CALIBRATION,
+            )
+            return None
+
         try:
             self.Startup_o2_span_air_calibration_obj._restore_safe_gas_state()
         except Exception:
             logger.exception("O2 Span+空气校准失败后的安全气路恢复异常")
-        self.Startup_o2_span_air_calibration_obj.abort_pending_calibration()
         self.update_status_main_signal_gui_update.send(
             f"{time_util.get_format_from_time(time.time())} | O₂ Span+空气启动流程失败：{error}",
             title=GapSystem_Running_Type.STARTUP_AIR_CALIBRATION,
@@ -800,18 +818,58 @@ class UFC_UGC_ZOS_index(MyQThread):
     def zero_carlibration_obj_calibrate_wrapped(self, resolve, reject):
         global wait_zero_calibration_finished_event
         wait_zero_calibration_finished_event.clear()
-        AsyPromise(self.Zero_carlibration_obj.calibrate).catch(lambda e: logger.error(f"{e}"))
-        wait_zero_calibration_finished_event.wait()
+        worker = self.Zero_carlibration_obj
+        completion_event = getattr(worker, "calibration_done_event", None)
+        if completion_event is not None:
+            completion_event.clear()
+        startup_errors = []
+        AsyPromise(worker.calibrate).catch(lambda error: startup_errors.append(error))
+        if startup_errors:
+            error = startup_errors[0]
+            logger.error(f"零点标定启动失败: {error}")
+            reject(error)
+            return
+        if completion_event is not None:
+            completion_event.wait()
+        else:
+            wait_zero_calibration_finished_event.wait()
+        if getattr(self, "_experiment_stop_requested", False):
+            reject("实验停止，CO2校零已取消；阻止后续校准阶段启动")
+            return
+        runtime_error = getattr(worker, "calibration_error", None)
+        if runtime_error:
+            logger.error(f"零点标定运行失败: {runtime_error}")
+            reject(runtime_error)
+            return
         resolve()
-        pass
 
     def span_carlibration_obj_calibrate_wrapped(self, resolve, reject):
         global wait_span_calibration_finished_event
         wait_span_calibration_finished_event.clear()
-        AsyPromise(self.Range_carlibration_obj.calibrate).catch(lambda e: logger.error(f"{e}"))
-        wait_span_calibration_finished_event.wait()
+        worker = self.Range_carlibration_obj
+        completion_event = getattr(worker, "calibration_done_event", None)
+        if completion_event is not None:
+            completion_event.clear()
+        startup_errors = []
+        AsyPromise(worker.calibrate).catch(lambda error: startup_errors.append(error))
+        if startup_errors:
+            error = startup_errors[0]
+            logger.error(f"量程标定启动失败: {error}")
+            reject(error)
+            return
+        if completion_event is not None:
+            completion_event.wait()
+        else:
+            wait_span_calibration_finished_event.wait()
+        if getattr(self, "_experiment_stop_requested", False):
+            reject("实验停止，CO2 Span已取消；阻止后续校准阶段启动")
+            return
+        runtime_error = getattr(worker, "calibration_error", None)
+        if runtime_error:
+            logger.error(f"量程标定运行失败: {runtime_error}")
+            reject(runtime_error)
+            return
         resolve()
-        pass
 
     def start_btn_handle(self):
         self._prepare_new_start()
@@ -888,6 +946,9 @@ class UFC_UGC_ZOS_index(MyQThread):
     #     wait_UFC_UGC_ZOS_start_event.clear()  # 重置事件
     #     resolve()
     def stop_btn_handle(self):
+        # Mark the user intent first so a concurrently rejected calibration
+        # chain is treated as cancellation, not as a second failure rollback.
+        self._experiment_stop_requested = True
         # if self.monitor_start_state_Thread is not None:
         #     self.monitor_start_state_Thread.stop()
         #     self.monitor_start_state_Thread.deleteLater()
@@ -985,11 +1046,12 @@ class UFC_UGC_ZOS_index(MyQThread):
             global_setting.set_setting("is_calibrating", False)
             global_setting.set_setting("current_calibration_type", None)
 
-        # Only wait a bounded time. The stop flag has already been set, so any
-        # later calibration stage must abort before issuing another command.
+        # Do not issue shutdown writes while a calibration worker may still be
+        # inside a serial transaction. Calibration steps poll is_STOP and
+        # unwind on cancellation; wait for that unwind before touching paths.
         for calibration in active_calibrations:
             try:
-                if calibration.isRunning() and not calibration.wait(2000):
+                if calibration.isRunning() and not calibration.wait(30000):
                     self._record_shutdown_error(calibration.name, "线程退出等待超时")
             except Exception as exc:
                 self._record_shutdown_error(calibration.name, exc)

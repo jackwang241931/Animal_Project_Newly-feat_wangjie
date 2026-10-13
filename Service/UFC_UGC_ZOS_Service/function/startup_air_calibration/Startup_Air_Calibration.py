@@ -1,5 +1,4 @@
 import copy
-import math
 import time
 
 from blinker.base import _PNamespaceSignal
@@ -46,7 +45,6 @@ class Startup_Air_Calibration:
         self.co2_calibration_handler = None
         self.o2_calibration_filter = WetOxygenReferenceFilter()
         self.previous_valid_snapshots = {}
-        self.pre_calibration_references = {}
         self.calculation_started_logged = False
         self.o2_failure_notified = False
         self.o2_failure_reason = None
@@ -149,6 +147,8 @@ class Startup_Air_Calibration:
             "zos_rh",
             "gas_pressure",
             "o2_percent",
+            "sht_temp",
+            "sht_rh",
         )
         previous_snapshot = self.previous_valid_snapshots.get(channel)
         normalized_snapshot = dict(snapshot)
@@ -203,28 +203,6 @@ class Startup_Air_Calibration:
         return max(target_points, 1)
 
     @staticmethod
-    def _normalize_reference_max_attempts():
-        calibration_config = global_setting.get_setting("UFC_UGC_ZOS_config", {}).get("Calibration", {})
-        try:
-            max_attempts = int(float(calibration_config.get(
-                "startup_air_calibration_reference_max_attempts", 10
-            )))
-        except Exception:
-            max_attempts = 10
-        return max(max_attempts, 3)
-
-    @staticmethod
-    def _normalize_reference_retry_interval():
-        calibration_config = global_setting.get_setting("UFC_UGC_ZOS_config", {}).get("Calibration", {})
-        try:
-            retry_interval = float(calibration_config.get(
-                "startup_air_calibration_reference_retry_interval", 5
-            ))
-        except Exception:
-            retry_interval = 5.0
-        return max(retry_interval, 0.5)
-
-    @staticmethod
     def _normalize_run_timeout(target_points, sample_interval, channel_count):
         calibration_config = global_setting.get_setting("UFC_UGC_ZOS_config", {}).get("Calibration", {})
         # Every channel performs two serial transactions (UGC + ZOS) before
@@ -264,6 +242,14 @@ class Startup_Air_Calibration:
         return None
 
     @staticmethod
+    def _extract_data_value_matching(data_items, predicate):
+        for item in data_items or []:
+            desc = str(item.get("desc", ""))
+            if predicate(desc):
+                return item.get("value")
+        return None
+
+    @staticmethod
     def _channel_to_handler_name(channel):
         return hardware_channel_to_handler_name(channel)
 
@@ -279,114 +265,20 @@ class Startup_Air_Calibration:
     def _get_active_channels(self):
         return get_enabled_calibration_channels()
 
-    def _capture_pre_calibration_references(self, active_channels):
-        """Capture the three stable wet-O2 values used by Air calibration."""
-        required_points = 3
-        references = {
-            self._channel_to_handler_name(channel): []
-            for channel in active_channels
-        }
-        sample_interval = self._normalize_sample_interval()
-        max_attempts = self._normalize_reference_max_attempts()
-        retry_interval = self._normalize_reference_retry_interval()
-        last_invalid_reasons = {}
-        retry_channels = []
+    @staticmethod
+    def _reference_first_channels(channels):
+        """Poll REF first so each cage CO2 sample has a current-cycle peer."""
+        channels = list(channels or [])
+        reference_channels = [channel for channel in channels if int(channel) == 8]
+        other_channels = [channel for channel in channels if int(channel) != 8]
+        return reference_channels + other_channels
 
-        for attempt_index in range(max_attempts):
-            for channel in active_channels:
-                channel_name = self._channel_to_handler_name(channel)
-                if len(references[channel_name]) >= required_points:
-                    continue
-
-                snapshot = self._read_zos_channel_snapshot(channel)
-                if snapshot is None:
-                    last_invalid_reasons[channel_name] = "读取失败"
-                    logger.warning(
-                        f"{self.name}: {channel_name} 第 {attempt_index + 1}/{max_attempts} 次"
-                        "湿基氧参考读取失败"
-                    )
-                    continue
-                try:
-                    value = float(snapshot["o2_percent"])
-                except (KeyError, TypeError, ValueError):
-                    last_invalid_reasons[channel_name] = "氧浓度格式无效"
-                    logger.warning(
-                        f"{self.name}: {channel_name} 第 {attempt_index + 1}/{max_attempts} 次"
-                        "湿基氧参考格式无效"
-                    )
-                    continue
-                if math.isfinite(value) and 0.0 < value <= 100.0:
-                    references[channel_name].append(value)
-                    last_invalid_reasons.pop(channel_name, None)
-                else:
-                    last_invalid_reasons[channel_name] = f"氧浓度={value:g}"
-                    logger.warning(
-                        f"{self.name}: {channel_name} 第 {attempt_index + 1}/{max_attempts} 次"
-                        f"湿基氧参考无效（氧浓度={value:g}）"
-                    )
-
-            missing = [
-                channel
-                for channel, values in references.items()
-                if len(values) < required_points
-            ]
-            if not missing:
-                if retry_channels:
-                    recovered_details = "，".join(
-                        f"{channel}={len(references[channel])}/{required_points}"
-                        for channel in retry_channels
-                    )
-                    self._send_text(
-                        f"{self.name}参考数据补采成功（{recovered_details}），继续 Air 校准"
-                    )
-                break
-
-            if attempt_index + 1 == required_points:
-                retry_channels = list(missing)
-                retry_details = "，".join(
-                    f"{channel}={len(references[channel])}/{required_points}"
-                    for channel in retry_channels
-                )
-                retry_message = (
-                    f"{self.name}检测到无效参考数据（{retry_details}），开始补采，"
-                    f"最多尝试 {max_attempts} 次"
-                )
-                logger.warning(retry_message)
-                self._send_text(retry_message)
-
-            if attempt_index < max_attempts - 1:
-                wait_interval = (
-                    sample_interval
-                    if attempt_index < required_points - 1
-                    else retry_interval
-                )
-                time.sleep(wait_interval)
-
-        self.pre_calibration_references = references
-        missing = [
-            channel
-            for channel, values in references.items()
-            if len(values) < required_points
-        ]
-        if missing:
-            missing_details = "，".join(
-                f"{channel}={len(references[channel])}/{required_points}"
-                f"（最近一次：{last_invalid_reasons.get(channel, '无有效数据')}）"
-                for channel in missing
-            )
-            failure_message = (
-                f"{self.name}未进入采集：稳定阶段湿基氧参考数据不足"
-                f"（{missing_details}），累计尝试 {max_attempts} 次；"
-                "本轮校准失败，请检查对应通道"
-            )
-            logger.warning(failure_message)
-            self._send_text(failure_message)
-            return False
-
-        logger.info(f"{self.name}: 已保存空气校准前各通道最后3个湿基氧参考值")
-        return True
-
-    def _build_calibration_handlers(self, sample_interval=None, active_channel_count=None):
+    def _build_calibration_handlers(
+        self,
+        sample_interval=None,
+        active_channel_count=None,
+        active_channels=None,
+    ):
         try:
             from Service.UFC_UGC_ZOS_Service.function.o2_compensation import (
                 create_o2_calibration_handler,
@@ -398,9 +290,17 @@ class Startup_Air_Calibration:
             raise RuntimeError(f"加载 Air 校准处理器失败: {exc}")
 
         target_points = self._normalize_target_points()
-        handler_channels = list(self.pre_calibration_references)
+        active_channels = (
+            list(active_channels)
+            if active_channels is not None
+            else self._get_active_channels()
+        )
+        handler_channels = [
+            self._channel_to_handler_name(channel)
+            for channel in active_channels
+        ]
         if not handler_channels:
-            raise RuntimeError("空气校准缺少已启用通道的参考数据")
+            raise RuntimeError("空气校准缺少已启用通道")
         continued_handler = self._pending_full_o2_handler
         self._pending_full_o2_handler = None
         if continued_handler is not None:
@@ -436,11 +336,6 @@ class Startup_Air_Calibration:
         if continued_handler is None:
             self.o2_calibration_handler.start_air_touchup()
         self.o2_calibration_filter = WetOxygenReferenceFilter()
-        for channel in self.o2_calibration_handler.channels:
-            self.o2_calibration_filter.set_initial_references(
-                channel,
-                self.pre_calibration_references[channel],
-            )
         self.co2_calibration_handler.start_new_calibration()
         self.previous_valid_snapshots = {}
         self.calculation_started_logged = False
@@ -485,39 +380,6 @@ class Startup_Air_Calibration:
             standard_pressure = 1013.25
         return round(float(raw_co2_ppm) * standard_pressure / float(gas_pressure), 4)
 
-    def _seed_co2_reference_for_time_alignment(self, active_channels):
-        """Collect one REF point before cage polling so M1 has a time peer."""
-        reference_channel = 8
-        if reference_channel not in active_channels:
-            return False
-
-        for attempt in range(3):
-            co2_snapshot = self._read_ugc_channel_snapshot(reference_channel)
-            zos_snapshot = self._read_zos_channel_snapshot(reference_channel)
-            if co2_snapshot is not None and zos_snapshot is not None:
-                compensated_co2 = self._calculate_pressure_compensated_co2(
-                    co2_snapshot.get("raw_co2_ppm"),
-                    zos_snapshot.get("gas_pressure"),
-                )
-                if compensated_co2 is not None:
-                    self.co2_calibration_handler.add_data(
-                        self._channel_to_handler_name(reference_channel),
-                        compensated_co2,
-                    )
-                    self._send_text(
-                        f"{self.name}CO2时间对齐：正式轮询前REF预采样完成（1点）"
-                    )
-                    return True
-            logger.warning(
-                f"{self.name}CO2时间对齐：REF预采样失败，"
-                f"正在重试 {attempt + 1}/3"
-            )
-
-        self._send_text(
-            f"{self.name}CO2时间对齐失败：正式轮询前未取得REF参考点"
-        )
-        return False
-
     def _read_zos_channel_snapshot(self, channel):
         port = self._get_port()
         self.send_message = {
@@ -538,6 +400,13 @@ class Startup_Air_Calibration:
         o2_percent = self._extract_data_value(data_items, "氧浓度")
         zos_temp = self._extract_data_value(data_items, "ZOS温度2测量值")
         zos_rh = self._extract_data_value(data_items, "ZOS湿度测量值")
+        sht_temp = self._extract_data_value_matching(
+            data_items, lambda desc: "SHT" in desc.upper() and "温度" in desc
+        )
+        sht_rh = self._extract_data_value_matching(
+            data_items,
+            lambda desc: "SHT" in desc.upper() and ("湿度" in desc or "RH" in desc.upper()),
+        )
 
         if None in [o2_partial, gas_pressure, o2_percent, zos_temp, zos_rh]:
             return None
@@ -549,6 +418,8 @@ class Startup_Air_Calibration:
             "zos_rh": float(zos_rh),
             "gas_pressure": float(gas_pressure),
             "o2_percent": float(o2_percent),
+            "sht_temp": float(sht_temp) if sht_temp is not None else None,
+            "sht_rh": float(sht_rh) if sht_rh is not None else None,
         }
 
     def start(self, resolve, reject):
@@ -576,11 +447,6 @@ class Startup_Air_Calibration:
         wait_seconds = self._normalize_startup_wait_seconds()
         if wait_seconds == 0:
             self._send_text(f"{self.name}等待阶段已跳过")
-            if not self._capture_pre_calibration_references(self._get_active_channels()):
-                reject(
-                    f"{self.name}无法开始：每个通道必须先取得3个稳定湿基氧参考值"
-                )
-                return
             resolve()
             return
 
@@ -593,11 +459,6 @@ class Startup_Air_Calibration:
                     f"{self.name}等待稳定：当前等待 {second + 1}/{wait_seconds} 秒"
                 )
             time.sleep(1)
-        if not self._capture_pre_calibration_references(self._get_active_channels()):
-            reject(
-                f"{self.name}无法开始：每个通道必须先取得3个稳定湿基氧参考值"
-            )
-            return
         resolve()
 
     def run(self, resolve, reject):
@@ -606,33 +467,21 @@ class Startup_Air_Calibration:
             reject("未选择串口，无法执行运行前 Air 空气校准")
             return
 
-        active_channels = self._get_active_channels()
+        active_channels = self._reference_first_channels(self._get_active_channels())
         if len(active_channels) == 0:
             reject("未配置有效通道，无法执行运行前 Air 空气校准")
             return
 
         sample_interval = self._normalize_sample_interval()
         target_points = self._normalize_target_points()
-        if any(
-            len(
-                self.pre_calibration_references.get(
-                    self._channel_to_handler_name(channel), []
-                )
-            ) != 3
-            for channel in active_channels
-        ):
-            reject(f"{self.name}无法开始：空气校准前的三点湿基氧参考不完整")
-            return
         try:
             self._build_calibration_handlers(
                 sample_interval=sample_interval,
                 active_channel_count=len(active_channels),
+                active_channels=active_channels,
             )
         except Exception as exc:
             reject(str(exc))
-            return
-        if not self._seed_co2_reference_for_time_alignment(active_channels):
-            reject(f"{self.name}无法开始：CO2时间对齐缺少REF预采样数据")
             return
         max_timeout = self._normalize_run_timeout(target_points, sample_interval, len(active_channels))
         last_progress_log_time = 0.0
@@ -690,6 +539,8 @@ class Startup_Air_Calibration:
                                     snapshot["gas_pressure"],
                                     cleaned_o2_percent,
                                     snapshot["zos_rh"],
+                                    sht_temp=snapshot.get("sht_temp"),
+                                    sht_rh=snapshot.get("sht_rh"),
                                 )
                             except Exception as exc:
                                 logger.exception(

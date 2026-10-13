@@ -25,6 +25,18 @@ from public.function.Monitor_data_storage.DataStorage import store_data_with_res
 from public.function.promise.AsyPromise import AsyPromise
 from public.util.number_util import number_util
 from public.util.time_util import time_util
+
+
+def _is_calibration_stop_requested(calibration):
+    """Return whether the current calibration run has been cancelled."""
+    interruption_requested = getattr(calibration, "isInterruptionRequested", None)
+    return bool(
+        getattr(calibration, "is_STOP", False)
+        or (callable(interruption_requested) and interruption_requested())
+        or global_setting.get_setting("calibration_cancel_requested", False)
+    )
+
+
 # 前面测量的氧气值
 last_oxygen_value = 0
 # 前面测量的ZOS气压值
@@ -101,6 +113,11 @@ class Gas_Carlibration:
         # CO2阶段结束后气泵和UFC仍由后续阶段继续使用，不能在阶段收尾时关闭。
         # 单独校准时保持False，沿用原有的独立收尾逻辑。
         self.keep_gas_path_open_after_calibration = False
+        # The worker promise resolves as soon as the QThread starts.  Runtime
+        # completion (or failure) therefore needs a separate signal for the
+        # combined calibration workflow waiting in UFC_UGC_ZOS_index.
+        self.calibration_done_event = threading.Event()
+        self.calibration_error = None
         # span 标定时，本次下发给设备的目标值
         self.ugc_span_target_co2_ppm = None
         self.zos_span_target_o2_percent = None
@@ -173,8 +190,9 @@ class Gas_Carlibration:
 
     def open_ugc_zero_or_span_valve(self, resolve, reject, port):
         # 1. 打开ugc调零或者SPan阀门
-        if self.is_STOP:
+        if _is_calibration_stop_requested(self):
             reject("stop")
+            return
         match self.type:
             case Gas_Carlibration_Type.ZERO:
                 self.send_message = {
@@ -241,20 +259,53 @@ class Gas_Carlibration:
 
         self.send_thread.send_message = self.send_message
         def send_success(r):
-            target_co2 = standard_co2
-            try:
-                if r and r.get("data") and r["data"].get("data"):
-                    for item in r["data"]["data"]:
-                        if item.get("desc") == "标准气体浓度":
-                            target_co2 = int(item.get("value"))
-                            break
-            except Exception as e:
-                logger.warning(f"UGC标准气体浓度取回包失败，使用用户设置值兜底: {e}")
+            if not isinstance(r, dict) or not r.get("send_state", False):
+                error_message = (
+                    f"CO2标准气浓度写入失败：未收到有效响应，"
+                    f"寄存器=0x0012，目标值={standard_co2}ppm"
+                )
+                self.update_status_main_signal_gui_update.send(
+                    f"{time_util.get_format_from_time(time.time())} | {error_message}",
+                    title=self.title,
+                )
+                reject(error_message)
+                return
 
-            self.ugc_span_target_co2_ppm = target_co2
+            try:
+                response_hex = r.get("response_hex")
+                response = (
+                    bytes(response_hex)
+                    if isinstance(response_hex, (bytes, bytearray))
+                    else bytes.fromhex(str(response_hex or ""))
+                )
+            except (TypeError, ValueError) as exc:
+                error_message = f"CO2标准气浓度写入失败：响应报文无法解析: {exc}"
+                self.update_status_main_signal_gui_update.send(
+                    f"{time_util.get_format_from_time(time.time())} | {error_message}",
+                    title=self.title,
+                )
+                reject(error_message)
+                return
+
+            # Modbus 0x06 的正常响应必须原样回显站号、功能码、寄存器和值；
+            # CRC 已由底层 send_state 校验，这里再核对业务字段，防止误报成功。
+            expected_prefix = bytes((3, 6, 0, 0x12, high_byte, low_byte))
+            if len(response) != 8 or response[:6] != expected_prefix:
+                error_message = (
+                    "CO2标准气浓度写入失败：响应报文与请求不一致，"
+                    f"期望前缀={expected_prefix.hex()}，实际={response.hex() or '空'}"
+                )
+                self.update_status_main_signal_gui_update.send(
+                    f"{time_util.get_format_from_time(time.time())} | {error_message}",
+                    title=self.title,
+                )
+                reject(error_message)
+                return
+
+            self.ugc_span_target_co2_ppm = standard_co2
             self.update_status_main_signal_gui_update.send(
                 f"{time_util.get_format_from_time(time.time())} | 校span成功："
-                f"UGC已成功写入CO2标准气体浓度={target_co2}ppm",
+                f"UGC已确认写入CO2标准气体浓度={standard_co2}ppm",
                 title=self.title
             )
             resolve()
@@ -552,6 +603,17 @@ class Zero_Carlibration(Gas_Carlibration, MyQThread):
         pass
     def calibrate(self, resolve, reject):
         """零点标定"""
+        # Reset the per-run flag before checking the shared cancellation flag.
+        # A stop request racing worker startup must never be overwritten later.
+        self.is_STOP = False
+        self.calibration_done_event.clear()
+        self.calibration_error = None
+        if _is_calibration_stop_requested(self):
+            self.is_STOP = True
+            self.set_calibration_running_state(False)
+            self.calibration_done_event.set()
+            reject("实验停止，零点校准已取消")
+            return
         time.sleep(0.01)
         self.set_calibration_running_state(True)
         # 发送开始标定消息
@@ -561,7 +623,6 @@ class Zero_Carlibration(Gas_Carlibration, MyQThread):
         )
         self.update_status_main_signal_gui_update.send(
             f"{time_util.get_format_from_time(time.time())} |  零点标定 开始{'.' * 100}", title=self.title)
-        self.is_STOP = False
         self.current_calibration_values = {
             'oxygen_value': None,
             'carbon_value': None,
@@ -574,10 +635,16 @@ class Zero_Carlibration(Gas_Carlibration, MyQThread):
             self.set_calibration_running_state(False)
             self.update_status_main_signal_gui_update.send(
                 f"{time_util.get_format_from_time(time.time())} | 启动失败，未选择串口！", title=self.title)
-            reject()
-        if self.is_STOP:
+            self.calibration_error = "启动失败，未选择串口"
+            self.calibration_done_event.set()
+            reject(self.calibration_error)
+            return
+        if _is_calibration_stop_requested(self):
             self.set_calibration_running_state(False)
-            reject()
+            self.calibration_error = None
+            self.calibration_done_event.set()
+            reject("实验停止，零点校准已取消")
+            return
         self.start()
         resolve()
         pass
@@ -1030,6 +1097,17 @@ class Range_Carlibration(Gas_Carlibration, MyQThread):
 
     def calibrate(self, resolve, reject):
         """量程标定"""
+        # See Zero_Carlibration.calibrate: do not clear a stop that arrived
+        # while the startup chain was scheduling this worker.
+        self.is_STOP = False
+        self.calibration_done_event.clear()
+        self.calibration_error = None
+        if _is_calibration_stop_requested(self):
+            self.is_STOP = True
+            self.set_calibration_running_state(False)
+            self.calibration_done_event.set()
+            reject("实验停止，Span校准已取消")
+            return
         self.set_calibration_running_state(True)
         # 发送开始标定消息
         self.update_status_main_signal_gui_update.send(
@@ -1039,7 +1117,6 @@ class Range_Carlibration(Gas_Carlibration, MyQThread):
         self.update_status_main_signal_gui_update.send(
             f"{time_util.get_format_from_time(time.time())} |  SPan量程标定 开始{'.' * 100}", title=self.title)
 
-        self.is_STOP = False
         self.current_calibration_values = {
             'oxygen_value': None,
             'carbon_value': None,
@@ -1052,10 +1129,16 @@ class Range_Carlibration(Gas_Carlibration, MyQThread):
             self.set_calibration_running_state(False)
             self.update_status_main_signal_gui_update.send(
                 f"{time_util.get_format_from_time(time.time())} | 启动失败，未选择串口！", title=self.title)
-            reject()
-        if self.is_STOP:
+            self.calibration_error = "启动失败，未选择串口"
+            self.calibration_done_event.set()
+            reject(self.calibration_error)
+            return
+        if _is_calibration_stop_requested(self):
             self.set_calibration_running_state(False)
-            reject()
+            self.calibration_error = None
+            self.calibration_done_event.set()
+            reject("实验停止，Span校准已取消")
+            return
         self.start()
         resolve()
         pass
@@ -1615,7 +1698,10 @@ def _log_ugc_calibration_command_result(
             *self.send_message["data"],
         ]
     )
-    response_matches = response_hex.startswith(expected_prefix)
+    # A normal Modbus write acknowledgement is an eight-byte frame.  Require
+    # the complete echo (the transport already validates its CRC) rather than
+    # accepting a truncated prefix as a successful calibration command.
+    response_matches = len(response_hex) == 16 and response_hex.startswith(expected_prefix)
     success = send_state and response_matches
     status = "成功" if success else "失败"
     response_text = response_hex or "无响应"
@@ -1627,6 +1713,106 @@ def _log_ugc_calibration_command_result(
         title=self.title,
     )
     return success
+
+
+def _send_ugc_calibration_coil_v2(self, port, register, value, description, resolve, reject):
+    if _is_calibration_stop_requested(self):
+        reject("stop")
+        return
+
+    self.send_message = {
+        "port": port,
+        "data": number_util.set_int_to_4_bytes_list(
+            f"{register:04X}{value:04X}"
+        ),
+        "slave_id": "3",
+        "function_code": "5",
+        "timeout": 1,
+    }
+    self.update_status_main_signal_gui_update.send(
+        f"{time_util.get_format_from_time(time.time())} | {self.name}校准：{description}",
+        title=self.title,
+    )
+    self.send_thread.send_message = self.send_message
+
+    def handle_result(result):
+        if not _log_ugc_calibration_command_result(
+            self,
+            result,
+            command_name=description,
+            calibration_name="气路切换",
+        ):
+            reject(f"{description}回包不匹配")
+            return
+        resolve()
+
+    def handle_error(error):
+        _log_ugc_calibration_command_result(
+            self,
+            None,
+            command_name=description,
+            calibration_name="气路切换",
+            error=error,
+        )
+        reject(error)
+
+    AsyPromise(self.send_thread.Send).then(handle_result).catch(handle_error)
+
+
+def _run_ugc_calibration_coil_sequence_v2(self, port, steps, resolve, reject):
+    def run_step(index):
+        if _is_calibration_stop_requested(self):
+            reject("stop")
+            return
+        if index >= len(steps):
+            resolve()
+            return
+
+        register, value, description = steps[index]
+        AsyPromise(
+            lambda resolve_step, reject_step: _send_ugc_calibration_coil_v2(
+                self,
+                port,
+                register,
+                value,
+                description,
+                resolve_step,
+                reject_step,
+            )
+        ).then(lambda _: run_step(index + 1)).catch(reject)
+
+    run_step(0)
+
+
+def _patched_prepare_co2_zero_gas_path_v2(self, resolve, reject, port):
+    # 1012: open N2, close Air, close Span, then enter the ZOS merge state.
+    return _run_ugc_calibration_coil_sequence_v2(
+        self,
+        port,
+        [
+            (0x0001, 0xFF00, "打开UGC N2阀"),
+            (0x0000, 0x0000, "关闭UGC空气阀"),
+            (0x0002, 0x0000, "关闭UGC Span阀"),
+        ],
+        resolve,
+        reject,
+    )
+
+
+def _patched_prepare_co2_span_gas_path_v2(self, resolve, reject, port):
+    # 1012: open Span, close Air, then close N2.  CO2 Span does not switch
+    # the ZOS Span coil; ZOS Span belongs to the later O2 Span phase.
+    return _run_ugc_calibration_coil_sequence_v2(
+        self,
+        port,
+        [
+            (0x0002, 0xFF00, "打开UGC Span阀"),
+            (0x0000, 0x0000, "关闭UGC空气阀"),
+            (0x0001, 0x0000, "关闭UGC N2阀"),
+        ],
+        resolve,
+        reject,
+    )
 
 
 def _patched_zero_cyclic_sampling_of_ugc_carbon_sensor(self, resolve, reject, port):
@@ -1670,9 +1856,9 @@ def _patched_zero_cyclic_sampling_of_ugc_carbon_sensor(self, resolve, reject, po
 
         if elapsed_time > max_timeout:
             self.update_status_main_signal_gui_update.send(
-                f"{time_util.get_format_from_time(time.time())} | 零点标定 UGC已超时：已运行{int(elapsed_time)}秒，进入统一收尾流程",
+                f"{time_util.get_format_from_time(time.time())} | 零点标定 UGC稳定性检测失败：已运行{int(elapsed_time)}秒，超过{int(max_timeout)}秒仍未满足稳定条件，终止本阶段",
                 title=self.title)
-            resolve()
+            reject(f"CO2零点数据不稳定：{int(elapsed_time)}秒内未满足稳定条件")
             return
 
         pending_channels = [ch for ch in active_channels if not channels_finish_state[ch]]
@@ -1755,6 +1941,15 @@ def _patched_zero_cyclic_sampling_of_ugc_carbon_sensor(self, resolve, reject, po
                     channels_stable_start[channel] = None
                     channels_data[channel] = []
 
+        elapsed_time = time.time() - start_time
+        if elapsed_time > max_timeout:
+            self.update_status_main_signal_gui_update.send(
+                f"{time_util.get_format_from_time(time.time())} | 零点标定 UGC稳定性检测失败：已运行{int(elapsed_time)}秒，超过{int(max_timeout)}秒仍未满足稳定条件，终止本阶段",
+                title=self.title,
+            )
+            reject(f"CO2零点数据不稳定：{int(elapsed_time)}秒内未满足稳定条件")
+            return
+
         stable_count = sum(1 for ch in active_channels if channels_finish_state[ch])
         all_stable = stable_count == total_channels
 
@@ -1790,12 +1985,14 @@ def _patched_zero_cyclic_sampling_of_ugc_carbon_sensor(self, resolve, reject, po
         f"{time_util.get_format_from_time(time.time())} | 零点标定 发送UGC零点设置指令",
         title=self.title)
     def handle_result(result):
-        _log_ugc_calibration_command_result(
+        if not _log_ugc_calibration_command_result(
             self,
             result,
             command_name="UGC零点设置指令",
             calibration_name="校0",
-        )
+        ):
+            reject("UGC零点标定指令响应不匹配")
+            return
         resolve()
 
     def handle_error(error):
@@ -1864,9 +2061,9 @@ def _patched_range_cyclic_sampling_of_ugc_carbon_sensor(self, resolve, reject, p
 
         if elapsed_time > max_timeout:
             self.update_status_main_signal_gui_update.send(
-                f"{time_util.get_format_from_time(time.time())} | SPan量程标定 UGC已超时：已运行{int(elapsed_time)}秒，进入统一收尾流程",
+                f"{time_util.get_format_from_time(time.time())} | SPan量程标定 UGC稳定性检测失败：已运行{int(elapsed_time)}秒，超过{int(max_timeout)}秒仍未满足稳定条件，终止本阶段",
                 title=self.title)
-            resolve()
+            reject(f"CO2 Span数据不稳定：{int(elapsed_time)}秒内未满足稳定条件")
             return
 
         pending_channels = [ch for ch in active_channels if not channels_finish_state[ch]]
@@ -1953,6 +2150,15 @@ def _patched_range_cyclic_sampling_of_ugc_carbon_sensor(self, resolve, reject, p
                     channels_stable_start[channel] = None
                     channels_data[channel] = []
 
+        elapsed_time = time.time() - start_time
+        if elapsed_time > max_timeout:
+            self.update_status_main_signal_gui_update.send(
+                f"{time_util.get_format_from_time(time.time())} | SPan量程标定 UGC稳定性检测失败：已运行{int(elapsed_time)}秒，超过{int(max_timeout)}秒仍未满足稳定条件，终止本阶段",
+                title=self.title,
+            )
+            reject(f"CO2 Span数据不稳定：{int(elapsed_time)}秒内未满足稳定条件")
+            return
+
         stable_count = sum(1 for ch in active_channels if channels_finish_state[ch])
         all_stable = stable_count == total_channels
 
@@ -1985,12 +2191,14 @@ def _patched_range_cyclic_sampling_of_ugc_carbon_sensor(self, resolve, reject, p
         f"{time_util.get_format_from_time(time.time())} | SPan量程标定 发送UGC span标定指令",
         title=self.title)
     def handle_result(result):
-        _log_ugc_calibration_command_result(
+        if not _log_ugc_calibration_command_result(
             self,
             result,
             command_name="UGC span标定指令",
             calibration_name="校span",
-        )
+        ):
+            reject("UGC Span标定指令响应不匹配")
+            return
         resolve()
 
     def handle_error(error):
@@ -2063,6 +2271,51 @@ def _patched_close_zos_zero_or_span_valve_v2(self, resolve, reject, port):
     _patched_force_close_zos_zero_or_span_valve_v2(self, resolve, reject, port)
 
 
+def _patched_fail_calibration_v2(self, error):
+    """Terminate a calibration worker and expose its runtime failure upstream."""
+    done_event = getattr(self, "calibration_done_event", None)
+    if done_event is None:
+        done_event = threading.Event()
+        self.calibration_done_event = done_event
+    if done_event.is_set():
+        return
+
+    if _is_calibration_stop_requested(self):
+        # Cancellation is an expected shutdown path, not a calibration
+        # failure.  Resolving the waiter without an error lets the stop-button
+        # path finish device shutdown without displaying a false failure.
+        self.calibration_error = None
+        self.set_calibration_running_state(False)
+        done_event.set()
+        try:
+            self.update_status_main_signal_gui_update.send(
+                f"{time_util.get_format_from_time(time.time())} | "
+                f"{self.name}已按实验停止请求取消，转入统一结束流程",
+                title=self.title,
+            )
+        except Exception as signal_error:
+            logger.error(f"发送校准取消日志失败: {signal_error}")
+        self.stop()
+        return
+
+    error_text = str(error).strip() if error is not None else "未知错误"
+    if not error_text:
+        error_text = "未知错误"
+    self.calibration_error = error_text
+    self.set_calibration_running_state(False)
+    message = (
+        f"{time_util.get_format_from_time(time.time())} | "
+        f"{self.name}失败：{error_text}；已终止当前标定，后续标定不再继续"
+    )
+    logger.error(message)
+    try:
+        self.update_status_main_signal_gui_update.send(message, title=self.title)
+    except Exception as signal_error:
+        logger.error(f"发送标定失败日志失败: {signal_error}")
+    done_event.set()
+    self.stop()
+
+
 def _patched_finish_calibration_core_v2(self, resolve, reject):
     self.set_calibration_running_state(False)
     self.update_status_main_signal_gui_update.send(
@@ -2089,6 +2342,10 @@ def _patched_finish_calibration_core_v2(self, resolve, reject):
             )
         case _:
             pass
+    self.calibration_error = None
+    done_event = getattr(self, "calibration_done_event", None)
+    if done_event is not None:
+        done_event.set()
     resolve()
 
 
@@ -2337,27 +2594,49 @@ def _patched_finalize_calibration_flow_v3(self, resolve, reject, port, stage_nam
     chained startup workflow.
     """
 
+    co2_only_stage = getattr(self, "co2_only_mode", False)
+
+    def close_after_ugc(_=None):
+        if co2_only_stage:
+            # The combined 1012 workflow keeps ZOS in calibration mode through
+            # CO2 zero, CO2 Span, O2 Span and Air. Air.stop() sends the one
+            # documented 0x0009-off command after the Air acquisition finishes.
+            self.defer_zos_close_until_finalize = False
+            return AsyPromise(
+                self.close_ufc_if_open_for_zero,
+                port=port,
+            ).then(
+                lambda __: AsyPromise(self.finish_calibration, port=port).then(
+                    lambda ___: resolve()
+                )
+            )
+
+        return AsyPromise(self.close_zos_zero_or_span_valve, port=port).then(
+            lambda __: AsyPromise(
+                self.close_ufc_if_open_for_zero,
+                port=port,
+            ).then(
+                lambda ___: AsyPromise(self.finish_calibration, port=port).then(
+                    lambda ____: resolve()
+                )
+            )
+        )
+
     def close_stage_valves(_=None):
         self.defer_zos_close_until_finalize = False
         AsyPromise(self.close_ugc_zero_or_span_valve, port=port).then(
-            lambda _: AsyPromise(self.close_zos_zero_or_span_valve, port=port).then(
-                lambda __: AsyPromise(
-                    self.close_ufc_if_open_for_zero,
-                    port=port,
-                ).then(
-                    lambda ___: AsyPromise(self.finish_calibration, port=port).then(
-                        lambda ____: resolve()
-                    ).catch(lambda e: reject(e))
-                ).catch(lambda e: reject(e))
-            ).catch(lambda e: reject(e))
+            close_after_ugc
         ).catch(lambda e: reject(e))
 
     if getattr(self, "keep_gas_path_open_after_calibration", False):
         self.update_status_main_signal_gui_update.send(
-            f"{time_util.get_format_from_time(time.time())} | {self.name}校准：{stage_name}完成，组合流程保留气泵和UFC，继续后续校准",
+            f"{time_util.get_format_from_time(time.time())} | {self.name}校准：{stage_name}完成，组合流程保留当前UGC气路、气泵和UFC，继续后续校准",
             title=self.title,
         )
-        close_stage_valves()
+        # In the chained 1012 workflow the next stage performs the gas switch:
+        # keep N2 after CO2 zero and keep Span after CO2 Span.  Run the remaining
+        # stage bookkeeping without closing the active UGC calibration valve.
+        close_after_ugc()
         return
 
     AsyPromise(self.close_gas_pump_and_flow_for_zero, port=port).then(
@@ -2383,10 +2662,6 @@ def _patched_span_finalize_flow_v3(self, resolve, reject, port):
 def _patched_zero_dosomething_v2(self):
     self.ufc_started_by_calibration = False
     self.defer_zos_close_until_finalize = True
-    self.update_status_main_signal_gui_update.send(
-        f"{time_util.get_format_from_time(time.time())} | 零点标定前关闭reference气电磁阀（空气阀）已临时跳过",
-        title=self.title
-    )
     if getattr(self, "co2_only_mode", False):
         calibration_config = global_setting.get_setting(
             "UFC_UGC_ZOS_config", {}
@@ -2395,49 +2670,51 @@ def _patched_zero_dosomething_v2(self):
             calibration_config.get("co2_zero_purge_time", 120)
         )
         self.update_status_main_signal_gui_update.send(
-            f"{time_util.get_format_from_time(time.time())} | 组合流程：执行旧CO2零点逻辑，跳过旧O2零点采样",
+            f"{time_util.get_format_from_time(time.time())} | 组合流程：CO2校零入口按1012关闭空气阀、关闭Span阀、打开N2阀；保持UFC和气泵运行",
             title=self.title,
         )
-        AsyPromise(self.open_ugc_zero_or_span_valve, port=self.port).then(
-            lambda _: AsyPromise(self.open_zos_zero_or_span_valve, port=self.port).then(
-                lambda __: AsyPromise(self.start_ufc_if_needed_for_zero, port=self.port).then(
-                    lambda ___: AsyPromise(self.open_gas_pump_and_flow_for_zero, port=self.port).then(
-                        lambda ____: AsyPromise(
-                            self.wait_one_minute_for_zero,
-                            step_desc="开启气泵后等待CO2校零气体置换",
-                            wait_seconds=co2_zero_purge_time,
-                        ).then(
-                            lambda _____: AsyPromise(
-                                self.cyclic_sampling_of_ugc_carbon_sensor, port=self.port
-                            ).then(
-                                lambda ______: AsyPromise(
-                                    self.zero_finalize_flow, port=self.port
-                                ).then(lambda _______: self.stop()).catch(lambda e: self.stop())
-                            ).catch(lambda e: self.stop())
-                        ).catch(lambda e: self.stop())
-                    ).catch(lambda e: self.stop())
-                ).catch(lambda e: self.stop())
-            ).catch(lambda e: self.stop())
-        ).catch(lambda e: self.stop())
+        AsyPromise(
+            lambda resolve, reject: _patched_prepare_co2_zero_gas_path_v2(
+                self, resolve, reject, self.port
+            )
+        ).then(
+            lambda _: AsyPromise(self.open_zos_zero_or_span_valve, port=self.port)
+        ).then(
+            lambda _: AsyPromise(self.start_ufc_if_needed_for_zero, port=self.port)
+        ).then(
+            lambda _: AsyPromise(self.open_gas_pump_and_flow_for_zero, port=self.port)
+        ).then(
+            lambda _: AsyPromise(
+                self.wait_one_minute_for_zero,
+                step_desc="开启气泵后等待CO2校零气体置换",
+                wait_seconds=co2_zero_purge_time,
+            )
+        ).then(
+            lambda _: AsyPromise(self.cyclic_sampling_of_ugc_carbon_sensor, port=self.port)
+        ).then(
+            lambda _: AsyPromise(self.zero_finalize_flow, port=self.port)
+        ).then(
+            lambda _: self.stop()
+        ).catch(self.fail_calibration)
         return
 
     AsyPromise(self.open_ugc_zero_or_span_valve, port=self.port).then(
-        lambda _: AsyPromise(self.open_zos_zero_or_span_valve, port=self.port).then(
-            lambda __: AsyPromise(self.start_ufc_if_needed_for_zero, port=self.port).then(
-                lambda ___: AsyPromise(self.open_gas_pump_and_flow_for_zero, port=self.port).then(
-                    lambda ____: AsyPromise(self.wait_one_minute_for_zero, step_desc="开启气泵后等待一分钟").then(
-                        lambda _____: AsyPromise(self.cyclic_sampling_of_zos_oxygen_sensor, port=self.port).then(
-                            lambda ______: AsyPromise(self.cyclic_sampling_of_ugc_carbon_sensor, port=self.port).then(
-                                lambda _______: AsyPromise(self.zero_finalize_flow, port=self.port).then(
-                                    lambda __________: self.stop()
-                                ).catch(lambda e: self.stop())
-                            ).catch(lambda e: self.stop())
-                        ).catch(lambda e: self.stop())
-                    ).catch(lambda e: self.stop())
-                ).catch(lambda e: self.stop())
-            ).catch(lambda e: self.stop())
-        ).catch(lambda e: self.stop())
-    ).catch(lambda e: self.stop())
+        lambda _: AsyPromise(self.open_zos_zero_or_span_valve, port=self.port)
+    ).then(
+        lambda _: AsyPromise(self.start_ufc_if_needed_for_zero, port=self.port)
+    ).then(
+        lambda _: AsyPromise(self.open_gas_pump_and_flow_for_zero, port=self.port)
+    ).then(
+        lambda _: AsyPromise(self.wait_one_minute_for_zero, step_desc="开启气泵后等待一分钟")
+    ).then(
+        lambda _: AsyPromise(self.cyclic_sampling_of_zos_oxygen_sensor, port=self.port)
+    ).then(
+        lambda _: AsyPromise(self.cyclic_sampling_of_ugc_carbon_sensor, port=self.port)
+    ).then(
+        lambda _: AsyPromise(self.zero_finalize_flow, port=self.port)
+    ).then(
+        lambda _: self.stop()
+    ).catch(self.fail_calibration)
 def _patched_range_dosomething_v2(self):
     self.ufc_started_by_calibration = False
     self.defer_zos_close_until_finalize = True
@@ -2452,65 +2729,55 @@ def _patched_range_dosomething_v2(self):
             f"{time_util.get_format_from_time(time.time())} | 组合流程：进入CO2 Span阶段，本阶段只执行CO2 Span",
             title=self.title,
         )
-        AsyPromise(self.open_ugc_zero_or_span_valve, port=self.port).then(
-            lambda _: AsyPromise(self.open_zos_zero_or_span_valve, port=self.port).then(
-                lambda __: AsyPromise(self.start_ufc_if_needed_for_zero, port=self.port).then(
-                    lambda ___: AsyPromise(self.open_gas_pump_and_flow_for_zero, port=self.port).then(
-                        # 1011文档顺序：先写入CO2标准气浓度，再等待Span气置换，
-                        # 最后采样并发送CO2 Span标定指令。
-                        lambda ____: AsyPromise(
-                            self.set_ugc_standard_gas_co2,
-                            port=self.port,
-                        ).then(
-                            lambda _____: AsyPromise(
-                                self.wait_one_minute_for_zero,
-                                step_desc="等待CO2 Span气体置换",
-                                wait_seconds=co2_span_purge_time,
-                            ).then(
-                                lambda ______: AsyPromise(
-                                    self.cyclic_sampling_of_ugc_carbon_sensor,
-                                    port=self.port,
-                                ).then(
-                                    lambda _______: AsyPromise(
-                                        self.span_finalize_flow,
-                                        port=self.port,
-                                    ).then(
-                                        lambda ________: self.stop()
-                                    ).catch(lambda e: self.stop())
-                                ).catch(lambda e: self.stop())
-                            ).catch(lambda e: self.stop())
-                        ).catch(lambda e: self.stop())
-                    ).catch(lambda e: self.stop())
-                ).catch(lambda e: self.stop())
-            ).catch(lambda e: self.stop())
-        ).catch(lambda e: self.stop())
+        # 1012: UGC Span on -> UGC Air off -> UGC N2 off.  Do not send the
+        # undocumented ZOS Span-coil command here; keep the prepared pump/UFC on.
+        AsyPromise(
+            lambda resolve, reject: _patched_prepare_co2_span_gas_path_v2(
+                self, resolve, reject, self.port
+            )
+        ).then(
+            lambda _: AsyPromise(self.set_ugc_standard_gas_co2, port=self.port)
+        ).then(
+            lambda _: AsyPromise(
+                self.wait_one_minute_for_zero,
+                step_desc="等待CO2 Span气体置换",
+                wait_seconds=co2_span_purge_time,
+            )
+        ).then(
+            lambda _: AsyPromise(self.cyclic_sampling_of_ugc_carbon_sensor, port=self.port)
+        ).then(
+            lambda _: AsyPromise(self.span_finalize_flow, port=self.port)
+        ).then(
+            lambda _: self.stop()
+        ).catch(self.fail_calibration)
         return
 
     AsyPromise(self.open_ugc_zero_or_span_valve, port=self.port).then(
-        lambda _: AsyPromise(self.open_zos_zero_or_span_valve, port=self.port).then(
-            lambda __: AsyPromise(self.start_ufc_if_needed_for_zero, port=self.port).then(
-                lambda ___: AsyPromise(self.open_gas_pump_and_flow_for_zero, port=self.port).then(
-                    lambda ____: AsyPromise(self.wait_one_minute_for_zero, step_desc="开启气泵后等待一分钟").then(
-                        lambda _____: AsyPromise(self.cyclic_sampling_of_zos_oxygen_sensor, port=self.port).then(
-                            lambda ______: AsyPromise(self.set_ugc_standard_gas_co2, port=self.port).then(
-                                lambda _______: AsyPromise(self.cyclic_sampling_of_ugc_carbon_sensor, port=self.port).then(
-                                    lambda __________: AsyPromise(self.span_finalize_flow, port=self.port).then(
-                                        lambda ___________: self.stop()
-                                    ).catch(lambda e: self.stop())
-                                ).catch(lambda e: self.stop())
-                            ).catch(lambda e: self.stop())
-                        ).catch(lambda e: self.stop())
-                    ).catch(lambda e: self.stop())
-                ).catch(lambda e: self.stop())
-            ).catch(lambda e: self.stop())
-        ).catch(lambda e: self.stop())
-    ).catch(lambda e: self.stop())
+        lambda _: AsyPromise(self.open_zos_zero_or_span_valve, port=self.port)
+    ).then(
+        lambda _: AsyPromise(self.start_ufc_if_needed_for_zero, port=self.port)
+    ).then(
+        lambda _: AsyPromise(self.open_gas_pump_and_flow_for_zero, port=self.port)
+    ).then(
+        lambda _: AsyPromise(self.wait_one_minute_for_zero, step_desc="开启气泵后等待一分钟")
+    ).then(
+        lambda _: AsyPromise(self.cyclic_sampling_of_zos_oxygen_sensor, port=self.port)
+    ).then(
+        lambda _: AsyPromise(self.set_ugc_standard_gas_co2, port=self.port)
+    ).then(
+        lambda _: AsyPromise(self.cyclic_sampling_of_ugc_carbon_sensor, port=self.port)
+    ).then(
+        lambda _: AsyPromise(self.span_finalize_flow, port=self.port)
+    ).then(
+        lambda _: self.stop()
+    ).catch(self.fail_calibration)
 
 
 Gas_Carlibration._normalize_co2_to_ppm = _patched_normalize_co2_to_ppm
 Gas_Carlibration._normalize_oxygen_percent = _patched_normalize_oxygen_percent
 Gas_Carlibration._read_zos_channel_snapshot = _patched_read_zos_channel_snapshot
 Gas_Carlibration._calculate_compensated_co2_ppm = _patched_calculate_compensated_co2_ppm
+Gas_Carlibration.fail_calibration = _patched_fail_calibration_v2
 Gas_Carlibration.finish_calibration = _patched_finish_calibration_v2
 Gas_Carlibration.close_ugc_zero_or_span_valve = _patched_close_ugc_zero_or_span_valve
 Gas_Carlibration.force_close_zos_zero_or_span_valve = _patched_force_close_zos_zero_or_span_valve_v2
