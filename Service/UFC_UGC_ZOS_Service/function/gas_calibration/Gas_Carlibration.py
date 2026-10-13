@@ -2161,15 +2161,22 @@ def _patched_open_gas_pump_and_flow_for_zero_v2(self, resolve, reject, port):
         reject("stop")
         return
 
+    is_co2_span_stage = (
+        getattr(self, "type", None) == Gas_Carlibration_Type.SPAN
+        and getattr(self, "co2_only_mode", False)
+    )
+
+    pump_command = "000A0000" if is_co2_span_stage else "000A00FF"
     self.send_message = {
         'port': port,
-        'data': number_util.set_int_to_4_bytes_list("000A00FF"),
+        'data': number_util.set_int_to_4_bytes_list(pump_command),
         'slave_id': '2',
         'function_code': '5',
         'timeout': 1
     }
     self.update_status_main_signal_gui_update.send(
-        f"{time_util.get_format_from_time(time.time())} | {self.name}校准：开启气泵及设定流量控制器",
+        f"{time_util.get_format_from_time(time.time())} | {self.name}校准："
+        f"{'CO2 Span专用反向' if is_co2_span_stage else ''}开启气泵及设定流量控制器",
         title=self.title
     )
     self.send_thread.send_message = self.send_message
@@ -2241,15 +2248,21 @@ def _patched_close_gas_pump_and_flow_for_zero_v2(self, resolve, reject, port):
         reject("stop")
         return
 
+    is_co2_span_stage = (
+        getattr(self, "type", None) == Gas_Carlibration_Type.SPAN
+        and getattr(self, "co2_only_mode", False)
+    )
+    pump_command = "000A00FF" if is_co2_span_stage else "000A0000"
     self.send_message = {
         'port': port,
-        'data': number_util.set_int_to_4_bytes_list("000A0000"),
+        'data': number_util.set_int_to_4_bytes_list(pump_command),
         'slave_id': '2',
         'function_code': '5',
         'timeout': 1
     }
     self.update_status_main_signal_gui_update.send(
-        f"{time_util.get_format_from_time(time.time())} | {self.name}校准：关闭气泵及设定流量控制器",
+        f"{time_util.get_format_from_time(time.time())} | {self.name}校准："
+        f"{'CO2 Span专用反向' if is_co2_span_stage else ''}关闭气泵及设定流量控制器",
         title=self.title
     )
     self.send_thread.send_message = self.send_message

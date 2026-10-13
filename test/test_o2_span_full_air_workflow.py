@@ -13,6 +13,9 @@ from Service.UFC_UGC_ZOS_Service.function.startup_air_calibration.Startup_Air_Ca
     Startup_Air_Calibration,
 )
 from Service.UFC_UGC_ZOS_Service.function.gas_calibration.Gas_Carlibration import (
+    Gas_Carlibration_Type,
+    _patched_close_gas_pump_and_flow_for_zero_v2,
+    _patched_open_gas_pump_and_flow_for_zero_v2,
     _patched_wait_one_minute_for_zero_v2,
 )
 from Service.UFC_UGC_ZOS_Service.function.gas_path_system.Gas_path_system import (
@@ -84,6 +87,55 @@ class O2SpanFullAirWorkflowTests(unittest.TestCase):
         self.assertIn('number_util.set_int_to_4_bytes_list("00000000")', close_air)
         ufc_close = inspect.getsource(UFC_gas_path_system_close_thread.close_UFC_valve)
         self.assertLess(ufc_close.index("before_close_ufc"), ufc_close.index("_send_close_ufc_command"))
+
+    def test_co2_span_uses_reversed_pump_commands_only(self):
+        calls = []
+
+        class _Signal:
+            @staticmethod
+            def send(*args, **kwargs):
+                calls.append((args, kwargs))
+
+        class _SendThread:
+            def __init__(self):
+                self.sent = []
+
+            def Send(self, resolve, reject):
+                self.sent.append("".join(self.send_message["data"]).upper())
+                resolve({"send_state": True})
+
+        service = SimpleNamespace(
+            is_STOP=False,
+            type=Gas_Carlibration_Type.SPAN,
+            co2_only_mode=True,
+            name="Range Calibration thread",
+            title="span",
+            update_status_main_signal_gui_update=_Signal(),
+            send_thread=_SendThread(),
+        )
+        global_setting.set_setting("air_pump_start_time_state", False)
+        opened = []
+        closed = []
+        try:
+            _patched_open_gas_pump_and_flow_for_zero_v2(
+                service,
+                lambda: opened.append(True),
+                self.fail,
+                "COM1",
+            )
+            _patched_close_gas_pump_and_flow_for_zero_v2(
+                service,
+                lambda: closed.append(True),
+                self.fail,
+                "COM1",
+            )
+        finally:
+            global_setting.set_setting("air_pump_start_time_state", False)
+
+        self.assertEqual([True], opened)
+        self.assertEqual([True], closed)
+        self.assertEqual(["000A0000", "000A00FF"], service.send_thread.sent)
+        self.assertTrue(any("CO2 Span专用反向" in call[0][0] for call in calls))
 
     def test_air_button_routes_by_experiment_state(self):
         source = inspect.getsource(ExperimentControlPage._start_air_calibration)
