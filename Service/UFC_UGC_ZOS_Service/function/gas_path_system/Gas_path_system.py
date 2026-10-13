@@ -1728,14 +1728,36 @@ class ZOS_gas_path_system(Gas_path_system):
         time.sleep(0.01)
         self.update_status_main_signal_gui_update.send(f"{time_util.get_format_from_time(time.time())} | ZOS 正在启动")
         self.zos_gas_path_system_run_thread.reset_wet_o2_anomaly_guard("ZOS启动/状态切换")
-        # 1.上电启动气路
+        # 文档A-1：校准前先明确切到抽鼠笼状态，不能只更新软件状态。
         port = global_setting.get_setting("port", None)
         if port is None:
             self.update_status_main_signal_gui_update.send(
                 f"{time_util.get_format_from_time(time.time())} | 启动失败，未选择串口！")
-            reject()
-        AsyPromise(self.start_success).then(lambda r: resolve()
-        ).catch(lambda e: logger.error(f"{e}"))
+            reject("未选择串口，无法将ZOS切到抽鼠笼状态")
+            return
+        self.is_stop = False
+        self.send_message = {
+            'port': port,
+            'data': number_util.set_int_to_4_bytes_list("00090000"),
+            'slave_id': '4',
+            'function_code': '5',
+            'timeout': 1,
+        }
+        self.send_thread.send_message = self.send_message
+        self.update_status_main_signal_gui_update.send(
+            f"{time_util.get_format_from_time(time.time())} | ZOS启动-1.切换为抽鼠笼采样状态"
+        )
+
+        def require_cage_switch_success(result):
+            if not isinstance(result, dict) or not result.get("send_state", False):
+                raise RuntimeError("ZOS切换抽鼠笼指令未获得有效响应")
+            return result
+
+        AsyPromise(self.send_thread.Send).then(
+            require_cage_switch_success
+        ).then(
+            lambda _: AsyPromise(self.start_success)
+        ).then(lambda _: resolve()).catch(reject)
 
         pass
     """start end"""

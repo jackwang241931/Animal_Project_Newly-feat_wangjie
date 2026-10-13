@@ -13,6 +13,9 @@ from Service.UFC_UGC_ZOS_Service.function.startup_air_calibration.Startup_Air_Ca
     Startup_Air_Calibration,
 )
 from Service.UFC_UGC_ZOS_Service.function.gas_calibration.Gas_Carlibration import (
+    _patched_open_gas_pump_and_flow_for_zero_v2,
+    _patched_range_dosomething_v2,
+    _patched_start_ufc_if_needed_for_zero_v2,
     _patched_wait_one_minute_for_zero_v2,
 )
 from Service.UFC_UGC_ZOS_Service.function.gas_path_system.Gas_path_system import (
@@ -80,6 +83,8 @@ class O2SpanFullAirWorkflowTests(unittest.TestCase):
 
         zos_stop = inspect.getsource(ZOS_gas_path_system.stop)
         self.assertIn('number_util.set_int_to_4_bytes_list("00090000")', zos_stop)
+        zos_start = inspect.getsource(ZOS_gas_path_system.start)
+        self.assertIn('number_util.set_int_to_4_bytes_list("00090000")', zos_start)
         close_air = inspect.getsource(UGC_gas_path_system.close_air_valve_for_shutdown)
         self.assertIn('number_util.set_int_to_4_bytes_list("00000000")', close_air)
         ufc_close = inspect.getsource(UFC_gas_path_system_close_thread.close_UFC_valve)
@@ -232,6 +237,8 @@ class O2SpanFullAirWorkflowTests(unittest.TestCase):
             UFC_UGC_ZOS_index.start_btn_handle_with_o2_span_air_calibration
         )
         expected_order = (
+            "UFC_gas_state_check_obj.read_start_status",
+            "co2_zero_calibration_obj_calibrate_wrapped",
             "co2_span_calibration_obj_calibrate_wrapped",
             "run_span_only_keep_span",
             "_handoff_o2_span_handler_to_full_air",
@@ -322,8 +329,10 @@ class O2SpanFullAirWorkflowTests(unittest.TestCase):
             update_status_main_signal_gui_update=_Signal(),
             _prepare_new_start=lambda: None,
             _prepare_startup_calibration_cages=lambda: calls.append("prepare"),
-            _co2_zero_then_read_ufc_start_status=step(
-                "co2_zero", {"ufc_status": 0, "air_pump": 0}
+            UFC_gas_state_check_obj=SimpleNamespace(
+                read_start_status=step(
+                    "read_status", {"ufc_status": 0, "air_pump": 0}
+                )
             ),
             _remember_ufc_start_status=lambda status: (
                 calls.append("remember_status") or status
@@ -338,6 +347,7 @@ class O2SpanFullAirWorkflowTests(unittest.TestCase):
                     service, value
                 )
             ),
+            co2_zero_calibration_obj_calibrate_wrapped=step("co2_zero"),
             co2_span_calibration_obj_calibrate_wrapped=step("co2_span"),
             finish_start=step("finish_start"),
             _reject_o2_span_air_start=lambda error: AsyPromise.reject_immediately(error),
@@ -353,11 +363,12 @@ class O2SpanFullAirWorkflowTests(unittest.TestCase):
             [
                 "prepare",
                 "log",
-                "co2_zero",
+                "read_status",
                 "remember_status",
-                "ugc_start",
                 "zos_start",
+                "ugc_start",
                 "ufc_start",
+                "co2_zero",
                 "co2_span",
                 "o2_span",
                 "handoff",
@@ -395,6 +406,49 @@ class O2SpanFullAirWorkflowTests(unittest.TestCase):
         self.assertEqual([True], observed)
         self.assertEqual([True], resolved)
         self.assertFalse(range_worker.co2_only_mode)
+
+    def test_prepared_combined_calibration_does_not_repeat_ufc_or_pump_start(self):
+        calls = []
+
+        class _Signal:
+            @staticmethod
+            def send(*args, **kwargs):
+                calls.append("log")
+
+        worker = SimpleNamespace(
+            gas_path_prepared_before_calibration=True,
+            ufc_started_by_calibration=True,
+            update_status_main_signal_gui_update=_Signal(),
+            name="CO2",
+            title="calibration",
+            is_STOP=False,
+        )
+
+        _patched_start_ufc_if_needed_for_zero_v2(
+            worker,
+            lambda: calls.append("ufc_kept"),
+            self.fail,
+            "COM3",
+        )
+        _patched_open_gas_pump_and_flow_for_zero_v2(
+            worker,
+            lambda: calls.append("pump_kept"),
+            self.fail,
+            "COM3",
+        )
+
+        self.assertEqual(["log", "ufc_kept", "log", "pump_kept"], calls)
+        self.assertFalse(worker.ufc_started_by_calibration)
+
+    def test_co2_span_writes_standard_value_before_purge_wait(self):
+        source = inspect.getsource(_patched_range_dosomething_v2)
+        co2_only_branch = source.split("if getattr(self, \"co2_only_mode\", False):", 1)[1]
+        co2_only_branch = co2_only_branch.split("    AsyPromise(self.open_ugc_zero_or_span_valve", 2)[1]
+
+        self.assertLess(
+            co2_only_branch.index("set_ugc_standard_gas_co2"),
+            co2_only_branch.index('step_desc="等待CO2 Span气体置换"'),
+        )
 
     def test_combined_startup_chain_handles_synchronous_callback_steps(self):
         calls = []
@@ -466,8 +520,8 @@ class O2SpanFullAirWorkflowTests(unittest.TestCase):
                 "log",
                 "read_status",
                 "remember_status",
-                "ugc_start",
                 "zos_start",
+                "ugc_start",
                 "ufc_start",
                 "span",
                 "handoff",

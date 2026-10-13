@@ -361,6 +361,7 @@ class UFC_UGC_ZOS_index(MyQThread):
             if worker is not None:
                 worker.co2_only_mode = False
                 worker.keep_gas_path_open_after_calibration = False
+                worker.gas_path_prepared_before_calibration = False
 
     def start_btn_handle_with_calibration(self):
         """先按流程完成调零+调span，再重新启动正常实验气路"""
@@ -443,12 +444,17 @@ class UFC_UGC_ZOS_index(MyQThread):
         previous_keep_gas_path = getattr(
             worker, "keep_gas_path_open_after_calibration", False
         )
+        previous_gas_path_prepared = getattr(
+            worker, "gas_path_prepared_before_calibration", False
+        )
         worker.co2_only_mode = True
         worker.keep_gas_path_open_after_calibration = True
+        worker.gas_path_prepared_before_calibration = True
 
         def restore_worker_flags():
             worker.co2_only_mode = previous_co2_only_mode
             worker.keep_gas_path_open_after_calibration = previous_keep_gas_path
+            worker.gas_path_prepared_before_calibration = previous_gas_path_prepared
 
         def on_resolve(*args):
             restore_worker_flags()
@@ -471,12 +477,17 @@ class UFC_UGC_ZOS_index(MyQThread):
         previous_keep_gas_path = getattr(
             worker, "keep_gas_path_open_after_calibration", False
         )
+        previous_gas_path_prepared = getattr(
+            worker, "gas_path_prepared_before_calibration", False
+        )
         worker.co2_only_mode = True
         worker.keep_gas_path_open_after_calibration = True
+        worker.gas_path_prepared_before_calibration = True
 
         def restore_worker_flags():
             worker.co2_only_mode = previous_co2_only_mode
             worker.keep_gas_path_open_after_calibration = previous_keep_gas_path
+            worker.gas_path_prepared_before_calibration = previous_gas_path_prepared
 
         def on_resolve(*args):
             restore_worker_flags()
@@ -536,28 +547,34 @@ class UFC_UGC_ZOS_index(MyQThread):
         self._prepare_startup_calibration_cages()
         if include_co2_zero:
             self.update_status_main_signal_gui_update.send(
-                f"{time_util.get_format_from_time(time.time())} | 启动完整空气校准：CO₂校零 → CO₂ Span → O₂ Span → O₂/CO₂ Air同时采集",
+                f"{time_util.get_format_from_time(time.time())} | 启动完整空气校准：前置气路准备 → CO₂校零 → CO₂ Span → O₂ Span → O₂/CO₂ Air同时采集",
                 title=GapSystem_Running_Type.STARTUP_AIR_CALIBRATION,
             )
-            chain = AsyPromise(self._co2_zero_then_read_ufc_start_status)
         else:
             self.update_status_main_signal_gui_update.send(
                 f"{time_util.get_format_from_time(time.time())} | 启动O₂ Span和空气校准：正在按顺序启动气路",
                 title=GapSystem_Running_Type.STARTUP_AIR_CALIBRATION,
             )
-            chain = AsyPromise(self.UFC_gas_state_check_obj.read_start_status)
+
+        # 文档A段只执行一次：先读取UFC/气泵状态，再打开空气气路、
+        # 初始化ZOS、配置九路流量并按需开启UFC和气泵。完整校准必须在
+        # 这套前置气路准备完成后才进入CO2零点，不能在零点结束后重启气路。
+        chain = AsyPromise(self.UFC_gas_state_check_obj.read_start_status)
 
         chain = (
             chain
             .then(self._remember_ufc_start_status)
-            .then(lambda _: AsyPromise(self.UGC_gas_path_system_obj.start))
             .then(lambda _: AsyPromise(self.ZOS_gas_path_system_obj.start))
+            .then(lambda _: AsyPromise(self.UGC_gas_path_system_obj.start))
             .then(lambda _: AsyPromise(self.UFC_gas_path_system_obj.start))
         )
 
         if include_co2_zero:
             chain = (
                 chain
+                .then(lambda _: AsyPromise(
+                    self.co2_zero_calibration_obj_calibrate_wrapped
+                ))
                 .then(lambda _: AsyPromise(
                     self.co2_span_calibration_obj_calibrate_wrapped
                 ))

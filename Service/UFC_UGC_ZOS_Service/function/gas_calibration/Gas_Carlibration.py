@@ -2117,6 +2117,15 @@ def _patched_is_ufc_started_for_zero_v2(self):
 
 
 def _patched_start_ufc_if_needed_for_zero_v2(self, resolve, reject, port):
+    if getattr(self, "gas_path_prepared_before_calibration", False):
+        self.ufc_started_by_calibration = False
+        self.update_status_main_signal_gui_update.send(
+            f"{time_util.get_format_from_time(time.time())} | {self.name}校准：前置气路已完成，保持UFC当前状态，不重复发送启动指令",
+            title=self.title,
+        )
+        resolve()
+        return
+
     if self.is_STOP:
         reject("stop")
         return
@@ -2157,6 +2166,14 @@ def _patched_start_ufc_if_needed_for_zero_v2(self, resolve, reject, port):
 
 
 def _patched_open_gas_pump_and_flow_for_zero_v2(self, resolve, reject, port):
+    if getattr(self, "gas_path_prepared_before_calibration", False):
+        self.update_status_main_signal_gui_update.send(
+            f"{time_util.get_format_from_time(time.time())} | {self.name}校准：前置气路已完成，保持气泵和流量控制器运行，不重复发送开泵指令",
+            title=self.title,
+        )
+        resolve()
+        return
+
     if self.is_STOP:
         reject("stop")
         return
@@ -2439,14 +2456,16 @@ def _patched_range_dosomething_v2(self):
             lambda _: AsyPromise(self.open_zos_zero_or_span_valve, port=self.port).then(
                 lambda __: AsyPromise(self.start_ufc_if_needed_for_zero, port=self.port).then(
                     lambda ___: AsyPromise(self.open_gas_pump_and_flow_for_zero, port=self.port).then(
+                        # 1011文档顺序：先写入CO2标准气浓度，再等待Span气置换，
+                        # 最后采样并发送CO2 Span标定指令。
                         lambda ____: AsyPromise(
-                            self.wait_one_minute_for_zero,
-                            step_desc="开启气泵后等待CO2 Span气体置换",
-                            wait_seconds=co2_span_purge_time,
+                            self.set_ugc_standard_gas_co2,
+                            port=self.port,
                         ).then(
                             lambda _____: AsyPromise(
-                                self.set_ugc_standard_gas_co2,
-                                port=self.port,
+                                self.wait_one_minute_for_zero,
+                                step_desc="等待CO2 Span气体置换",
+                                wait_seconds=co2_span_purge_time,
                             ).then(
                                 lambda ______: AsyPromise(
                                     self.cyclic_sampling_of_ugc_carbon_sensor,
