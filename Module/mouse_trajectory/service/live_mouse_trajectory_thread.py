@@ -2838,6 +2838,8 @@ class MouseTrajectoryThread(MyQThread):
                 "frame_name": image_file.name,
                 "frame_id": frame_id,
                 "status": status,
+                "coordinateMode": self.coordinate_mode,
+                "zAvailable": not self._is_e2_xy_mode(),
                 "plot_paths": plot_paths_for_emit or plot_paths,
                 "plot_title": plot_title_for_emit,
                 "plot_revision": plot_revision_for_emit,

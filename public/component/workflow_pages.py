@@ -16,6 +16,7 @@ import time
 import uuid
 import csv
 import tempfile
+from configparser import ConfigParser
 from itertools import chain, zip_longest
 from contextlib import closing
 from datetime import datetime
@@ -1809,7 +1810,12 @@ class TrajectoryCanvas(QWidget):
     VIEW_ELEVATION_DEG = 28.0
 
     def __init__(self, parent=None):
-        super().__init__(parent); self.points: list[tuple[float, float, float]] = []; self.segments: list[list[tuple[float, float, float]]] = []; self.heatmap: list[tuple[float, float, int]] = []; self.mode = "trajectory"; self.setMinimumHeight(260)
+        super().__init__(parent); self.points: list[tuple[float, float, float]] = []; self.segments: list[list[tuple[float, float, float]]] = []; self.heatmap: list[tuple[float, float, int]] = []; self.mode = "trajectory"; self.coordinate_mode = "legacy_xyz"; self.setMinimumHeight(260)
+
+    def set_coordinate_mode(self, mode: str) -> None:
+        normalized = str(mode or "legacy_xyz").strip().lower()
+        self.coordinate_mode = normalized if normalized in {"legacy_xyz", "e2_xy"} else "legacy_xyz"
+        self.update()
 
     def set_points(self, points: Iterable[tuple[float, float, float]]) -> None:
         self.points = list(points); self.segments = [list(self.points)] if self.points else []; self.mode = "trajectory"; self.update()
@@ -1830,7 +1836,12 @@ class TrajectoryCanvas(QWidget):
                 segments.append(current)
                 current = []
             try:
-                parsed = (float(point[0]), float(point[1]), float(point[2]))
+                values = (float(point[0]), float(point[1]), float(point[2]))
+                parsed = (
+                    _PhysicalMillimeterPoint(*values)
+                    if isinstance(point, _PhysicalMillimeterPoint)
+                    else values
+                )
             except (TypeError, ValueError, IndexError):
                 if current:
                     segments.append(current)
@@ -3048,6 +3059,7 @@ class MachineVisionPage(_BaseWorkflowPage):
 
     def __init__(self, context_provider: Any = None, health_source: Any = None, parent=None):
         self.selected_channel = 1
+        self.trajectory_coordinate_mode = self._configured_trajectory_coordinate_mode()
         self._coord3d_config_window = None
         self._last_frame_id = None
         self._last_frame_size: tuple[int, int] = (0, 0)
@@ -3278,6 +3290,16 @@ class MachineVisionPage(_BaseWorkflowPage):
             return
         if channel <= 0:
             return
+        result_mode = str(
+            result.get("coordinateMode")
+            or result.get("coordinate_mode")
+            or self.trajectory_coordinate_mode
+        ).strip().lower()
+        if (
+            result_mode in {"legacy_xyz", "e2_xy"}
+            and result_mode != self.trajectory_coordinate_mode
+        ):
+            self._apply_trajectory_coordinate_mode(result_mode)
         corners = self._normalize_detected_cage_points(result.get("corners"))
         if corners:
             # Match legacy Tab4: retain the latest valid frame and reuse it
@@ -3299,17 +3321,10 @@ class MachineVisionPage(_BaseWorkflowPage):
         if frame_id > 0:
             self._live_trajectory_frame_ids[channel] = frame_id
         samples = self._live_trajectory_samples.setdefault(channel, [])
-        solved = result.get("solved")
-        point = None
-        if isinstance(solved, Mapping):
-            try:
-                x = _number(solved.get("X"))
-                y = _number(solved.get("Y"))
-                z = _number(solved.get("Z_total", solved.get("Z")))
-                if x is not None and y is not None and z is not None:
-                    point = (float(x), float(y), float(z))
-            except (TypeError, ValueError):
-                point = None
+        point = self._trajectory_point_from_result(
+            result,
+            fallback_mode=self.trajectory_coordinate_mode,
+        )
         if point is None:
             if samples and samples[-1] is not None:
                 samples.append(None)
@@ -3343,6 +3358,74 @@ class MachineVisionPage(_BaseWorkflowPage):
             self._infrared_loader_thread = None
             logger.exception("启动旧版红外图像加载线程失败: %s", exc)
             self._clear_infrared_display("红外相机未提供新图像")
+
+    @staticmethod
+    def _trajectory_point_from_result(
+        result: Mapping[str, Any],
+        fallback_mode: str = "legacy_xyz",
+    ) -> Optional[tuple[float, float, float]]:
+        solved = result.get("solved")
+        if not isinstance(solved, Mapping):
+            return None
+        mode = str(
+            result.get("coordinateMode")
+            or result.get("coordinate_mode")
+            or fallback_mode
+            or "legacy_xyz"
+        ).strip().lower()
+        if mode not in {"legacy_xyz", "e2_xy"}:
+            mode = "legacy_xyz"
+        try:
+            x = _number(solved.get("X"))
+            y = _number(solved.get("Y"))
+            if x is None or y is None:
+                return None
+            z = _number(solved.get("Z_total", solved.get("Z")))
+            if mode == "e2_xy":
+                # E2 is trained for physical X/Y millimetres only. Z=0 is a
+                # display-plane coordinate, not a model prediction.
+                return _PhysicalMillimeterPoint(float(x), float(y), 0.0)
+            if z is None:
+                return None
+            return (float(x), float(y), float(z))
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _configured_trajectory_coordinate_mode() -> str:
+        camera_config = global_setting.get_setting("camera_config", {}) or {}
+        trajectory_config = (
+            camera_config.get("MOUSE_TRAJECTORY", {})
+            if isinstance(camera_config, Mapping)
+            else {}
+        )
+        if not trajectory_config:
+            parser = ConfigParser()
+            parser.read(resolve_project_path("config/camera_config.ini"), encoding="utf-8")
+            if parser.has_section("MOUSE_TRAJECTORY"):
+                trajectory_config = dict(parser["MOUSE_TRAJECTORY"])
+        mode = str(
+            trajectory_config.get("trajectory_coordinate_mode", "legacy_xyz")
+            or "legacy_xyz"
+        ).strip().lower()
+        return mode if mode in {"legacy_xyz", "e2_xy"} else "legacy_xyz"
+
+    def _apply_trajectory_coordinate_mode(self, mode: str) -> None:
+        normalized = str(mode or "legacy_xyz").strip().lower()
+        if normalized not in {"legacy_xyz", "e2_xy"}:
+            normalized = "legacy_xyz"
+        self.trajectory_coordinate_mode = normalized
+        is_xy = normalized == "e2_xy"
+        if hasattr(self, "trajectory_canvas"):
+            self.trajectory_canvas.set_coordinate_mode(normalized)
+        if hasattr(self, "trajectory_title_label"):
+            self.trajectory_title_label.setText("笼内三维行动轨迹")
+        if hasattr(self, "trajectory_detail_label"):
+            self.trajectory_detail_label.setText(
+                "实时更新 XY 轨迹；保留 Z 轴，当前轨迹绘制在 Z=0 底面"
+                if is_xy
+                else "实时更新轨迹数据；轨迹使用实时 XYZ 数据"
+            )
 
     @staticmethod
     def _configured_display_max_age_seconds() -> float:
@@ -3449,7 +3532,13 @@ class MachineVisionPage(_BaseWorkflowPage):
 
     def _build_ui(self) -> None:
         _scroll, layout = self._canvas()
-        self._header(layout, "MACHINE VISION", "机器视觉 · 双模成像（逐通道）", "左侧显示重要信息与红外证据，中间显示轨迹相机画面，右侧只显示笼内 3D 轨迹。")
+        is_xy = self.trajectory_coordinate_mode == "e2_xy"
+        self._header(
+            layout,
+            "MACHINE VISION",
+            "机器视觉 · 双模成像（逐通道）",
+            "左侧显示重要信息与红外证据，中间显示轨迹相机画面，右侧显示笼内 3D 轨迹画布。",
+        )
         channels = QHBoxLayout(); self.channel_buttons = []
         self.channel_group = QButtonGroup(self); self.channel_group.setExclusive(True)
         for channel in range(1, 9):
@@ -3519,10 +3608,16 @@ class MachineVisionPage(_BaseWorkflowPage):
         infrared_card.setMinimumHeight(350)
         infrared_card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         infrared_layout = infrared_card.layout(); self.infrared_label = QLabel("红外相机未提供新图像"); self.infrared_label.setAlignment(Qt.AlignmentFlag.AlignCenter); self.infrared_label.setMinimumSize(360, 280); self.infrared_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding); infrared_layout.addWidget(self.infrared_label, 1)
-        trajectory_card, _, _ = self._card("笼内三维行动轨迹", "", "实时更新轨迹数据；轨迹使用实时 XYZ 数据")
+        trajectory_card, _, self.trajectory_detail_label = self._card(
+            "笼内三维行动轨迹",
+            "",
+            "实时更新 XY 轨迹；保留 Z 轴，当前轨迹绘制在 Z=0 底面"
+            if is_xy
+            else "实时更新轨迹数据；轨迹使用实时 XYZ 数据",
+        )
         trajectory_card.setMinimumHeight(620)
         trajectory_card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        trajectory_layout = trajectory_card.layout(); self.trajectory_canvas = TrajectoryCanvas(); self.trajectory_canvas.setMinimumSize(460, 540); self.trajectory_canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding); trajectory_layout.addWidget(self.trajectory_canvas, 1)
+        trajectory_layout = trajectory_card.layout(); self.trajectory_title_label = trajectory_layout.itemAt(0).widget(); self.trajectory_canvas = TrajectoryCanvas(); self.trajectory_canvas.set_coordinate_mode(self.trajectory_coordinate_mode); self.trajectory_canvas.setMinimumSize(460, 540); self.trajectory_canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding); trajectory_layout.addWidget(self.trajectory_canvas, 1)
         grid.addWidget(info_card, 0, 0); grid.addWidget(frame_card, 0, 1, 2, 1); grid.addWidget(trajectory_card, 0, 2, 2, 1); grid.addWidget(infrared_card, 1, 0)
         layout.addLayout(grid)
 
