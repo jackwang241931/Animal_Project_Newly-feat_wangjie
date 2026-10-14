@@ -12,6 +12,9 @@ from index.MainWindow_index import _calculate_o2_span_full_air_wait_seconds
 from Service.UFC_UGC_ZOS_Service.function.startup_air_calibration.Startup_Air_Calibration import (
     Startup_Air_Calibration,
 )
+from Service.UFC_UGC_ZOS_Service.function.co2_compensation.startup_co2_air_calibration import (
+    Startup_CO2_Air_Calibration,
+)
 from Service.UFC_UGC_ZOS_Service.function.startup_air_calibration.Startup_O2_Span_Air_Calibration import (
     Startup_O2_Span_Air_Calibration,
 )
@@ -379,6 +382,16 @@ class O2SpanFullAirWorkflowTests(unittest.TestCase):
 
         self.assertIn('sht_temp=snapshot.get("sht_temp")', source)
         self.assertIn('sht_rh=snapshot.get("sht_rh")', source)
+
+    def test_air_co2_log_contains_raw_pressure_and_compensated_values(self):
+        for source in (
+            inspect.getsource(Startup_Air_Calibration.run),
+            inspect.getsource(Startup_CO2_Air_Calibration.run),
+        ):
+            self.assertIn("原始值=", source)
+            self.assertIn("ZOS气压=", source)
+            self.assertIn("气压补偿后=", source)
+            self.assertIn("校准采样和拟合使用气压补偿后数值", source)
 
     def test_air_formal_polling_puts_reference_channel_first(self):
         self.assertEqual(

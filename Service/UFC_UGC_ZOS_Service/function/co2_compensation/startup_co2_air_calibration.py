@@ -282,6 +282,13 @@ class Startup_CO2_Air_Calibration:
                 if compensated_co2 is None:
                     continue
 
+                self._send_text(
+                    f"{self.name} {self._channel_to_display_name(channel)} CO2采样："
+                    f"原始值={ugc_snapshot.get('raw_co2_ppm')}ppm，"
+                    f"ZOS气压={zos_snapshot.get('pressure')}KPa，"
+                    f"气压补偿后={compensated_co2}ppm；"
+                    "校准采样和拟合使用气压补偿后数值"
+                )
                 self.push_calibration_values_to_ui(
                     carbon_value=compensated_co2,
                     oxygen_pressure_value=zos_snapshot.get("pressure"),

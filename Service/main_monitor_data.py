@@ -2973,7 +2973,8 @@ def barrier_action():
         'ZOS_dry_basis_oxygen_num': results.get(
             f'ZOS_monitor_data_cage_{mouse_cage_number}__dry_basis_oxygen_num'
         ),
-        'UGC_CO2_num': co2_num,
+        # VCO2 的当前笼出口 CO2 使用 Air 校准后的拟合值。
+        'UGC_CO2_num': fitted_co2_num,
     })
     for column_name, description in METABOLISM_COLUMNS:
         store_Datas.append({'desc': description, 'value': metabolism_values[column_name]})

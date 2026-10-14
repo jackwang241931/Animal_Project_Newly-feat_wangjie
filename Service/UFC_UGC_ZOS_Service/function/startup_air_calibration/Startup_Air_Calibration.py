@@ -558,6 +558,13 @@ class Startup_Air_Calibration:
                         snapshot.get("gas_pressure"),
                     )
                     if compensated_co2 is not None:
+                        self._send_text(
+                            f"{self.name} {display_name} CO2采样："
+                            f"原始值={co2_snapshot.get('raw_co2_ppm')}ppm，"
+                            f"ZOS气压={snapshot.get('gas_pressure')}KPa，"
+                            f"气压补偿后={compensated_co2}ppm；"
+                            "校准采样和拟合使用气压补偿后数值"
+                        )
                         self.push_calibration_values_to_ui(
                             carbon_value=compensated_co2,
                             oxygen_pressure_value=snapshot["gas_pressure"],
