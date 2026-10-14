@@ -7,6 +7,7 @@ import threading
 import time
 import traceback
 from collections import deque
+from configparser import ConfigParser
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
@@ -24,6 +25,8 @@ from Module.mouse_trajectory.paths import (
     DEFAULT_IMAGE_REGISTRATION_JSON_PATH,
     DEFAULT_INSTRUMENT_AREA_JSON_PATH,
     DEFAULT_MOUSE_MODEL_PATH,
+    DEFAULT_XY_MODEL_PATH,
+    DEFAULT_XY_MOUSE_MODEL_PATH,
     DEFAULT_REFERENCE_IMAGE_PATH,
     EXPORT_DIR,
     PROJECT_ROOT,
@@ -34,6 +37,7 @@ from Module.mouse_trajectory.paths import (
     get_cage_export_dir,
     get_cage_plots_dir,
 )
+from Module.mouse_trajectory.service.e2_xy_predictor import E2XYPredictor
 from Module.mouse_trajectory.trajectory_tuning import (
     DEFAULT_TRAJECTORY_TUNING,
     TrajectoryTemporalStabilizer,
@@ -184,6 +188,13 @@ class MouseTrajectoryThread(MyQThread):
         self.instrument_area_json_path = DEFAULT_INSTRUMENT_AREA_JSON_PATH
         self.box_model_path = DEFAULT_BOX_MODEL_PATH
         self.mouse_model_path = DEFAULT_MOUSE_MODEL_PATH
+        self.xy_model_path = DEFAULT_XY_MODEL_PATH
+        self.xy_mouse_model_path = DEFAULT_XY_MOUSE_MODEL_PATH
+        self.coordinate_mode = "legacy_xyz"
+        self.xy_device = "auto"
+        self.xy_imgsz = 640
+        self.xy_batch_size = 8
+        self.xy_conf_mouse = 0.25
 
         self.conf_box = 0.4
         self.conf_mouse = float(self.runtime_tuning["mouse_confidence"])
@@ -245,12 +256,16 @@ class MouseTrajectoryThread(MyQThread):
         self.instrument_polygon_phys = None
         self.box_model: YOLO | None = None
         self.mouse_model: YOLO | None = None
+        self.xy_predictor: E2XYPredictor | None = None
         self.ref_corners: BoxCorners | None = None
         self.last_cleanup_time = time.time()
 
     @staticmethod
     def _build_model(model_path: Path | str, task: str) -> YOLO:
         return YOLO(str(model_path), task=task)
+
+    def _is_e2_xy_mode(self) -> bool:
+        return self.coordinate_mode == "e2_xy"
 
     def _apply_tuning_to_solver(self) -> None:
         solver = self.solver
@@ -1005,7 +1020,12 @@ class MouseTrajectoryThread(MyQThread):
         frame_items: list[tuple[int, dict[str, Any]]] = []
         try:
             self._schedule_history_cleanup_if_needed()
-            frame_items = self._pop_pending_frames(self.batch_size)
+            active_batch_size = (
+                self.xy_batch_size
+                if self._is_e2_xy_mode()
+                else self.batch_size
+            )
+            frame_items = self._pop_pending_frames(active_batch_size)
             if not frame_items:
                 if self.finish_after_drain:
                     self.finalize_outputs()
@@ -1059,6 +1079,69 @@ class MouseTrajectoryThread(MyQThread):
             trajectory_config = {}
             if camera_config and "MOUSE_TRAJECTORY" in camera_config:
                 trajectory_config = camera_config["MOUSE_TRAJECTORY"]
+            else:
+                parser = ConfigParser()
+                parser.read(
+                    PROJECT_ROOT / "config" / "camera_config.ini",
+                    encoding="utf-8",
+                )
+                if parser.has_section("MOUSE_TRAJECTORY"):
+                    trajectory_config = dict(parser["MOUSE_TRAJECTORY"])
+            requested_mode = str(
+                trajectory_config.get(
+                    "trajectory_coordinate_mode",
+                    self.coordinate_mode,
+                )
+                or self.coordinate_mode
+            ).strip().lower()
+            if requested_mode not in {"legacy_xyz", "e2_xy"}:
+                logger.warning(
+                    "unknown mouse trajectory coordinate mode "
+                    f"{requested_mode!r}; falling back to legacy_xyz"
+                )
+                requested_mode = "legacy_xyz"
+            self.coordinate_mode = requested_mode
+            self.xy_device = str(
+                trajectory_config.get("xy_device", self.xy_device)
+                or self.xy_device
+            ).strip()
+            self.xy_imgsz = max(
+                int(
+                    float(
+                        trajectory_config.get(
+                            "xy_detector_imgsz",
+                            self.xy_imgsz,
+                        )
+                        or self.xy_imgsz
+                    )
+                ),
+                32,
+            )
+            self.xy_batch_size = max(
+                int(
+                    float(
+                        trajectory_config.get(
+                            "xy_batch_size",
+                            self.xy_batch_size,
+                        )
+                        or self.xy_batch_size
+                    )
+                ),
+                1,
+            )
+            self.xy_conf_mouse = max(
+                min(
+                    float(
+                        trajectory_config.get(
+                            "xy_detector_conf",
+                            self.xy_conf_mouse,
+                        )
+                        or self.xy_conf_mouse
+                    ),
+                    1.0,
+                ),
+                0.0,
+            )
             self.imgsz = int(float(trajectory_config.get("yolo_imgsz", self.imgsz) or self.imgsz))
             self.batch_size = max(
                 int(float(trajectory_config.get("yolo_batch_size", self.batch_size) or self.batch_size)),
@@ -1502,6 +1585,41 @@ class MouseTrajectoryThread(MyQThread):
             f"opencv={self.opencv_num_threads}"
         )
 
+        if self._is_e2_xy_mode():
+            for required_path in (
+                self.xy_model_path,
+                self.xy_mouse_model_path,
+            ):
+                if required_path is None or not Path(required_path).exists():
+                    raise FileNotFoundError(
+                        f"E2 XY trajectory required file missing: {required_path}"
+                    )
+            logger.info(
+                "mouse trajectory coordinate mode: e2_xy (X/Y only; Z disabled)"
+            )
+            logger.info(
+                "loading E2 XY mouse detector: "
+                f"{self.xy_mouse_model_path}"
+            )
+            self.mouse_model = self._build_model(
+                self.xy_mouse_model_path,
+                task="detect",
+            )
+            logger.info(
+                f"loading E2 XY coordinate model: {self.xy_model_path}, "
+                f"device={self.xy_device}"
+            )
+            self.xy_predictor = E2XYPredictor(
+                self.xy_model_path,
+                device=self.xy_device,
+            )
+            logger.info(
+                "E2 XY trajectory models loaded successfully; "
+                "3D geometry solver and Z-axis output are disabled"
+            )
+            return
+
+        logger.info("mouse trajectory coordinate mode: legacy_xyz")
         for required_path in (
             self.reference_image_path,
             self.grid_json_path,
@@ -1838,7 +1956,18 @@ class MouseTrajectoryThread(MyQThread):
         return self.latest_annotated_path_by_cage.get(cage_number), None
 
     def _process_frame_batch(self, frame_items: list[tuple[int, dict[str, Any]]]):
-        if self.solver is None or self.box_model is None or self.mouse_model is None or self.ref_corners is None:
+        if self.mouse_model is None:
+            return 0
+        if self._is_e2_xy_mode() and self.xy_predictor is None:
+            return 0
+        if (
+            not self._is_e2_xy_mode()
+            and (
+                self.solver is None
+                or self.box_model is None
+                or self.ref_corners is None
+            )
+        ):
             return 0
 
         batch_pipeline_start = time.perf_counter()
@@ -1952,6 +2081,8 @@ class MouseTrajectoryThread(MyQThread):
                 "status": "ok",
                 "error": None,
                 "mouse_result": None,
+                "mouse_box": None,
+                "xy_prediction": None,
                 "frame_payload": dict(frame_payload),
                 "source_file_path": str(source_file_path or ""),
                 "color_source_path": self._build_processed_color_source_path(
@@ -1959,6 +2090,12 @@ class MouseTrajectoryThread(MyQThread):
                     timestamp,
                 ),
             }
+
+            if self._is_e2_xy_mode():
+                mouse_source_indexes.append(len(prepared_items))
+                mouse_sources.append(source_frame)
+                prepared_items.append(item)
+                continue
 
             prepare_start = time.perf_counter()
             try:
@@ -2051,9 +2188,9 @@ class MouseTrajectoryThread(MyQThread):
                 mouse_results = run_yolo_batch(
                     self.mouse_model,
                     mouse_sources,
-                    self.imgsz,
-                    self.conf_mouse,
-                    self.batch_size,
+                    self.xy_imgsz if self._is_e2_xy_mode() else self.imgsz,
+                    self.xy_conf_mouse if self._is_e2_xy_mode() else self.conf_mouse,
+                    self.xy_batch_size if self._is_e2_xy_mode() else self.batch_size,
                 )
                 predict_elapsed = time.perf_counter() - predict_start
                 self._record_yolo_fps(len(mouse_sources), predict_elapsed)
@@ -2080,8 +2217,8 @@ class MouseTrajectoryThread(MyQThread):
                         prepared_items[source_index]["mouse_result"] = run_yolo_single(
                             self.mouse_model,
                             mouse_source,
-                            self.imgsz,
-                            self.conf_mouse,
+                            self.xy_imgsz if self._is_e2_xy_mode() else self.imgsz,
+                            self.xy_conf_mouse if self._is_e2_xy_mode() else self.conf_mouse,
                         )
                         fallback_count += 1
                     except Exception as single_error:
@@ -2100,6 +2237,9 @@ class MouseTrajectoryThread(MyQThread):
                     prepared_items[source_index]["yolo_end_timestamp"] = yolo_end_timestamp
                     prepared_items[source_index]["yolo_end_monotonic_ns"] = yolo_end_monotonic_ns
 
+        if self._is_e2_xy_mode():
+            self._run_e2_xy_batch(prepared_items, mouse_source_indexes)
+
         for item in prepared_items:
             self._finish_prepared_frame(item)
         self._record_stage_timing(
@@ -2107,6 +2247,84 @@ class MouseTrajectoryThread(MyQThread):
             (time.perf_counter() - batch_pipeline_start) * 1000.0,
         )
         return len(prepared_items)
+
+    def _run_e2_xy_batch(
+        self,
+        prepared_items: list[dict[str, Any]],
+        source_indexes: list[int],
+    ) -> None:
+        predictor = self.xy_predictor
+        if predictor is None:
+            return
+
+        prediction_indexes: list[int] = []
+        prediction_frames: list[Any] = []
+        prediction_boxes: list[DetectionBox] = []
+        for source_index in source_indexes:
+            item = prepared_items[source_index]
+            if item.get("error"):
+                continue
+            mouse_result = item.get("mouse_result")
+            mouse_box = (
+                best_box_from_result(mouse_result)
+                if mouse_result is not None
+                else None
+            )
+            item["mouse_box"] = mouse_box
+            if mouse_box is None:
+                item["status"] = "no_mouse"
+                continue
+            prediction_indexes.append(source_index)
+            prediction_frames.append(item["source_frame"])
+            prediction_boxes.append(mouse_box)
+
+        if not prediction_frames:
+            return
+
+        prediction_start = time.perf_counter()
+        try:
+            predictions = predictor.predict_batch(
+                prediction_frames,
+                prediction_boxes,
+            )
+            if len(predictions) != len(prediction_indexes):
+                raise RuntimeError(
+                    "E2 XY predictor returned fewer results than input frames"
+                )
+            for source_index, prediction in zip(
+                prediction_indexes,
+                predictions,
+            ):
+                prepared_items[source_index]["xy_prediction"] = prediction
+        except Exception as error:
+            logger.warning(
+                "E2 XY batch prediction failed; falling back to single-frame "
+                f"prediction: {error}"
+            )
+            for source_index, frame, mouse_box in zip(
+                prediction_indexes,
+                prediction_frames,
+                prediction_boxes,
+            ):
+                try:
+                    prediction = predictor.predict_batch([frame], [mouse_box])[0]
+                    prepared_items[source_index]["xy_prediction"] = prediction
+                except Exception as single_error:
+                    prepared_items[source_index]["status"] = "error"
+                    prepared_items[source_index]["error"] = (
+                        f"E2 XY prediction failed: {single_error}"
+                    )
+                    logger.error(
+                        "E2 XY single-frame prediction failed "
+                        f"cage={prepared_items[source_index].get('cage_number')} "
+                        f"frame_id={prepared_items[source_index].get('frame_id')}: "
+                        f"{single_error}"
+                    )
+        finally:
+            self._record_stage_timing(
+                "e2_xy_batch_wall",
+                (time.perf_counter() - prediction_start) * 1000.0,
+            )
 
     def _record_yolo_fps(self, frame_count: int, elapsed_seconds: float):
         frame_count = int(frame_count)
@@ -2358,41 +2576,79 @@ class MouseTrajectoryThread(MyQThread):
                 }
                 status = "error"
             else:
-                mouse_result = item.get("mouse_result")
-                if item.get("h_test_to_ref") is not None and mouse_result is not None:
-                    postprocess_start = time.perf_counter()
-                    mouse_box = best_box_from_result(mouse_result)
-                    self._record_stage_timing(
-                        "mouse_result_decode",
-                        (time.perf_counter() - postprocess_start) * 1000.0,
-                    )
+                if self._is_e2_xy_mode():
+                    mouse_box = item.get("mouse_box")
+                    prediction = item.get("xy_prediction")
                     if mouse_box is None:
                         status = "no_mouse"
+                    elif prediction is None:
+                        status = "xy_inference_failed"
                     else:
-                        self.solver.registration = {
-                            "H_test_to_ref": item.get("h_test_to_ref"),
-                            "meanError": item.get("registration_mean_error"),
-                            "maxError": item.get("registration_max_error"),
-                            "source": item.get("registration_source", ""),
+                        solved = {
+                            "X": float(prediction["x_mm"]),
+                            "Y": float(prediction["y_mm"]),
+                            "Z": None,
+                            "locatorMethod": "e2_rgb_yolo6",
+                            "registrationSource": "",
                         }
-                        xyz_start = time.perf_counter()
-                        with self.tuning_lock:
-                            self._apply_tuning_to_solver()
-                            solved = solve_mouse_location(
-                                self.solver,
-                                mouse_box,
-                                image_file.name,
-                            )
+                else:
+                    mouse_result = item.get("mouse_result")
+                    if item.get("h_test_to_ref") is not None and mouse_result is not None:
+                        postprocess_start = time.perf_counter()
+                        mouse_box = best_box_from_result(mouse_result)
                         self._record_stage_timing(
-                            "xyz_solve",
-                            (time.perf_counter() - xyz_start) * 1000.0,
+                            "mouse_result_decode",
+                            (time.perf_counter() - postprocess_start) * 1000.0,
                         )
-                        if solved is not None:
-                            solved["registrationSource"] = item.get("registration_source", "")
-                        if solved is None:
-                            status = "solve_failed"
+                        if mouse_box is None:
+                            status = "no_mouse"
+                        else:
+                            self.solver.registration = {
+                                "H_test_to_ref": item.get("h_test_to_ref"),
+                                "meanError": item.get("registration_mean_error"),
+                                "maxError": item.get("registration_max_error"),
+                                "source": item.get("registration_source", ""),
+                            }
+                            xyz_start = time.perf_counter()
+                            with self.tuning_lock:
+                                self._apply_tuning_to_solver()
+                                solved = solve_mouse_location(
+                                    self.solver,
+                                    mouse_box,
+                                    image_file.name,
+                                )
+                            self._record_stage_timing(
+                                "xyz_solve",
+                                (time.perf_counter() - xyz_start) * 1000.0,
+                            )
+                            if solved is not None:
+                                solved["registrationSource"] = item.get("registration_source", "")
+                            if solved is None:
+                                status = "solve_failed"
 
                 row = build_row(frame_index, image_file, status, corners, mouse_box, solved, corner_shift)
+                if self._is_e2_xy_mode():
+                    prediction = item.get("xy_prediction") or {}
+                    row.update(
+                        {
+                            "coordinateMode": "e2_xy",
+                            "zAvailable": False,
+                            "Z": None,
+                            "rawZ": None,
+                            "rawX": row.get("X"),
+                            "rawY": row.get("Y"),
+                            "yTopBinCenterMm": prediction.get(
+                                "y_top_bin_center_mm"
+                            ),
+                            "yTopBinProbability": prediction.get(
+                                "y_top_bin_probability"
+                            ),
+                            "xyModelWeight": str(self.xy_model_path or ""),
+                            "mouseDetectorWeight": str(
+                                self.xy_mouse_model_path or ""
+                            ),
+                        }
+                    )
         except Exception as error:
             logger.error(f"mouse trajectory finish frame failed cage={cage_number} file={image_file.name}: {error}")
             row = {
@@ -2514,12 +2770,20 @@ class MouseTrajectoryThread(MyQThread):
         self.processed_frame_count += 1
         self.processing_started_at_by_cage.setdefault(cage_number, time.time())
         self.processed_frame_count_by_cage[cage_number] = processed_count_for_cage
-        stabilize_start = time.perf_counter()
-        self._stabilize_trajectory_row(cage_number, row)
-        self._record_stage_timing(
-            "trajectory_stabilize",
-            (time.perf_counter() - stabilize_start) * 1000.0,
-        )
+        if self._is_e2_xy_mode():
+            row.setdefault("coordinateMode", "e2_xy")
+            row.setdefault("zAvailable", False)
+            row["Z"] = None
+            row["rawZ"] = None
+        else:
+            row.setdefault("coordinateMode", "legacy_xyz")
+            row.setdefault("zAvailable", True)
+            stabilize_start = time.perf_counter()
+            self._stabilize_trajectory_row(cage_number, row)
+            self._record_stage_timing(
+                "trajectory_stabilize",
+                (time.perf_counter() - stabilize_start) * 1000.0,
+            )
         self._append_unflushed_row(cage_number, row)
         if row.get("status") == "ok":
             self.ok_frame_count_by_cage[cage_number] = (
@@ -2658,23 +2922,34 @@ class MouseTrajectoryThread(MyQThread):
             return None
         return self._pending_count(cage_number) / speed
 
-    @staticmethod
-    def _build_plot_paths_from_dir(plots_dir: Path) -> dict[str, str]:
-        return {
+    def _build_plot_paths_from_dir(self, plots_dir: Path) -> dict[str, str]:
+        paths = {
             "xy_trajectory": str(plots_dir / "xy_trajectory.png"),
-            "xyz_trajectory": str(plots_dir / "xyz_trajectory.png"),
-            "height_trajectory": str(plots_dir / "height_trajectory.png"),
             "occupancy_heatmap": str(plots_dir / "occupancy_heatmap.png"),
         }
+        if not self._is_e2_xy_mode():
+            paths.update(
+                {
+                    "xyz_trajectory": str(plots_dir / "xyz_trajectory.png"),
+                    "height_trajectory": str(plots_dir / "height_trajectory.png"),
+                }
+            )
+        return paths
 
     def _build_latest_plot_paths(self, cage_number: int) -> dict[str, str]:
         plots_dir = self._get_cage_plots_dir(cage_number)
-        return {
+        paths = {
             "xy_trajectory": str(plots_dir / "latest_xy_trajectory.png"),
-            "xyz_trajectory": str(plots_dir / "latest_xyz_trajectory.png"),
-            "height_trajectory": str(plots_dir / "latest_height_trajectory.png"),
             "occupancy_heatmap": str(plots_dir / "latest_occupancy_heatmap.png"),
         }
+        if not self._is_e2_xy_mode():
+            paths.update(
+                {
+                    "xyz_trajectory": str(plots_dir / "latest_xyz_trajectory.png"),
+                    "height_trajectory": str(plots_dir / "latest_height_trajectory.png"),
+                }
+            )
+        return paths
 
     def _publish_latest_plot_paths(self, cage_number: int, source_plot_paths: dict[str, str]) -> dict[str, str]:
         latest_plot_paths = self._build_latest_plot_paths(cage_number)
@@ -2719,13 +2994,38 @@ class MouseTrajectoryThread(MyQThread):
             ok_count = sum(1 for row in (rows or []) if row.get("status") == "ok")
         return {
             "cageNumber": cage_number,
-            "referenceImage": str(self.reference_image_path) if self.reference_image_path else "",
-            "gridJson": str(self.grid_json_path) if self.grid_json_path else "",
-            "boxWeight": str(self.box_model_path) if self.box_model_path else "",
-            "mouseWeight": str(self.mouse_model_path) if self.mouse_model_path else "",
-            "instrumentAreaJson": str(self.instrument_area_json_path) if self.instrument_area_json_path else "",
-            "imageRegistrationJson": str(self.registration_json_path) if self.registration_json_path else "",
-            "imageRegistration": self.static_registration,
+            "coordinateMode": self.coordinate_mode,
+            "zAvailable": not self._is_e2_xy_mode(),
+            "referenceImage": (
+                ""
+                if self._is_e2_xy_mode()
+                else str(self.reference_image_path or "")
+            ),
+            "gridJson": (
+                "" if self._is_e2_xy_mode() else str(self.grid_json_path or "")
+            ),
+            "boxWeight": (
+                "" if self._is_e2_xy_mode() else str(self.box_model_path or "")
+            ),
+            "mouseWeight": str(
+                self.xy_mouse_model_path
+                if self._is_e2_xy_mode()
+                else self.mouse_model_path
+            ),
+            "xyModelWeight": str(self.xy_model_path) if self._is_e2_xy_mode() else "",
+            "instrumentAreaJson": (
+                ""
+                if self._is_e2_xy_mode()
+                else str(self.instrument_area_json_path or "")
+            ),
+            "imageRegistrationJson": (
+                ""
+                if self._is_e2_xy_mode()
+                else str(self.registration_json_path or "")
+            ),
+            "imageRegistration": (
+                None if self._is_e2_xy_mode() else self.static_registration
+            ),
             "trajectoryTuning": self.get_runtime_tuning(),
             "trajectoryTuningHistory": self.get_tuning_history(),
             "frameCount": int(frame_count),

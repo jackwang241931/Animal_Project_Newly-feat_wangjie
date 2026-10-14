@@ -1094,7 +1094,12 @@ def render_annotation_image(
         cv2.rectangle(image, (x1, y1), (x2, y2), (0, 255, 0), 2)
     label = status
     if solved:
-        label = f"X:{solved.get('X', 0):.1f} Y:{solved.get('Y', 0):.1f} Z:{solved.get('Z_total', solved.get('Z', 0)):.1f}"
+        x_value = float(solved.get("X", 0) or 0)
+        y_value = float(solved.get("Y", 0) or 0)
+        z_value = solved.get("Z_total", solved.get("Z"))
+        label = f"X:{x_value:.1f} Y:{y_value:.1f}"
+        if z_value is not None:
+            label += f" Z:{float(z_value):.1f}"
     cv2.putText(image, label, (20, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
     return image
 

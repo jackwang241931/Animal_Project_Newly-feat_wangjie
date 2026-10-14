@@ -9,6 +9,7 @@ import time
 import traceback
 import typing
 import weakref
+from configparser import ConfigParser
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -70,6 +71,28 @@ trajectory_service_consumers = weakref.WeakSet()
 trajectory_module_loader_lock = threading.RLock()
 trajectory_module_loader = None
 mouse_trajectory_thread_class = None
+
+
+def _mouse_trajectory_coordinate_mode() -> str:
+    camera_config = global_setting.get_setting("camera_config") or {}
+    trajectory_config = (
+        camera_config.get("MOUSE_TRAJECTORY", {})
+        if isinstance(camera_config, dict)
+        else {}
+    )
+    if not trajectory_config:
+        parser = ConfigParser()
+        parser.read(
+            resolve_project_path("config/camera_config.ini"),
+            encoding="utf-8",
+        )
+        if parser.has_section("MOUSE_TRAJECTORY"):
+            trajectory_config = dict(parser["MOUSE_TRAJECTORY"])
+    mode = str(
+        trajectory_config.get("trajectory_coordinate_mode", "legacy_xyz")
+        or "legacy_xyz"
+    ).strip().lower()
+    return mode if mode in {"legacy_xyz", "e2_xy"} else "legacy_xyz"
 
 if typing.TYPE_CHECKING:
     from Module.mouse_trajectory.service import MouseTrajectoryThread
@@ -1862,6 +1885,7 @@ class Tab_4(ThemedWindow):
         self.last_valid_mouse_overlay_times: dict[int, float] = {}
         self.mouse_overlay_hold_seconds = 1.5
         self.current_trajectory_plot_key = "xy_trajectory"
+        self.trajectory_coordinate_mode = _mouse_trajectory_coordinate_mode()
         self.trajectory_tuning_dialog: TrajectoryTuningDialog | None = None
         self.temperature_widget: TemperatureTrendWidget | None = None
         self.last_enabled_cages: list[int] = []
@@ -1949,7 +1973,9 @@ class Tab_4(ThemedWindow):
             is_video_mode = self.current_mode == self.MODE_VIDEO
             self.trajectory_plot_selector_label.setVisible(is_video_mode)
             self.trajectory_plot_selector.setVisible(is_video_mode)
-            self.trajectory_tuning_button.setVisible(is_video_mode)
+            self.trajectory_tuning_button.setVisible(
+                is_video_mode and self.trajectory_coordinate_mode != "e2_xy"
+            )
 
     def init_header_selectors(self):
         self.cage_selector_label = QLabel("已开启笼子:", self.ui.verticalLayoutWidget)
@@ -1968,8 +1994,9 @@ class Tab_4(ThemedWindow):
         self.trajectory_plot_selector.setObjectName("trajectory_plot_selector")
         self.trajectory_plot_selector.setMinimumWidth(150)
         self.trajectory_plot_selector.addItem("X-Y轨迹", "xy_trajectory")
-        self.trajectory_plot_selector.addItem("X-Y-Z三维轨迹", "xyz_trajectory")
-        self.trajectory_plot_selector.addItem("高度-时间", "height_trajectory")
+        if self.trajectory_coordinate_mode != "e2_xy":
+            self.trajectory_plot_selector.addItem("X-Y-Z三维轨迹", "xyz_trajectory")
+            self.trajectory_plot_selector.addItem("高度-时间", "height_trajectory")
         self.trajectory_plot_selector.addItem("停留热力图", "occupancy_heatmap")
         self.trajectory_plot_selector.currentIndexChanged.connect(self.on_trajectory_plot_changed)
         self.trajectory_tuning_button = QPushButton("轨迹参数", self.ui.verticalLayoutWidget)
@@ -2223,8 +2250,13 @@ class Tab_4(ThemedWindow):
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
             solved = (overlay or {}).get("solved") or {}
             if solved:
-                z_value = solved.get("Z_total", solved.get("Z", 0))
-                label = f"X:{float(solved.get('X', 0)):.1f} Y:{float(solved.get('Y', 0)):.1f} Z:{float(z_value):.1f}"
+                label = (
+                    f"X:{float(solved.get('X', 0) or 0):.1f} "
+                    f"Y:{float(solved.get('Y', 0) or 0):.1f}"
+                )
+                z_value = solved.get("Z_total", solved.get("Z"))
+                if z_value is not None:
+                    label += f" Z:{float(z_value):.1f}"
             else:
                 center_x = (x1 + x2) / 2
                 center_y = (y1 + y2) / 2

@@ -137,6 +137,16 @@ DEFAULT_MOUSE_MODEL_PATH = first_existing_path(
     MODEL_DIR / "best_box.pt",
 )
 
+DEFAULT_XY_MODEL_PATH = first_existing_path(
+    _resolve_configured_model_path("xy_model_path"),
+    MODEL_DIR / "mouse_xy_e2.pt",
+)
+
+DEFAULT_XY_MOUSE_MODEL_PATH = first_existing_path(
+    _resolve_configured_model_path("xy_mouse_model_path"),
+    MODEL_DIR / "mouse_detector_fuyang.pt",
+)
+
 
 def get_cage_export_dir(cage_number: int, export_root: Path | str | None = None) -> Path:
     cage_dir = _resolve_export_root(export_root) / f"cage_{int(cage_number)}"
