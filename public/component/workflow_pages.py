@@ -1276,12 +1276,20 @@ class DataViewPage(_BaseWorkflowPage):
         # Keep the legacy combo hidden for integrations that still read it;
         # the visible control is the screenshot-compatible button row.
         self.channel_filter = QComboBox(self); self.channel_filter.addItem("全部", -1)
+        self.channel_filter.addItem("参考笼", 0)
         for channel in range(1, 9): self.channel_filter.addItem(f"CH{channel:02d}", channel)
         self.channel_filter.currentIndexChanged.connect(
-            lambda _index: self._select_channel_filter(int(self.channel_filter.currentData() or -1))
+            lambda _index: self._select_channel_filter(
+                -1 if self.channel_filter.currentData() is None else int(self.channel_filter.currentData())
+            )
         )
         self.channel_filter.hide()
-        for value, text in [(-1, "全部"), *[(channel, f"通道{channel}") for channel in range(1, 9)]]:
+        filter_options = [
+            (-1, "全部"),
+            (0, "参考笼"),
+            *[(channel, f"通道{channel}") for channel in range(1, 9)],
+        ]
+        for value, text in filter_options:
             button = QPushButton(text)
             button.setCheckable(True)
             button.setChecked(value == -1)
@@ -1329,12 +1337,20 @@ class DataViewPage(_BaseWorkflowPage):
 
     def _select_channel_filter(self, channel: int) -> None:
         self._selected_channel_filter = channel
-        for index, button in enumerate(self.channel_filter_buttons):
-            button.setChecked((index == 0 and channel == -1) or (index == channel and channel > 0))
+        for button in self.channel_filter_buttons:
+            button.setChecked(self.channel_filter_group.id(button) == channel)
         self.channel_filter.blockSignals(True)
-        self.channel_filter.setCurrentIndex(0 if channel == -1 else channel)
+        self.channel_filter.setCurrentIndex(self.channel_filter.findData(channel))
         self.channel_filter.blockSignals(False)
         self.refresh()
+
+    @staticmethod
+    def _channel_filter_label(channel: Optional[int]) -> str:
+        if channel in (None, -1):
+            return "全部"
+        if int(channel) == 0:
+            return "参考笼"
+        return f"CH{int(channel):02d}"
 
     def _db_path(self) -> Optional[str]:
         context = _provider_value(self._context_provider)
@@ -1448,8 +1464,17 @@ class DataViewPage(_BaseWorkflowPage):
     def _epoch_rows(connection: sqlite3.Connection, selected: int, db_path: Optional[str] = None) -> tuple[list[str], list[tuple[Any, ...]]]:
         """Use the old monitor's one-row-per-cage Epoch source, not raw-table unions."""
         cage_tables = DataViewPage._epoch_tables(connection)
+        filter_all_table_by_cage = False
         if selected not in (None, -1):
             tables = [name for name in cage_tables if _table_matches_channel(name, int(selected))]
+            if not tables:
+                all_exists = connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='Epoch_data_all'"
+                ).fetchone()
+                all_has_rows = all_exists and connection.execute("SELECT 1 FROM Epoch_data_all LIMIT 1").fetchone()
+                if all_has_rows:
+                    tables = ["Epoch_data_all"]
+                    filter_all_table_by_cage = True
         else:
             all_exists = connection.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='Epoch_data_all'"
@@ -1460,7 +1485,7 @@ class DataViewPage(_BaseWorkflowPage):
         # Real experiment databases have the legacy Epoch schema and metadata.
         # Read those with exactly the same DAO as the old monitoring table;
         # retain the direct reader only for older/partial databases without it.
-        if db_path and len(tables) == 1:
+        if db_path and len(tables) == 1 and not filter_all_table_by_cage:
             table = tables[0]
             quoted = '"' + table.replace('"', '""') + '"'
             columns = {str(row[1]) for row in connection.execute(f"PRAGMA table_info({quoted})")}
@@ -1487,6 +1512,12 @@ class DataViewPage(_BaseWorkflowPage):
             ).fetchall():
                 record = dict(zip(columns, values))
                 cage_number = record.get("mouse_cage_number") if name == "Epoch_data_all" else name.rsplit("_", 1)[-1]
+                if filter_all_table_by_cage:
+                    try:
+                        if int(cage_number) != int(selected):
+                            continue
+                    except (TypeError, ValueError):
+                        continue
                 records.append((str(cage_number), record))
         if not records:
             return [], []
@@ -1745,7 +1776,7 @@ class DataViewPage(_BaseWorkflowPage):
                     was_at_top,
                     was_at_bottom,
                 )
-                selected_label = "全部" if selected in (None, -1) else f"CH{int(selected):02d}"
+                selected_label = self._channel_filter_label(selected)
                 self.status_label.setText(f"当前筛选：{selected_label}；读取 {len(rows)} 条监测记录，数据源：{db_path}")
         except (OSError, sqlite3.Error) as error:
             self.status_label.setText(f"数据库读取失败：{error}")
@@ -1757,7 +1788,7 @@ class DataViewPage(_BaseWorkflowPage):
             return False
 
         selected = self._selected_channel_filter
-        channel_label = "全部" if selected in (None, -1) else f"CH{int(selected):02d}"
+        channel_label = self._channel_filter_label(selected)
         default_directory = self._last_export_directory
         if not default_directory:
             db_path = self._db_path()
