@@ -1051,8 +1051,10 @@ class O2SpanFullAirWorkflowTests(unittest.TestCase):
                     "calibration_max_timeout": 300,
                     "calibration_stable_duration": 0,
                     "calibration_sample_interval": 0,
-                    "zero_calibration_carbon_threshold": 5,
-                    "span_calibration_carbon_threshold": 15,
+                    "co2_zero_stable_duration": 0,
+                    "co2_span_stable_duration": 0,
+                    "zero_calibration_carbon_threshold": 1,
+                    "span_calibration_carbon_threshold": 5,
                     "span_calibration_co2_tolerance": 25,
                 }
             },

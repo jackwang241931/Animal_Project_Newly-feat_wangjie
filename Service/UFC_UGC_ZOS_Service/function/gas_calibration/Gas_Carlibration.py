@@ -700,9 +700,9 @@ class Zero_Carlibration(Gas_Carlibration, MyQThread):
         start_time = time.time()
 
         max_timeout = float(config.get('calibration_max_timeout', 300))
-        stable_duration = float(config.get('calibration_stable_duration', 15))
+        stable_duration = float(config.get('co2_zero_stable_duration', 30))
         sample_interval = float(config.get('calibration_sample_interval', 1))
-        threshold = float(config.get('zero_calibration_carbon_threshold', 5))
+        threshold = float(config.get('zero_calibration_carbon_threshold', 1))
         min_range = float(config.get('zero_calibration_co2_min', 0))
         max_range = float(config.get('zero_calibration_co2_max', 25))
 
@@ -1192,9 +1192,9 @@ class Range_Carlibration(Gas_Carlibration, MyQThread):
         start_time = time.time()
 
         max_timeout = float(config.get('calibration_max_timeout', 300))
-        stable_duration = float(config.get('calibration_stable_duration', 15))
+        stable_duration = float(config.get('co2_span_stable_duration', 30))
         sample_interval = float(config.get('calibration_sample_interval', 1))
-        threshold = float(config.get('span_calibration_carbon_threshold', 15))
+        threshold = float(config.get('span_calibration_carbon_threshold', 5))
         tolerance = float(config.get('span_calibration_co2_tolerance', 25))
 
         target_co2 = self.ugc_span_target_co2_ppm
@@ -1841,9 +1841,9 @@ def _patched_zero_cyclic_sampling_of_ugc_carbon_sensor(self, resolve, reject, po
     config = global_setting.get_setting("UFC_UGC_ZOS_config")['Calibration']
     start_time = time.time()
     max_timeout = float(config.get('calibration_max_timeout', 300))
-    stable_duration = float(config.get('calibration_stable_duration', 15))
+    stable_duration = float(config.get('co2_zero_stable_duration', 30))
     sample_interval = float(config.get('calibration_sample_interval', 1))
-    threshold = float(config.get('zero_calibration_carbon_threshold', 5))
+    threshold = float(config.get('zero_calibration_carbon_threshold', 1))
 
     channels_data = {ch: [] for ch in active_channels}
     channels_stable_start = {ch: None for ch in active_channels}
@@ -2034,9 +2034,9 @@ def _patched_range_cyclic_sampling_of_ugc_carbon_sensor(self, resolve, reject, p
     config = global_setting.get_setting("UFC_UGC_ZOS_config")['Calibration']
     start_time = time.time()
     max_timeout = float(config.get('calibration_max_timeout', 300))
-    stable_duration = float(config.get('calibration_stable_duration', 15))
+    stable_duration = float(config.get('co2_span_stable_duration', 30))
     sample_interval = float(config.get('calibration_sample_interval', 1))
-    threshold = float(config.get('span_calibration_carbon_threshold', 15))
+    threshold = float(config.get('span_calibration_carbon_threshold', 5))
     tolerance = float(config.get('span_calibration_co2_tolerance', 25))
 
     target_co2 = self.ugc_span_target_co2_ppm
