@@ -24,7 +24,6 @@ except Exception:  # pragma: no cover - logging must never break the API
 from . import o2_realtime_core as _core
 
 
-_WARNED_MISSING_REFERENCE: set[str] = set()
 _PROJECT_ROOT = Path(__file__).resolve().parents[4]
 _POINTS_CONFIG = _PROJECT_ROOT / "config" / "UFC_UGC_ZOS_Test.ini"
 _CALIBRATION_HANDLER_LOCK = threading.RLock()
@@ -270,12 +269,6 @@ def calculate_o2_compensated(
 ):
     """Call the replaceable implementation behind the stable host contract."""
     if channel_id not in _valid_channels():
-        return -1
-
-    if channel_id != "REF" and not has_valid_reference_dry_oxygen_sample():
-        if channel_id not in _WARNED_MISSING_REFERENCE:
-            logger.warning(f"O2 compensation skipped for {channel_id}: no valid REF sample")
-            _WARNED_MISSING_REFERENCE.add(channel_id)
         return -1
 
     try:

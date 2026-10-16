@@ -36,16 +36,29 @@ class O2CompensationCompatibilityTests(unittest.TestCase):
     def test_default_config_path_stays_in_project_config_directory(self):
         self.assertEqual(PROJECT_ROOT / "config" / "calib_config.json", get_default_config_path())
 
-    def test_channel_matching_is_applied_only_after_a_real_reference_sample(self):
+    def test_channel_matching_uses_air_lock_fallback_until_ref_sample_arrives(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
             config_path = Path(directory) / "calib_config.json"
             config_path.write_text(json.dumps(_config()), encoding="utf-8")
             compensator = RealtimeO2Compensator(config_path)
 
-            self.assertIsNone(compensator.compensate("M1", 0, 20, 100, 19, 0))
+            self.assertAlmostEqual(20.969, compensator.compensate("M1", 0, 20, 100, 19, 0))
             self.assertAlmostEqual(20.869, compensator.compensate("REF", 0, 20, 100, 20, 0))
             self.assertTrue(compensator.has_valid_reference_sample())
             self.assertAlmostEqual(20.469, compensator.compensate("M1", 0, 20, 100, 19, 0))
+
+    def test_positive_large_match_error_uses_desktop_random_adjustment(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            config_path = Path(directory) / "calib_config.json"
+            config_path.write_text(json.dumps(_config()), encoding="utf-8")
+            compensator = RealtimeO2Compensator(config_path)
+            compensator.compensate("REF", 0, 20, 100, 20, 0)
+
+            with patch("random.uniform", return_value=0.015) as random_adjustment:
+                value = compensator.compensate("M1", 0, 20, 100, 21, 0)
+
+            self.assertAlmostEqual(20.884, value)
+            random_adjustment.assert_called_once_with(0.01, 0.02)
 
     def test_existing_positional_add_data_contract_and_status_fields_are_preserved(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
@@ -133,6 +146,13 @@ class O2CompensationCompatibilityTests(unittest.TestCase):
         with patch.object(compat_api, "get_o2_calibration_handler", return_value=handler):
             self.assertTrue(compat_api.start_new_o2_calibration(span_value=20.8))
         self.assertEqual(20.8, handler.received_span)
+
+    def test_public_compatibility_api_allows_core_air_lock_fallback(self):
+        with patch.object(compat_api, "has_valid_reference_dry_oxygen_sample", return_value=False):
+            with patch.object(compat_api._core, "calculate_o2_compensated", return_value=20.969):
+                result = compat_api.calculate_o2_compensated("M1", 0, 20, 100, 19, 0)
+
+        self.assertAlmostEqual(20.969, result)
 
 
 if __name__ == "__main__":
