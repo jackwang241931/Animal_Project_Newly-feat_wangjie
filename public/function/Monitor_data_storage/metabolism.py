@@ -27,6 +27,15 @@ def _number(value):
     return number if math.isfinite(number) else None
 
 
+def adjust_reference_co2(reference_co2, subtract_value=0.0125):
+    """Apply the configured percentage-point correction to reference CO2."""
+    reference = _number(reference_co2)
+    subtraction = _number(subtract_value)
+    if reference is None or subtraction is None:
+        return None
+    return reference - subtraction
+
+
 def calculate_epoch_metabolism(values: Mapping):
     """Return VO2, VCO2, RER and EE, preserving calculated negative values.
 

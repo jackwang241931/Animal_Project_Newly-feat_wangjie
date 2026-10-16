@@ -37,7 +37,11 @@ from public.function.Modbus.Modbus_Type import Modbus_Slave_Type, Modbus_Slave_S
 from public.function.Modbus.New_Mod_Bus import ModbusRTUMasterNew
 from public.function.cage_control_commands import build_cage_control_command
 from public.function.Monitor_data_storage.DataStorage import StorageResult, store_data_with_result, DataItem
-from public.function.Monitor_data_storage.metabolism import METABOLISM_COLUMNS, calculate_epoch_metabolism
+from public.function.Monitor_data_storage.metabolism import (
+    METABOLISM_COLUMNS,
+    adjust_reference_co2,
+    calculate_epoch_metabolism,
+)
 from public.function.promise.AsyPromise import AsyPromise
 from public.system_health import HealthPolicy, HealthReporter
 from public.function.weight.weight_series_formatter import format_weight_series_for_storage
@@ -1016,6 +1020,23 @@ def _drain_collection_stage_signals():
 #使用端口
 port_use=None
 _co2_realtime_compensator = CO2RealtimeCompensator()
+
+
+def _reference_co2_subtract_value():
+    """Return the live reference-CO2 correction in percentage points."""
+    value = global_setting.get_setting("reference_co2_subtract_value", None)
+    if value is None:
+        config = global_setting.get_setting("UFC_UGC_ZOS_config", {}) or {}
+        value = (config.get("Calibration", {}) or {}).get(
+            "reference_co2_subtract_value", 0.0125
+        )
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return 0.0125
+    return value if math.isfinite(value) else 0.0125
+
+
 _epoch_carry_forward_handle = None
 _epoch_last_valid_cache = {}
 _epoch_missing_streak_cache = {}
@@ -2922,18 +2943,24 @@ def barrier_action():
 
 
     reference_data = None
+    adjusted_reference_co2 = None
     if mouse_cage_number != int(global_setting.get_setting('configer')['mouse_cage']['reference']):
         # 获取参考气轮次的数据：
         reference_data = handle.query_current_one_data(table_name=f"Epoch_data_cage_{int(global_setting.get_setting('configer')['mouse_cage']['reference'])}")
         if reference_data is not None:
+            adjusted_reference_co2 = adjust_reference_co2(
+                reference_data.get('UGC_CO2_num'),
+                _reference_co2_subtract_value(),
+            )
+            if adjusted_reference_co2 is not None:
+                adjusted_reference_co2 = round(adjusted_reference_co2, 4)
             store_Datas.append(
                 {'desc': 'ufc_参考气流量计测量值(sccm)',
                  'value': reference_data.get(f'UFC_flow_num') if reference_data.get(
                             f'UFC_flow_num') is not None else None })
             store_Datas.append(
                 {'desc': '参考气CO2(%)',
-                 'value': reference_data.get(f'UGC_CO2_num') if reference_data.get(
-                            f'UGC_CO2_num') is not None else None })
+                 'value': adjusted_reference_co2})
 
             store_Datas.append(
                 {'desc': '参考气氧浓度(%)',
@@ -2943,12 +2970,12 @@ def barrier_action():
                 {'desc': '参考气干基氧浓度(%)',
                  'value': reference_data.get('ZOS_dry_basis_oxygen_num')})
 
-            if fitted_co2_num is not None and reference_data.get(f'UGC_CO2_num') is not None:
+            if fitted_co2_num is not None and adjusted_reference_co2 is not None:
 
 
                 store_Datas.append(
                     {'desc': 'CO2生产量(%)',
-                     'value': round(fitted_co2_num - reference_data.get(f'UGC_CO2_num'), 4)})
+                     'value': round(fitted_co2_num - adjusted_reference_co2, 4)})
             sample_dry_basis_oxygen = results.get(
                 f'ZOS_monitor_data_cage_{mouse_cage_number}__dry_basis_oxygen_num'
             )
@@ -2969,7 +2996,7 @@ def barrier_action():
         'reference_dry_basis_oxygen_num': (
             reference_data.get('ZOS_dry_basis_oxygen_num') if reference_data else None
         ),
-        'reference_CO2_num': reference_data.get('UGC_CO2_num') if reference_data else None,
+        'reference_CO2_num': adjusted_reference_co2,
         'ZOS_dry_basis_oxygen_num': results.get(
             f'ZOS_monitor_data_cage_{mouse_cage_number}__dry_basis_oxygen_num'
         ),

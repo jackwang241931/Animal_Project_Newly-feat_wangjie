@@ -6,7 +6,10 @@ import unittest
 
 from public.dao.SQLite.Monitor_Datas_Handle import Monitor_Datas_Handle
 from public.dao.SQLite.SQliteManager import SQLiteManager
-from public.function.Monitor_data_storage.metabolism import calculate_epoch_metabolism
+from public.function.Monitor_data_storage.metabolism import (
+    adjust_reference_co2,
+    calculate_epoch_metabolism,
+)
 
 
 class MetabolismCalculationTests(unittest.TestCase):
@@ -28,6 +31,11 @@ class MetabolismCalculationTests(unittest.TestCase):
         self.assertAlmostEqual(result["vco2_production"], vco2)
         self.assertAlmostEqual(result["rer_rq"], vco2 / vo2)
         self.assertAlmostEqual(result["ee_energy_expenditure"], 60 * (3.941 * vo2 + 1.106 * vco2))
+
+    def test_reference_co2_uses_configured_percentage_point_subtraction(self):
+        self.assertAlmostEqual(0.0339, adjust_reference_co2(0.0464, 0.0125))
+        self.assertIsNone(adjust_reference_co2(None, 0.0125))
+        self.assertIsNone(adjust_reference_co2(0.0464, "invalid"))
 
     def test_missing_reference_and_invalid_flow_are_unavailable(self):
         for change in ({"reference_CO2_num": None}, {"UFC_flow_num": 0}, {"UFC_flow_num": math.nan}):
