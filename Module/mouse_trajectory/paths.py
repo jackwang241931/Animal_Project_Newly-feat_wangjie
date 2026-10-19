@@ -191,3 +191,9 @@ def get_cage_annotated_history_dir(cage_number: int, export_root: Path | str | N
     history_dir = get_cage_annotated_dir(cage_number, export_root=export_root) / "history"
     history_dir.mkdir(parents=True, exist_ok=True)
     return history_dir
+
+
+def get_cage_segmentation_dir(cage_number: int, export_root: Path | str | None = None) -> Path:
+    segmentation_dir = get_cage_export_dir(cage_number, export_root=export_root) / "segmentation"
+    segmentation_dir.mkdir(parents=True, exist_ok=True)
+    return segmentation_dir

@@ -35,6 +35,7 @@ from Module.mouse_trajectory.paths import (
     create_experiment_export_dir,
     get_cage_annotated_history_dir,
     get_cage_annotated_latest_dir,
+    get_cage_segmentation_dir,
     get_cage_data_dir,
     get_cage_export_dir,
     get_cage_plots_dir,
@@ -250,6 +251,14 @@ class MouseTrajectoryThread(MyQThread):
             max_workers=1,
             thread_name_prefix="mouse_trajectory_preview",
         )
+        # Bound queued full-resolution mask images so prolonged disk stalls do
+        # not consume unbounded memory. Waiting here preserves every mask from
+        # a frame that actually reached E2 XY inference.
+        self.segmentation_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="mouse_trajectory_segmentation",
+        )
+        self.segmentation_write_slots = threading.BoundedSemaphore(16)
         self.plot_executor = ThreadPoolExecutor(
             max_workers=1,
             thread_name_prefix="mouse_trajectory_plot",
@@ -559,6 +568,12 @@ class MouseTrajectoryThread(MyQThread):
 
     def _get_cage_annotated_history_dir(self, cage_number: int) -> Path:
         return get_cage_annotated_history_dir(
+            cage_number,
+            export_root=self._require_export_root(),
+        )
+
+    def _get_cage_segmentation_dir(self, cage_number: int) -> Path:
+        return get_cage_segmentation_dir(
             cage_number,
             export_root=self._require_export_root(),
         )
@@ -1495,6 +1510,7 @@ class MouseTrajectoryThread(MyQThread):
         executor: ThreadPoolExecutor,
         callback,
         *args,
+        on_done=None,
         **kwargs,
     ) -> bool:
         with self.async_job_lock:
@@ -1528,6 +1544,8 @@ class MouseTrajectoryThread(MyQThread):
                 with self.async_job_lock:
                     if self.async_jobs.get(job_key) is done_future:
                         self.async_jobs.pop(job_key, None)
+                if on_done is not None:
+                    on_done()
 
         future.add_done_callback(_job_done)
         return True
@@ -1560,6 +1578,9 @@ class MouseTrajectoryThread(MyQThread):
             "previewQueueSize": sum(
                 1 for job_key in active_keys if job_key and job_key[0] == "preview"
             ),
+            "segmentationQueueSize": sum(
+                1 for job_key in active_keys if job_key and job_key[0] == "segmentation"
+            ),
             "plotQueueSize": sum(
                 1 for job_key in active_keys if job_key and job_key[0] == "window_plot"
             ),
@@ -1578,6 +1599,12 @@ class MouseTrajectoryThread(MyQThread):
             self.preview_executor.shutdown(**shutdown_kwargs)
         except TypeError:
             self.preview_executor.shutdown(wait=wait)
+        # Segmentation images are experiment data, not disposable previews.
+        # Normal finalization has already waited for these jobs above.
+        try:
+            self.segmentation_executor.shutdown(wait=wait, cancel_futures=False)
+        except TypeError:
+            self.segmentation_executor.shutdown(wait=wait)
         try:
             self.output_executor.shutdown(**shutdown_kwargs)
         except TypeError:
@@ -1873,7 +1900,6 @@ class MouseTrajectoryThread(MyQThread):
         mouse_box: DetectionBox | None,
         solved: dict[str, Any] | None,
         status: str,
-        debug_masks: dict[str, Any] | None = None,
     ) -> tuple[Path | None, Path | None]:
         try:
             last_save_time = self.last_annotated_save_by_cage.get(cage_number, 0.0)
@@ -1882,9 +1908,6 @@ class MouseTrajectoryThread(MyQThread):
                 and timestamp - last_save_time < self.annotated_save_interval_seconds
             ):
                 return self.latest_annotated_path_by_cage.get(cage_number), None
-
-            if debug_masks:
-                self._save_segmentation_debug_images(cage_number, image_source, debug_masks)
 
             render_start = time.perf_counter()
             image = render_annotation_image(
@@ -1964,10 +1987,12 @@ class MouseTrajectoryThread(MyQThread):
     def _save_segmentation_debug_images(
         self,
         cage_number: int,
+        frame_id: int,
+        timestamp: float,
         image_source: Path | Any,
         debug_masks: dict[str, Any],
     ) -> None:
-        """Best-effort XY mask snapshots; output failures must not stop tracking."""
+        """Save every successfully segmented frame in this cage's own directory."""
         try:
             frame = (
                 cv2.imread(str(image_source))
@@ -1977,15 +2002,17 @@ class MouseTrajectoryThread(MyQThread):
             if frame is None or frame.ndim != 3 or frame.shape[2] < 3:
                 raise ValueError("segmentation debug frame must be a BGR image")
             masks = {
-                "sam_mouse_mask_latest.png": debug_masks["sam_mouse"],
-                "model_mouse_mask_latest.png": debug_masks["model_mouse"],
-                "model_cage_mask_latest.png": debug_masks["model_cage"],
+                "sam_mouse_mask.png": debug_masks["sam_mouse"],
+                "model_mouse_mask.png": debug_masks["model_mouse"],
+                "model_cage_mask.png": debug_masks["model_cage"],
             }
-            sam_mask = np.asarray(masks["sam_mouse_mask_latest.png"], dtype=np.uint8)
+            sam_mask = np.asarray(masks["sam_mouse_mask.png"], dtype=np.uint8)
             if sam_mask.shape != frame.shape[:2]:
                 raise ValueError("MobileSAM mask and source frame dimensions differ")
 
-            latest_dir = self._get_cage_annotated_latest_dir(cage_number)
+            segmentation_dir = self._get_cage_segmentation_dir(cage_number)
+            timestamp_text = datetime.fromtimestamp(timestamp).strftime("%Y%m%d_%H%M%S_%f")
+            frame_prefix = f"{timestamp_text}_f{int(frame_id):08d}_{time.time_ns()}"
             for filename, mask in masks.items():
                 mask_image = np.asarray(mask, dtype=np.uint8)
                 if mask_image.ndim != 2:
@@ -1994,7 +2021,7 @@ class MouseTrajectoryThread(MyQThread):
                 if not encoded_ok:
                     raise OSError(f"could not encode {filename}")
                 self._write_encoded_jpg_atomic(
-                    latest_dir / filename, encoded.tobytes()
+                    segmentation_dir / f"{frame_prefix}_{filename}", encoded.tobytes()
                 )
 
             overlay = frame.copy()
@@ -2017,10 +2044,51 @@ class MouseTrajectoryThread(MyQThread):
             if not encoded_ok:
                 raise OSError("could not encode segmentation overlay")
             self._write_encoded_jpg_atomic(
-                latest_dir / "segmentation_overlay_latest.jpg", encoded.tobytes()
+                segmentation_dir / f"{frame_prefix}_segmentation_overlay.jpg",
+                encoded.tobytes(),
             )
         except Exception as error:
-            logger.warning(f"save segmentation debug images failed cage={cage_number}: {error}")
+            logger.warning(
+                f"save segmentation images failed cage={cage_number} "
+                f"frame_id={frame_id}: {error}"
+            )
+
+    def _schedule_segmentation_debug_images(
+        self,
+        cage_number: int,
+        frame_id: int,
+        timestamp: float,
+        image_source: Path | Any,
+        debug_masks: dict[str, Any],
+    ) -> None:
+        # Backpressure keeps memory bounded without silently skipping masks
+        # from frames that completed segmentation.
+        self.segmentation_write_slots.acquire()
+        try:
+            submitted = self._submit_async_job(
+                ("segmentation", cage_number, frame_id, timestamp, time.monotonic_ns()),
+                self.segmentation_executor,
+                self._save_segmentation_debug_images,
+                cage_number,
+                frame_id,
+                timestamp,
+                image_source,
+                debug_masks,
+                on_done=self.segmentation_write_slots.release,
+            )
+        except Exception as error:
+            self.segmentation_write_slots.release()
+            logger.warning(
+                f"segmentation image job failed to start cage={cage_number} "
+                f"frame_id={frame_id}: {error}"
+            )
+            return
+        if not submitted:
+            self.segmentation_write_slots.release()
+            logger.warning(
+                f"segmentation image job was not accepted cage={cage_number} "
+                f"frame_id={frame_id}"
+            )
 
     def _schedule_mouse_detection_images(
         self,
@@ -2032,7 +2100,6 @@ class MouseTrajectoryThread(MyQThread):
         mouse_box: DetectionBox | None,
         solved: dict[str, Any] | None,
         status: str,
-        debug_masks: dict[str, Any] | None = None,
     ) -> tuple[Path | None, Path | None]:
         last_schedule_time = self.last_annotated_schedule_by_cage.get(cage_number, 0.0)
         if (
@@ -2053,7 +2120,6 @@ class MouseTrajectoryThread(MyQThread):
             mouse_box,
             solved,
             status,
-            debug_masks,
         )
         if submitted:
             self.last_annotated_schedule_by_cage[cage_number] = timestamp
@@ -2475,23 +2541,11 @@ class MouseTrajectoryThread(MyQThread):
         if not prediction_frames:
             return
 
-        debug_mask_indexes: set[int] = set()
-        if self.xy_save_segmentation_debug:
-            selected_cages: set[int] = set()
-            for prediction_index, source_index in enumerate(prediction_indexes):
-                item = prepared_items[source_index]
-                cage_number = int(item["cage_number"])
-                timestamp = float(item["timestamp"])
-                if cage_number in selected_cages:
-                    continue
-                if (
-                    self.annotated_save_interval_seconds > 0
-                    and timestamp - self.last_annotated_schedule_by_cage.get(cage_number, 0.0)
-                    < self.annotated_save_interval_seconds
-                ):
-                    continue
-                debug_mask_indexes.add(prediction_index)
-                selected_cages.add(cage_number)
+        debug_mask_indexes = (
+            set(range(len(prediction_indexes)))
+            if self.xy_save_segmentation_debug
+            else set()
+        )
 
         prediction_start = time.perf_counter()
         try:
@@ -2716,6 +2770,7 @@ class MouseTrajectoryThread(MyQThread):
             f"reserved={reserved_count}, "
             f"record_queue={async_sizes['recordQueueSize']}, "
             f"preview_queue={async_sizes['previewQueueSize']}, "
+            f"segmentation_queue={async_sizes['segmentationQueueSize']}, "
             f"plot_queue={async_sizes['plotQueueSize']}, "
             f"unflushed_rows={unflushed_row_count}, "
             f"window_points={sum(len(rows) for rows in self.window_rows_by_cage.values())}, "
@@ -3031,6 +3086,19 @@ class MouseTrajectoryThread(MyQThread):
             shift_log=shift_log,
             timestamp=timestamp,
         )
+        debug_masks = (
+            (item.get("xy_prediction") or {}).get("debug_masks")
+            if self._is_e2_xy_mode()
+            else None
+        )
+        if debug_masks is not None:
+            self._schedule_segmentation_debug_images(
+                cage_number,
+                frame_id,
+                timestamp,
+                item.get("source_frame"),
+                debug_masks,
+            )
         mouse_annotated_path, mouse_annotated_history_path = self._schedule_mouse_detection_images(
             cage_number=cage_number,
             frame_id=frame_id,
@@ -3040,11 +3108,6 @@ class MouseTrajectoryThread(MyQThread):
             mouse_box=mouse_box,
             solved=solved,
             status=status,
-            debug_masks=(
-                (item.get("xy_prediction") or {}).get("debug_masks")
-                if self._is_e2_xy_mode()
-                else None
-            ),
         )
         self._schedule_saved_color_frame_annotation(
             cage_number=cage_number,
