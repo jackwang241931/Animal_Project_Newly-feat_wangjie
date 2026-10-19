@@ -1,0 +1,366 @@
+{
+  "schema_version": 1,
+  "description": "Exact per-cage aligned side-view cage quadrilaterals used for E2_ResNet18_CageMouseMask_YOLO6_relativeXY training.",
+  "point_order": "far-left, far-right, near-right, near-left",
+  "input_size_px": [
+    256,
+    144
+  ],
+  "default_physical_cage_size_mm": {
+    "width_x": 180.0,
+    "depth_y": 360.0
+  },
+  "geometry_alignment": "side-view cage quad near/bottom vertices [2,3] exactly replaced by authored floor-grid quad near vertices [2,3]",
+  "calibrations": {
+    "12.57_c1": {
+      "image_size_px": [
+        1280,
+        720
+      ],
+      "aligned_cage_quad_px": [
+        [
+          92.0,
+          4.0
+        ],
+        [
+          1194.0,
+          4.0
+        ],
+        [
+          1111.5384521484375,
+          608.4615478515625
+        ],
+        [
+          154.61538696289062,
+          627.6923217773438
+        ]
+      ],
+      "quad_order": "far-left, far-right, near-right, near-left"
+    },
+    "12.57_c2": {
+      "image_size_px": [
+        1280,
+        720
+      ],
+      "aligned_cage_quad_px": [
+        [
+          84.0,
+          4.0
+        ],
+        [
+          1162.0,
+          4.0
+        ],
+        [
+          1105.3846435546875,
+          655.3846435546875
+        ],
+        [
+          135.38461303710938,
+          655.3846435546875
+        ]
+      ],
+      "quad_order": "far-left, far-right, near-right, near-left"
+    },
+    "12.57_c3": {
+      "image_size_px": [
+        1280,
+        720
+      ],
+      "aligned_cage_quad_px": [
+        [
+          140.0,
+          4.0
+        ],
+        [
+          1226.0,
+          4.0
+        ],
+        [
+          1142.3077392578125,
+          580.0
+        ],
+        [
+          208.46153259277344,
+          591.5384521484375
+        ]
+      ],
+      "quad_order": "far-left, far-right, near-right, near-left"
+    },
+    "12.57_c4": {
+      "image_size_px": [
+        1280,
+        720
+      ],
+      "aligned_cage_quad_px": [
+        [
+          68.0,
+          12.0
+        ],
+        [
+          1226.0,
+          12.0
+        ],
+        [
+          1125.3846435546875,
+          561.5384521484375
+        ],
+        [
+          160.76922607421875,
+          560.7692260742188
+        ]
+      ],
+      "quad_order": "far-left, far-right, near-right, near-left"
+    },
+    "13.10_c1": {
+      "image_size_px": [
+        1280,
+        720
+      ],
+      "aligned_cage_quad_px": [
+        [
+          92.0,
+          4.0
+        ],
+        [
+          1194.0,
+          4.0
+        ],
+        [
+          1118.4615478515625,
+          613.8461303710938
+        ],
+        [
+          170.76922607421875,
+          616.1538696289062
+        ]
+      ],
+      "quad_order": "far-left, far-right, near-right, near-left"
+    },
+    "13.10_c2": {
+      "image_size_px": [
+        1280,
+        720
+      ],
+      "aligned_cage_quad_px": [
+        [
+          92.0,
+          4.0
+        ],
+        [
+          1162.0,
+          4.0
+        ],
+        [
+          1114.6153564453125,
+          638.4615478515625
+        ],
+        [
+          139.23077392578125,
+          647.6923217773438
+        ]
+      ],
+      "quad_order": "far-left, far-right, near-right, near-left"
+    },
+    "13.10_c3": {
+      "image_size_px": [
+        1280,
+        720
+      ],
+      "aligned_cage_quad_px": [
+        [
+          140.0,
+          4.0
+        ],
+        [
+          1226.0,
+          14.0
+        ],
+        [
+          1136.15380859375,
+          586.923095703125
+        ],
+        [
+          197.6923065185547,
+          590.7692260742188
+        ]
+      ],
+      "quad_order": "far-left, far-right, near-right, near-left"
+    },
+    "13.10_c4": {
+      "image_size_px": [
+        1280,
+        720
+      ],
+      "aligned_cage_quad_px": [
+        [
+          71.0,
+          20.0
+        ],
+        [
+          1226.0,
+          20.0
+        ],
+        [
+          1121.5384521484375,
+          560.0
+        ],
+        [
+          164.61538696289062,
+          562.3076782226562
+        ]
+      ],
+      "quad_order": "far-left, far-right, near-right, near-left"
+    },
+    "14.13_c1": {
+      "image_size_px": [
+        1280,
+        720
+      ],
+      "aligned_cage_quad_px": [
+        [
+          92.0,
+          4.0
+        ],
+        [
+          1170.0,
+          4.0
+        ],
+        [
+          1111.5384521484375,
+          662.3076782226562
+        ],
+        [
+          136.92308044433594,
+          670.0
+        ]
+      ],
+      "quad_order": "far-left, far-right, near-right, near-left"
+    },
+    "14.13_c2": {
+      "image_size_px": [
+        1280,
+        720
+      ],
+      "aligned_cage_quad_px": [
+        [
+          116.0,
+          4.0
+        ],
+        [
+          1202.0,
+          4.0
+        ],
+        [
+          1116.15380859375,
+          640.0
+        ],
+        [
+          150.0,
+          632.3076782226562
+        ]
+      ],
+      "quad_order": "far-left, far-right, near-right, near-left"
+    },
+    "14.13_c3": {
+      "image_size_px": [
+        1280,
+        720
+      ],
+      "aligned_cage_quad_px": [
+        [
+          132.0,
+          4.0
+        ],
+        [
+          1218.0,
+          4.0
+        ],
+        [
+          1131.5384521484375,
+          591.5384521484375
+        ],
+        [
+          206.15383911132812,
+          597.6923217773438
+        ]
+      ],
+      "quad_order": "far-left, far-right, near-right, near-left"
+    },
+    "14.13_c4": {
+      "image_size_px": [
+        1280,
+        720
+      ],
+      "aligned_cage_quad_px": [
+        [
+          72.0,
+          4.0
+        ],
+        [
+          1226.0,
+          4.0
+        ],
+        [
+          1127.6922607421875,
+          562.3076782226562
+        ],
+        [
+          166.15383911132812,
+          563.076904296875
+        ]
+      ],
+      "quad_order": "far-left, far-right, near-right, near-left"
+    },
+    "14.27_ir_c3": {
+      "image_size_px": [
+        1280,
+        720
+      ],
+      "aligned_cage_quad_px": [
+        [
+          128.0,
+          12.0
+        ],
+        [
+          1218.0,
+          12.0
+        ],
+        [
+          1136.923095703125,
+          600.0
+        ],
+        [
+          203.07691955566406,
+          599.2307739257812
+        ]
+      ],
+      "quad_order": "far-left, far-right, near-right, near-left"
+    },
+    "15.43_ir_c2": {
+      "image_size_px": [
+        1280,
+        720
+      ],
+      "aligned_cage_quad_px": [
+        [
+          109.0,
+          35.0
+        ],
+        [
+          1206.0,
+          35.0
+        ],
+        [
+          1127.5,
+          647.0833129882812
+        ],
+        [
+          166.6666717529297,
+          637.0833129882812
+        ]
+      ],
+      "quad_order": "far-left, far-right, near-right, near-left"
+    }
+  }
+}

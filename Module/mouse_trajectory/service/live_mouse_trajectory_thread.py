@@ -27,6 +27,9 @@ from Module.mouse_trajectory.paths import (
     DEFAULT_MOUSE_MODEL_PATH,
     DEFAULT_XY_MODEL_PATH,
     DEFAULT_XY_MOUSE_MODEL_PATH,
+    DEFAULT_XY_SAM_MODEL_PATH,
+    DEFAULT_XY_CAGE_CALIBRATIONS_PATH,
+    DEFAULT_XY_CAGE_MAPPING_PATH,
     DEFAULT_REFERENCE_IMAGE_PATH,
     EXPORT_DIR,
     PROJECT_ROOT,
@@ -190,11 +193,17 @@ class MouseTrajectoryThread(MyQThread):
         self.mouse_model_path = DEFAULT_MOUSE_MODEL_PATH
         self.xy_model_path = DEFAULT_XY_MODEL_PATH
         self.xy_mouse_model_path = DEFAULT_XY_MOUSE_MODEL_PATH
+        self.xy_sam_model_path = DEFAULT_XY_SAM_MODEL_PATH
+        self.xy_cage_calibrations_path = DEFAULT_XY_CAGE_CALIBRATIONS_PATH
+        self.xy_cage_mapping_path = DEFAULT_XY_CAGE_MAPPING_PATH
         self.coordinate_mode = "legacy_xyz"
         self.xy_device = "auto"
         self.xy_imgsz = 640
+        self.xy_sam_imgsz = 1024
         self.xy_batch_size = 8
         self.xy_conf_mouse = 0.25
+        self.xy_cage_width_mm = 180.0
+        self.xy_cage_depth_mm = 360.0
 
         self.conf_box = 0.4
         self.conf_mouse = float(self.runtime_tuning["mouse_confidence"])
@@ -1142,6 +1151,18 @@ class MouseTrajectoryThread(MyQThread):
                 ),
                 0.0,
             )
+            self.xy_sam_imgsz = max(
+                int(float(trajectory_config.get("xy_sam_imgsz", self.xy_sam_imgsz) or self.xy_sam_imgsz)),
+                32,
+            )
+            self.xy_cage_width_mm = float(
+                trajectory_config.get("xy_cage_width_mm", self.xy_cage_width_mm)
+                or self.xy_cage_width_mm
+            )
+            self.xy_cage_depth_mm = float(
+                trajectory_config.get("xy_cage_depth_mm", self.xy_cage_depth_mm)
+                or self.xy_cage_depth_mm
+            )
             self.imgsz = int(float(trajectory_config.get("yolo_imgsz", self.imgsz) or self.imgsz))
             self.batch_size = max(
                 int(float(trajectory_config.get("yolo_batch_size", self.batch_size) or self.batch_size)),
@@ -1589,6 +1610,9 @@ class MouseTrajectoryThread(MyQThread):
             for required_path in (
                 self.xy_model_path,
                 self.xy_mouse_model_path,
+                self.xy_sam_model_path,
+                self.xy_cage_calibrations_path,
+                self.xy_cage_mapping_path,
             ):
                 if required_path is None or not Path(required_path).exists():
                     raise FileNotFoundError(
@@ -1611,10 +1635,27 @@ class MouseTrajectoryThread(MyQThread):
             )
             self.xy_predictor = E2XYPredictor(
                 self.xy_model_path,
+                sam_weights_path=self.xy_sam_model_path,
+                calibrations_path=self.xy_cage_calibrations_path,
+                cage_mapping_path=self.xy_cage_mapping_path,
                 device=self.xy_device,
+                cage_width_mm=self.xy_cage_width_mm,
+                cage_depth_mm=self.xy_cage_depth_mm,
+                sam_imgsz=self.xy_sam_imgsz,
             )
+            unmapped_cages = [
+                cage_number
+                for cage_number in range(1, 9)
+                if str(cage_number) not in self.xy_predictor.cage_key_by_cage
+            ]
+            if unmapped_cages:
+                logger.warning(
+                    "E2 XY cage calibration mapping is incomplete for cages "
+                    f"{unmapped_cages}; fill {self.xy_cage_mapping_path} "
+                    "before relying on their coordinates"
+                )
             logger.info(
-                "E2 XY trajectory models loaded successfully; "
+                "E2 XY mask/Yolo6 trajectory models loaded successfully; "
                 "3D geometry solver and Z-axis output are disabled"
             )
             return
@@ -2260,6 +2301,7 @@ class MouseTrajectoryThread(MyQThread):
         prediction_indexes: list[int] = []
         prediction_frames: list[Any] = []
         prediction_boxes: list[DetectionBox] = []
+        prediction_cages: list[int] = []
         for source_index in source_indexes:
             item = prepared_items[source_index]
             if item.get("error"):
@@ -2277,6 +2319,7 @@ class MouseTrajectoryThread(MyQThread):
             prediction_indexes.append(source_index)
             prediction_frames.append(item["source_frame"])
             prediction_boxes.append(mouse_box)
+            prediction_cages.append(int(item["cage_number"]))
 
         if not prediction_frames:
             return
@@ -2286,6 +2329,7 @@ class MouseTrajectoryThread(MyQThread):
             predictions = predictor.predict_batch(
                 prediction_frames,
                 prediction_boxes,
+                prediction_cages,
             )
             if len(predictions) != len(prediction_indexes):
                 raise RuntimeError(
@@ -2295,19 +2339,38 @@ class MouseTrajectoryThread(MyQThread):
                 prediction_indexes,
                 predictions,
             ):
-                prepared_items[source_index]["xy_prediction"] = prediction
+                if prediction.get("error"):
+                    prepared_items[source_index]["status"] = "error"
+                    prepared_items[source_index]["error"] = (
+                        f"E2 XY prediction failed: {prediction['error']}"
+                    )
+                    logger.error(
+                        "E2 XY prediction failed "
+                        f"cage={prepared_items[source_index].get('cage_number')} "
+                        f"frame_id={prepared_items[source_index].get('frame_id')}: "
+                        f"{prediction['error']}"
+                    )
+                else:
+                    prepared_items[source_index]["xy_prediction"] = prediction
         except Exception as error:
             logger.warning(
                 "E2 XY batch prediction failed; falling back to single-frame "
                 f"prediction: {error}"
             )
-            for source_index, frame, mouse_box in zip(
+            for source_index, frame, mouse_box, cage_number in zip(
                 prediction_indexes,
                 prediction_frames,
                 prediction_boxes,
+                prediction_cages,
             ):
                 try:
-                    prediction = predictor.predict_batch([frame], [mouse_box])[0]
+                    prediction = predictor.predict_batch(
+                        [frame],
+                        [mouse_box],
+                        [cage_number],
+                    )[0]
+                    if prediction.get("error"):
+                        raise RuntimeError(prediction["error"])
                     prepared_items[source_index]["xy_prediction"] = prediction
                 except Exception as single_error:
                     prepared_items[source_index]["status"] = "error"
@@ -2588,7 +2651,7 @@ class MouseTrajectoryThread(MyQThread):
                             "X": float(prediction["x_mm"]),
                             "Y": float(prediction["y_mm"]),
                             "Z": None,
-                            "locatorMethod": "e2_rgb_yolo6",
+                            "locatorMethod": "e2_mask_yolo6",
                             "registrationSource": "",
                         }
                 else:
@@ -2637,15 +2700,15 @@ class MouseTrajectoryThread(MyQThread):
                             "rawZ": None,
                             "rawX": row.get("X"),
                             "rawY": row.get("Y"),
-                            "yTopBinCenterMm": prediction.get(
-                                "y_top_bin_center_mm"
-                            ),
-                            "yTopBinProbability": prediction.get(
-                                "y_top_bin_probability"
-                            ),
+                            "xyRelativeX": prediction.get("x_relative"),
+                            "xyRelativeY": prediction.get("y_relative"),
+                            "cageCalibrationKey": prediction.get("cage_key"),
                             "xyModelWeight": str(self.xy_model_path or ""),
                             "mouseDetectorWeight": str(
                                 self.xy_mouse_model_path or ""
+                            ),
+                            "mouseSegmenterWeight": str(
+                                self.xy_sam_model_path or ""
                             ),
                         }
                     )
@@ -3015,6 +3078,17 @@ class MouseTrajectoryThread(MyQThread):
                 else self.mouse_model_path
             ),
             "xyModelWeight": str(self.xy_model_path) if self._is_e2_xy_mode() else "",
+            "xySegmenterWeight": (
+                str(self.xy_sam_model_path) if self._is_e2_xy_mode() else ""
+            ),
+            "xyCageCalibrations": (
+                str(self.xy_cage_calibrations_path)
+                if self._is_e2_xy_mode()
+                else ""
+            ),
+            "xyCageMapping": (
+                str(self.xy_cage_mapping_path) if self._is_e2_xy_mode() else ""
+            ),
             "instrumentAreaJson": (
                 ""
                 if self._is_e2_xy_mode()

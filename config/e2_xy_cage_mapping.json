@@ -1,0 +1,19 @@
+{
+  "description": "Map physical cage number to a matching side-view key in model/e2_xy_mask_yolo6/cage_calibrations.json. Fill each value only after confirming the camera view.",
+  "available_cage_keys": [
+    "12.57_c1", "12.57_c2", "12.57_c3", "12.57_c4",
+    "13.10_c1", "13.10_c2", "13.10_c3", "13.10_c4",
+    "14.13_c1", "14.13_c2", "14.13_c3", "14.13_c4",
+    "14.27_ir_c3", "15.43_ir_c2"
+  ],
+  "cage_key_by_cage": {
+    "1": "",
+    "2": "",
+    "3": "",
+    "4": "",
+    "5": "",
+    "6": "",
+    "7": "",
+    "8": ""
+  }
+}

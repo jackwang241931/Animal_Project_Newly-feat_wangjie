@@ -87,6 +87,11 @@ def first_existing_path(*paths: Path) -> Path | None:
 
 
 def _resolve_configured_model_path(option_name: str) -> Path | None:
+    configured_path = _configured_path(option_name)
+    return configured_path if configured_path is not None and configured_path.exists() else None
+
+
+def _configured_path(option_name: str) -> Path | None:
     parser = _load_camera_config_parser()
     if parser is None or not parser.has_section("MOUSE_TRAJECTORY"):
         return None
@@ -99,7 +104,7 @@ def _resolve_configured_model_path(option_name: str) -> Path | None:
     if not configured_path.is_absolute():
         configured_path = (PROJECT_ROOT / configured_path).resolve()
 
-    return configured_path if configured_path.exists() else None
+    return configured_path
 
 
 DEFAULT_REFERENCE_IMAGE_PATH = first_existing_path(
@@ -137,14 +142,29 @@ DEFAULT_MOUSE_MODEL_PATH = first_existing_path(
     MODEL_DIR / "best_box.pt",
 )
 
-DEFAULT_XY_MODEL_PATH = first_existing_path(
-    _resolve_configured_model_path("xy_model_path"),
-    MODEL_DIR / "mouse_xy_e2.pt",
+DEFAULT_XY_MODEL_PATH = (
+    _configured_path("xy_model_path")
+    or MODEL_DIR / "e2_xy_mask_yolo6" / "best_model.pt"
 )
 
-DEFAULT_XY_MOUSE_MODEL_PATH = first_existing_path(
-    _resolve_configured_model_path("xy_mouse_model_path"),
-    MODEL_DIR / "mouse_detector_fuyang.pt",
+DEFAULT_XY_MOUSE_MODEL_PATH = (
+    _configured_path("xy_mouse_model_path")
+    or MODEL_DIR / "e2_xy_mask_yolo6" / "best_mouse.pt"
+)
+
+DEFAULT_XY_SAM_MODEL_PATH = (
+    _configured_path("xy_sam_model_path")
+    or MODEL_DIR / "e2_xy_mask_yolo6" / "mobile_sam.pt"
+)
+
+DEFAULT_XY_CAGE_CALIBRATIONS_PATH = (
+    _configured_path("xy_cage_calibrations_path")
+    or MODEL_DIR / "e2_xy_mask_yolo6" / "cage_calibrations.json"
+)
+
+DEFAULT_XY_CAGE_MAPPING_PATH = (
+    _configured_path("xy_cage_mapping_path")
+    or PROJECT_ROOT / "config" / "e2_xy_cage_mapping.json"
 )
 
 
