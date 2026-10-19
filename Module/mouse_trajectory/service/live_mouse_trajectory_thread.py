@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import cv2
+import numpy as np
 import torch
 from PyQt6.QtCore import pyqtSignal
 from loguru import logger
@@ -192,6 +193,7 @@ class MouseTrajectoryThread(MyQThread):
         self.xy_model_path = DEFAULT_XY_MODEL_PATH
         self.xy_mouse_model_path = DEFAULT_XY_MOUSE_MODEL_PATH
         self.xy_sam_model_path = DEFAULT_XY_SAM_MODEL_PATH
+        self.xy_save_segmentation_debug = True
         self.coordinate_mode = "legacy_xyz"
         self.xy_device = "auto"
         self.xy_imgsz = 640
@@ -1152,6 +1154,11 @@ class MouseTrajectoryThread(MyQThread):
                 int(float(trajectory_config.get("xy_sam_imgsz", self.xy_sam_imgsz) or self.xy_sam_imgsz)),
                 32,
             )
+            self.xy_save_segmentation_debug = str(
+                trajectory_config.get(
+                    "xy_save_segmentation_debug", self.xy_save_segmentation_debug
+                )
+            ).strip().lower() in {"1", "true", "yes", "on"}
             self.xy_cage_width_mm = float(
                 trajectory_config.get("xy_cage_width_mm", self.xy_cage_width_mm)
                 or self.xy_cage_width_mm
@@ -1866,6 +1873,7 @@ class MouseTrajectoryThread(MyQThread):
         mouse_box: DetectionBox | None,
         solved: dict[str, Any] | None,
         status: str,
+        debug_masks: dict[str, Any] | None = None,
     ) -> tuple[Path | None, Path | None]:
         try:
             last_save_time = self.last_annotated_save_by_cage.get(cage_number, 0.0)
@@ -1874,6 +1882,9 @@ class MouseTrajectoryThread(MyQThread):
                 and timestamp - last_save_time < self.annotated_save_interval_seconds
             ):
                 return self.latest_annotated_path_by_cage.get(cage_number), None
+
+            if debug_masks:
+                self._save_segmentation_debug_images(cage_number, image_source, debug_masks)
 
             render_start = time.perf_counter()
             image = render_annotation_image(
@@ -1950,6 +1961,67 @@ class MouseTrajectoryThread(MyQThread):
             logger.error(f"save mouse detection image failed cage={cage_number}: {error}")
             return None, None
 
+    def _save_segmentation_debug_images(
+        self,
+        cage_number: int,
+        image_source: Path | Any,
+        debug_masks: dict[str, Any],
+    ) -> None:
+        """Best-effort XY mask snapshots; output failures must not stop tracking."""
+        try:
+            frame = (
+                cv2.imread(str(image_source))
+                if isinstance(image_source, Path)
+                else image_source
+            )
+            if frame is None or frame.ndim != 3 or frame.shape[2] < 3:
+                raise ValueError("segmentation debug frame must be a BGR image")
+            masks = {
+                "sam_mouse_mask_latest.png": debug_masks["sam_mouse"],
+                "model_mouse_mask_latest.png": debug_masks["model_mouse"],
+                "model_cage_mask_latest.png": debug_masks["model_cage"],
+            }
+            sam_mask = np.asarray(masks["sam_mouse_mask_latest.png"], dtype=np.uint8)
+            if sam_mask.shape != frame.shape[:2]:
+                raise ValueError("MobileSAM mask and source frame dimensions differ")
+
+            latest_dir = self._get_cage_annotated_latest_dir(cage_number)
+            for filename, mask in masks.items():
+                mask_image = np.asarray(mask, dtype=np.uint8)
+                if mask_image.ndim != 2:
+                    raise ValueError(f"{filename} must be a single-channel mask")
+                encoded_ok, encoded = cv2.imencode(".png", mask_image)
+                if not encoded_ok:
+                    raise OSError(f"could not encode {filename}")
+                self._write_encoded_jpg_atomic(
+                    latest_dir / filename, encoded.tobytes()
+                )
+
+            overlay = frame.copy()
+            selected = sam_mask > 0
+            overlay[selected] = (
+                (
+                    overlay[selected].astype(np.uint16) * 2
+                    + np.array([0, 255, 0], dtype=np.uint16) * 3
+                ) // 5
+            ).astype(np.uint8)
+            contours, _ = cv2.findContours(
+                sam_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+            cv2.drawContours(overlay, contours, -1, (0, 255, 255), 2)
+            encoded_ok, encoded = cv2.imencode(
+                ".jpg",
+                overlay,
+                [int(cv2.IMWRITE_JPEG_QUALITY), int(self.mouse_annotated_jpg_quality)],
+            )
+            if not encoded_ok:
+                raise OSError("could not encode segmentation overlay")
+            self._write_encoded_jpg_atomic(
+                latest_dir / "segmentation_overlay_latest.jpg", encoded.tobytes()
+            )
+        except Exception as error:
+            logger.warning(f"save segmentation debug images failed cage={cage_number}: {error}")
+
     def _schedule_mouse_detection_images(
         self,
         cage_number: int,
@@ -1960,6 +2032,7 @@ class MouseTrajectoryThread(MyQThread):
         mouse_box: DetectionBox | None,
         solved: dict[str, Any] | None,
         status: str,
+        debug_masks: dict[str, Any] | None = None,
     ) -> tuple[Path | None, Path | None]:
         last_schedule_time = self.last_annotated_schedule_by_cage.get(cage_number, 0.0)
         if (
@@ -1980,6 +2053,7 @@ class MouseTrajectoryThread(MyQThread):
             mouse_box,
             solved,
             status,
+            debug_masks,
         )
         if submitted:
             self.last_annotated_schedule_by_cage[cage_number] = timestamp
@@ -2401,12 +2475,31 @@ class MouseTrajectoryThread(MyQThread):
         if not prediction_frames:
             return
 
+        debug_mask_indexes: set[int] = set()
+        if self.xy_save_segmentation_debug:
+            selected_cages: set[int] = set()
+            for prediction_index, source_index in enumerate(prediction_indexes):
+                item = prepared_items[source_index]
+                cage_number = int(item["cage_number"])
+                timestamp = float(item["timestamp"])
+                if cage_number in selected_cages:
+                    continue
+                if (
+                    self.annotated_save_interval_seconds > 0
+                    and timestamp - self.last_annotated_schedule_by_cage.get(cage_number, 0.0)
+                    < self.annotated_save_interval_seconds
+                ):
+                    continue
+                debug_mask_indexes.add(prediction_index)
+                selected_cages.add(cage_number)
+
         prediction_start = time.perf_counter()
         try:
             predictions = predictor.predict_batch(
                 prediction_frames,
                 prediction_boxes,
                 prediction_quads,
+                debug_mask_indexes=debug_mask_indexes,
             )
             if len(predictions) != len(prediction_indexes):
                 raise RuntimeError(
@@ -2434,17 +2527,17 @@ class MouseTrajectoryThread(MyQThread):
                 "E2 XY batch prediction failed; falling back to single-frame "
                 f"prediction: {error}"
             )
-            for source_index, frame, mouse_box, cage_quad in zip(
-                prediction_indexes,
-                prediction_frames,
-                prediction_boxes,
-                prediction_quads,
+            for prediction_index, (source_index, frame, mouse_box, cage_quad) in enumerate(
+                zip(prediction_indexes, prediction_frames, prediction_boxes, prediction_quads)
             ):
                 try:
                     prediction = predictor.predict_batch(
                         [frame],
                         [mouse_box],
                         [cage_quad],
+                        debug_mask_indexes=(
+                            {0} if prediction_index in debug_mask_indexes else None
+                        ),
                     )[0]
                     if prediction.get("error"):
                         raise RuntimeError(prediction["error"])
@@ -2947,6 +3040,11 @@ class MouseTrajectoryThread(MyQThread):
             mouse_box=mouse_box,
             solved=solved,
             status=status,
+            debug_masks=(
+                (item.get("xy_prediction") or {}).get("debug_masks")
+                if self._is_e2_xy_mode()
+                else None
+            ),
         )
         self._schedule_saved_color_frame_annotation(
             cage_number=cage_number,

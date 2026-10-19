@@ -171,7 +171,8 @@ def _sam_mouse_crop(
     box_xyxy: Sequence[float],
     device_arg: str,
     imgsz: int,
-) -> np.ndarray:
+    include_full_mask: bool = False,
+) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
     frame_height, frame_width = frame.shape[:2]
     box = np.asarray(box_xyxy, dtype=np.float32)
     results = segmenter.predict(
@@ -211,7 +212,7 @@ def _sam_mouse_crop(
     crop = _largest_component(crop)
     if not np.any(crop):
         raise RuntimeError("MobileSAM mouse mask has no connected foreground")
-    return crop
+    return (crop, full_mask) if include_full_mask else crop
 
 
 def _make_mouse_mask(
@@ -293,6 +294,7 @@ class E2XYPredictor:
         frames_bgr: Sequence[np.ndarray],
         detections: Sequence[Any],
         cage_quads: Sequence[Any],
+        debug_mask_indexes: set[int] | None = None,
     ) -> list[dict[str, Any]]:
         if not (
             len(frames_bgr)
@@ -312,6 +314,9 @@ class E2XYPredictor:
             zip(frames_bgr, detections, cage_quads)
         ):
             try:
+                save_debug_masks = (
+                    debug_mask_indexes is not None and index in debug_mask_indexes
+                )
                 if frame is None or frame.ndim != 3 or frame.shape[2] < 3:
                     raise ValueError("E2 XY requires a three-channel BGR frame")
                 frame_height, frame_width = frame.shape[:2]
@@ -324,13 +329,18 @@ class E2XYPredictor:
                 if mouse_box.shape != (4,):
                     raise ValueError("Mouse detection box must contain four coordinates")
 
-                crop_mask = _sam_mouse_crop(
+                sam_result = _sam_mouse_crop(
                     self.segmenter,
                     frame,
                     mouse_box,
                     self.sam_device_arg,
                     self.sam_imgsz,
+                    include_full_mask=save_debug_masks,
                 )
+                if save_debug_masks:
+                    crop_mask, sam_full_mask = sam_result
+                else:
+                    crop_mask = sam_result
                 cage_mask = _make_cage_mask(cage_quad, frame_width, frame_height)
                 mouse_mask = _make_mouse_mask(
                     crop_mask,
@@ -349,7 +359,14 @@ class E2XYPredictor:
                 )
                 yolo_tensors.append(torch.from_numpy(yolo_features))
                 valid_indexes.append(index)
-                results[index] = {"cage_detection": "best_box.pt"}
+                result: dict[str, Any] = {"cage_detection": "best_box.pt"}
+                if save_debug_masks:
+                    result["debug_masks"] = {
+                        "sam_mouse": sam_full_mask,
+                        "model_mouse": mouse_mask,
+                        "model_cage": cage_mask,
+                    }
+                results[index] = result
             except Exception as error:
                 results[index] = {"error": str(error)}
 
