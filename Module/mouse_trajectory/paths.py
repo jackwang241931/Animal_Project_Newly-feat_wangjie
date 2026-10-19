@@ -157,17 +157,6 @@ DEFAULT_XY_SAM_MODEL_PATH = (
     or MODEL_DIR / "e2_xy_mask_yolo6" / "mobile_sam.pt"
 )
 
-DEFAULT_XY_CAGE_CALIBRATIONS_PATH = (
-    _configured_path("xy_cage_calibrations_path")
-    or MODEL_DIR / "e2_xy_mask_yolo6" / "cage_calibrations.json"
-)
-
-DEFAULT_XY_CAGE_MAPPING_PATH = (
-    _configured_path("xy_cage_mapping_path")
-    or PROJECT_ROOT / "config" / "e2_xy_cage_mapping.json"
-)
-
-
 def get_cage_export_dir(cage_number: int, export_root: Path | str | None = None) -> Path:
     cage_dir = _resolve_export_root(export_root) / f"cage_{int(cage_number)}"
     cage_dir.mkdir(parents=True, exist_ok=True)

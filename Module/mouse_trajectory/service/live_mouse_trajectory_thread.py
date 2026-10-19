@@ -28,8 +28,6 @@ from Module.mouse_trajectory.paths import (
     DEFAULT_XY_MODEL_PATH,
     DEFAULT_XY_MOUSE_MODEL_PATH,
     DEFAULT_XY_SAM_MODEL_PATH,
-    DEFAULT_XY_CAGE_CALIBRATIONS_PATH,
-    DEFAULT_XY_CAGE_MAPPING_PATH,
     DEFAULT_REFERENCE_IMAGE_PATH,
     EXPORT_DIR,
     PROJECT_ROOT,
@@ -194,8 +192,6 @@ class MouseTrajectoryThread(MyQThread):
         self.xy_model_path = DEFAULT_XY_MODEL_PATH
         self.xy_mouse_model_path = DEFAULT_XY_MOUSE_MODEL_PATH
         self.xy_sam_model_path = DEFAULT_XY_SAM_MODEL_PATH
-        self.xy_cage_calibrations_path = DEFAULT_XY_CAGE_CALIBRATIONS_PATH
-        self.xy_cage_mapping_path = DEFAULT_XY_CAGE_MAPPING_PATH
         self.coordinate_mode = "legacy_xyz"
         self.xy_device = "auto"
         self.xy_imgsz = 640
@@ -266,6 +262,7 @@ class MouseTrajectoryThread(MyQThread):
         self.box_model: YOLO | None = None
         self.mouse_model: YOLO | None = None
         self.xy_predictor: E2XYPredictor | None = None
+        self.e2_cage_corners_by_cage: dict[int, BoxCorners] = {}
         self.ref_corners: BoxCorners | None = None
         self.last_cleanup_time = time.time()
 
@@ -1607,12 +1604,12 @@ class MouseTrajectoryThread(MyQThread):
         )
 
         if self._is_e2_xy_mode():
+            self.e2_cage_corners_by_cage.clear()
             for required_path in (
+                self.box_model_path,
                 self.xy_model_path,
                 self.xy_mouse_model_path,
                 self.xy_sam_model_path,
-                self.xy_cage_calibrations_path,
-                self.xy_cage_mapping_path,
             ):
                 if required_path is None or not Path(required_path).exists():
                     raise FileNotFoundError(
@@ -1621,6 +1618,11 @@ class MouseTrajectoryThread(MyQThread):
             logger.info(
                 "mouse trajectory coordinate mode: e2_xy (X/Y only; Z disabled)"
             )
+            logger.info(
+                "loading E2 XY cage detector: "
+                f"{self.box_model_path}"
+            )
+            self.box_model = self._build_model(self.box_model_path, task="segment")
             logger.info(
                 "loading E2 XY mouse detector: "
                 f"{self.xy_mouse_model_path}"
@@ -1636,26 +1638,13 @@ class MouseTrajectoryThread(MyQThread):
             self.xy_predictor = E2XYPredictor(
                 self.xy_model_path,
                 sam_weights_path=self.xy_sam_model_path,
-                calibrations_path=self.xy_cage_calibrations_path,
-                cage_mapping_path=self.xy_cage_mapping_path,
                 device=self.xy_device,
                 cage_width_mm=self.xy_cage_width_mm,
                 cage_depth_mm=self.xy_cage_depth_mm,
                 sam_imgsz=self.xy_sam_imgsz,
             )
-            unmapped_cages = [
-                cage_number
-                for cage_number in range(1, 9)
-                if str(cage_number) not in self.xy_predictor.cage_key_by_cage
-            ]
-            if unmapped_cages:
-                logger.warning(
-                    "E2 XY cage calibration mapping is incomplete for cages "
-                    f"{unmapped_cages}; fill {self.xy_cage_mapping_path} "
-                    "before relying on their coordinates"
-                )
             logger.info(
-                "E2 XY mask/Yolo6 trajectory models loaded successfully; "
+                "E2 XY cage detector, mask/Yolo6 trajectory models loaded successfully; "
                 "3D geometry solver and Z-axis output are disabled"
             )
             return
@@ -2298,10 +2287,11 @@ class MouseTrajectoryThread(MyQThread):
         if predictor is None:
             return
 
-        prediction_indexes: list[int] = []
-        prediction_frames: list[Any] = []
-        prediction_boxes: list[DetectionBox] = []
-        prediction_cages: list[int] = []
+        # Detect and cache one cage quadrilateral per camera. Cameras and cages
+        # are fixed during an experiment, so this avoids running the segmenter
+        # on every trajectory frame while removing the hand-maintained key map.
+        first_frame_by_cage: dict[int, int] = {}
+        mouse_boxes_by_index: dict[int, DetectionBox] = {}
         for source_index in source_indexes:
             item = prepared_items[source_index]
             if item.get("error"):
@@ -2316,10 +2306,97 @@ class MouseTrajectoryThread(MyQThread):
             if mouse_box is None:
                 item["status"] = "no_mouse"
                 continue
+            cage_number = int(item["cage_number"])
+            mouse_boxes_by_index[source_index] = mouse_box
+            if cage_number not in self.e2_cage_corners_by_cage:
+                first_frame_by_cage.setdefault(cage_number, source_index)
+
+        missing_cage_numbers = list(first_frame_by_cage)
+        if missing_cage_numbers:
+            box_sources = [
+                prepared_items[first_frame_by_cage[cage_number]]["source_frame"]
+                for cage_number in missing_cage_numbers
+            ]
+            box_results: list[Any] = []
+            detection_start = time.perf_counter()
+            try:
+                if self.box_model is None:
+                    raise RuntimeError("best_box.pt cage detector is not loaded")
+                box_results = run_yolo_batch(
+                    self.box_model,
+                    box_sources,
+                    self.imgsz,
+                    self.conf_box,
+                    min(self.batch_size, len(box_sources)),
+                )
+                self._record_ultralytics_speed(box_results)
+            except Exception as batch_error:
+                logger.warning(
+                    "E2 XY best_box batch detection failed; trying per-cage: "
+                    f"{batch_error}"
+                )
+                box_results = []
+                if self.box_model is not None:
+                    for cage_number, source in zip(missing_cage_numbers, box_sources):
+                        try:
+                            box_results.append(
+                                run_yolo_single(
+                                    self.box_model,
+                                    source,
+                                    self.imgsz,
+                                    self.conf_box,
+                                )
+                            )
+                        except Exception as single_error:
+                            logger.error(
+                                "E2 XY best_box single detection failed "
+                                f"cage={cage_number}: {single_error}"
+                            )
+                            box_results.append(None)
+            finally:
+                self._record_stage_timing(
+                    "e2_cage_box_detect",
+                    (time.perf_counter() - detection_start) * 1000.0,
+                )
+
+            for cage_number, result in zip(missing_cage_numbers, box_results):
+                corners = extract_box_corners(result) if result is not None else None
+                if corners is None:
+                    logger.error(
+                        "E2 XY automatic cage detection failed: "
+                        f"best_box.pt did not return a quadrilateral for cage {cage_number}"
+                    )
+                    continue
+                self.e2_cage_corners_by_cage[cage_number] = corners
+                logger.info(
+                    "E2 XY automatically detected cage corners "
+                    f"cage={cage_number}, source=best_box.pt, "
+                    f"method={corners.source}, confidence={corners.conf:.3f}"
+                )
+
+        prediction_indexes: list[int] = []
+        prediction_frames: list[Any] = []
+        prediction_boxes: list[DetectionBox] = []
+        prediction_quads: list[BoxCorners] = []
+        for source_index in source_indexes:
+            item = prepared_items[source_index]
+            mouse_box = mouse_boxes_by_index.get(source_index)
+            if item.get("error") or mouse_box is None:
+                continue
+            cage_number = int(item["cage_number"])
+            corners = self.e2_cage_corners_by_cage.get(cage_number)
+            if corners is None:
+                item["status"] = "error"
+                item["error"] = (
+                    "E2 XY prediction failed: best_box.pt could not automatically "
+                    f"detect cage corners for cage {cage_number}"
+                )
+                continue
+            item["corners"] = corners
             prediction_indexes.append(source_index)
             prediction_frames.append(item["source_frame"])
             prediction_boxes.append(mouse_box)
-            prediction_cages.append(int(item["cage_number"]))
+            prediction_quads.append(corners)
 
         if not prediction_frames:
             return
@@ -2329,7 +2406,7 @@ class MouseTrajectoryThread(MyQThread):
             predictions = predictor.predict_batch(
                 prediction_frames,
                 prediction_boxes,
-                prediction_cages,
+                prediction_quads,
             )
             if len(predictions) != len(prediction_indexes):
                 raise RuntimeError(
@@ -2357,17 +2434,17 @@ class MouseTrajectoryThread(MyQThread):
                 "E2 XY batch prediction failed; falling back to single-frame "
                 f"prediction: {error}"
             )
-            for source_index, frame, mouse_box, cage_number in zip(
+            for source_index, frame, mouse_box, cage_quad in zip(
                 prediction_indexes,
                 prediction_frames,
                 prediction_boxes,
-                prediction_cages,
+                prediction_quads,
             ):
                 try:
                     prediction = predictor.predict_batch(
                         [frame],
                         [mouse_box],
-                        [cage_number],
+                        [cage_quad],
                     )[0]
                     if prediction.get("error"):
                         raise RuntimeError(prediction["error"])
@@ -2702,7 +2779,8 @@ class MouseTrajectoryThread(MyQThread):
                             "rawY": row.get("Y"),
                             "xyRelativeX": prediction.get("x_relative"),
                             "xyRelativeY": prediction.get("y_relative"),
-                            "cageCalibrationKey": prediction.get("cage_key"),
+                            "cageDetectionSource": prediction.get("cage_detection"),
+                            "cageDetectionWeight": str(self.box_model_path or ""),
                             "xyModelWeight": str(self.xy_model_path or ""),
                             "mouseDetectorWeight": str(
                                 self.xy_mouse_model_path or ""
@@ -3069,9 +3147,7 @@ class MouseTrajectoryThread(MyQThread):
             "gridJson": (
                 "" if self._is_e2_xy_mode() else str(self.grid_json_path or "")
             ),
-            "boxWeight": (
-                "" if self._is_e2_xy_mode() else str(self.box_model_path or "")
-            ),
+            "boxWeight": str(self.box_model_path or ""),
             "mouseWeight": str(
                 self.xy_mouse_model_path
                 if self._is_e2_xy_mode()
@@ -3080,14 +3156,6 @@ class MouseTrajectoryThread(MyQThread):
             "xyModelWeight": str(self.xy_model_path) if self._is_e2_xy_mode() else "",
             "xySegmenterWeight": (
                 str(self.xy_sam_model_path) if self._is_e2_xy_mode() else ""
-            ),
-            "xyCageCalibrations": (
-                str(self.xy_cage_calibrations_path)
-                if self._is_e2_xy_mode()
-                else ""
-            ),
-            "xyCageMapping": (
-                str(self.xy_cage_mapping_path) if self._is_e2_xy_mode() else ""
             ),
             "instrumentAreaJson": (
                 ""

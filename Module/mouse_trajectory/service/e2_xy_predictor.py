@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -69,51 +68,28 @@ def resolve_device(value: str) -> torch.device:
     return torch.device(requested)
 
 
-def _load_mapping(path: Path) -> dict[str, str]:
-    document = json.loads(path.read_text(encoding="utf-8"))
-    raw_mapping = document.get("cage_key_by_cage") if isinstance(document, dict) else None
-    if not isinstance(raw_mapping, dict):
-        raise ValueError(
-            "Cage mapping must be a JSON object named 'cage_key_by_cage'"
+def _validated_cage_quad(corners: Any, frame_width: int, frame_height: int) -> np.ndarray:
+    """Validate the ordered far-left, far-right, near-right, near-left corners."""
+    if hasattr(corners, "corners"):
+        corners = corners.corners
+    if isinstance(corners, np.ndarray):
+        quad = np.asarray(corners, dtype=np.float32)
+    elif isinstance(corners, (list, tuple)) and corners and isinstance(corners[0], dict):
+        quad = np.asarray(
+            [[point["x"], point["y"]] for point in corners],
+            dtype=np.float32,
         )
-    mapping: dict[str, str] = {}
-    for cage_number, key in raw_mapping.items():
-        normalized_key = str(key or "").strip()
-        if normalized_key:
-            mapping[str(cage_number).strip()] = normalized_key
-    return mapping
-
-
-def _load_calibrations(path: Path) -> dict[str, dict[str, Any]]:
-    document = json.loads(path.read_text(encoding="utf-8"))
-    calibrations = document.get("calibrations") if isinstance(document, dict) else None
-    if not isinstance(calibrations, dict) or not calibrations:
-        raise ValueError(f"No cage calibrations found in {path}")
-    return calibrations
-
-
-def _scaled_cage_quad(
-    calibration: dict[str, Any],
-    frame_width: int,
-    frame_height: int,
-    cage_key: str,
-) -> np.ndarray:
-    quad = np.asarray(calibration["aligned_cage_quad_px"], dtype=np.float32).reshape(4, 2)
-    calibrated_width, calibrated_height = map(int, calibration["image_size_px"])
-    if calibrated_width < 2 or calibrated_height < 2 or not np.isfinite(quad).all():
-        raise ValueError(f"Invalid cage calibration for {cage_key}")
-    calibrated_ratio = calibrated_width / calibrated_height
-    frame_ratio = frame_width / frame_height
-    if abs(frame_ratio / calibrated_ratio - 1.0) > 0.01:
-        raise ValueError(
-            f"Frame aspect ratio {frame_width}x{frame_height} does not match "
-            f"cage calibration {cage_key} ({calibrated_width}x{calibrated_height})"
-        )
-    scale = np.asarray(
-        [frame_width / calibrated_width, frame_height / calibrated_height],
-        dtype=np.float32,
-    )
-    return quad * scale
+    else:
+        quad = np.asarray(corners, dtype=np.float32)
+    if quad.shape != (4, 2) or not np.isfinite(quad).all():
+        raise ValueError("Detected cage corners must be four finite (x, y) points")
+    if abs(float(cv2.contourArea(quad))) < max(frame_width * frame_height * 0.01, 10.0):
+        raise ValueError("Detected cage quadrilateral is too small or degenerate")
+    if np.any(quad[:, 0] < -frame_width * 0.05) or np.any(quad[:, 0] > frame_width * 1.05):
+        raise ValueError("Detected cage corners fall outside the frame horizontally")
+    if np.any(quad[:, 1] < -frame_height * 0.05) or np.any(quad[:, 1] > frame_height * 1.05):
+        raise ValueError("Detected cage corners fall outside the frame vertically")
+    return quad
 
 
 def _make_cage_mask(quad: np.ndarray, frame_width: int, frame_height: int) -> np.ndarray:
@@ -268,8 +244,6 @@ class E2XYPredictor:
         self,
         weights_path: Path | str,
         sam_weights_path: Path | str,
-        calibrations_path: Path | str,
-        cage_mapping_path: Path | str,
         device: str = "auto",
         cage_width_mm: float = 180.0,
         cage_depth_mm: float = 360.0,
@@ -277,13 +251,9 @@ class E2XYPredictor:
     ):
         self.weights_path = Path(weights_path)
         self.sam_weights_path = Path(sam_weights_path)
-        self.calibrations_path = Path(calibrations_path)
-        self.cage_mapping_path = Path(cage_mapping_path)
         for required_path in (
             self.weights_path,
             self.sam_weights_path,
-            self.calibrations_path,
-            self.cage_mapping_path,
         ):
             if not required_path.is_file():
                 raise FileNotFoundError(required_path)
@@ -297,15 +267,6 @@ class E2XYPredictor:
         self.sam_imgsz = max(int(sam_imgsz), 32)
         if self.cage_width_mm <= 0 or self.cage_depth_mm <= 0:
             raise ValueError("Cage physical dimensions must be positive")
-
-        self.calibrations = _load_calibrations(self.calibrations_path)
-        self.cage_key_by_cage = _load_mapping(self.cage_mapping_path)
-        unknown_keys = sorted(set(self.cage_key_by_cage.values()) - set(self.calibrations))
-        if unknown_keys:
-            raise ValueError(
-                "Unknown cage calibration key(s) in mapping: "
-                f"{', '.join(unknown_keys)}"
-            )
 
         checkpoint = torch.load(
             self.weights_path,
@@ -331,10 +292,14 @@ class E2XYPredictor:
         self,
         frames_bgr: Sequence[np.ndarray],
         detections: Sequence[Any],
-        cage_numbers: Sequence[int],
+        cage_quads: Sequence[Any],
     ) -> list[dict[str, Any]]:
-        if not (len(frames_bgr) == len(detections) == len(cage_numbers)):
-            raise ValueError("E2 XY frame, detection, and cage counts do not match")
+        if not (
+            len(frames_bgr)
+            == len(detections)
+            == len(cage_quads)
+        ):
+            raise ValueError("E2 XY frame, detection, and cage-corner counts do not match")
         if not frames_bgr:
             return []
 
@@ -343,25 +308,17 @@ class E2XYPredictor:
         mask_tensors: list[torch.Tensor] = []
         yolo_tensors: list[torch.Tensor] = []
 
-        for index, (frame, detection, cage_number) in enumerate(
-            zip(frames_bgr, detections, cage_numbers)
+        for index, (frame, detection, detected_corners) in enumerate(
+            zip(frames_bgr, detections, cage_quads)
         ):
             try:
                 if frame is None or frame.ndim != 3 or frame.shape[2] < 3:
                     raise ValueError("E2 XY requires a three-channel BGR frame")
                 frame_height, frame_width = frame.shape[:2]
-                cage_key = self.cage_key_by_cage.get(str(int(cage_number)))
-                if not cage_key:
-                    raise KeyError(
-                        f"No cage calibration mapped for cage {int(cage_number)}; "
-                        f"set it in {self.cage_mapping_path}"
-                    )
-                calibration = self.calibrations[cage_key]
-                cage_quad = _scaled_cage_quad(
-                    calibration,
+                cage_quad = _validated_cage_quad(
+                    detected_corners,
                     frame_width,
                     frame_height,
-                    cage_key,
                 )
                 mouse_box = np.asarray(detection.xyxy, dtype=np.float32)
                 if mouse_box.shape != (4,):
@@ -392,7 +349,7 @@ class E2XYPredictor:
                 )
                 yolo_tensors.append(torch.from_numpy(yolo_features))
                 valid_indexes.append(index)
-                results[index] = {"cage_key": cage_key}
+                results[index] = {"cage_detection": "best_box.pt"}
             except Exception as error:
                 results[index] = {"error": str(error)}
 
