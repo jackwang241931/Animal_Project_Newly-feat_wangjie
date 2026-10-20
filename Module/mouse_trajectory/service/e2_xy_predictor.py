@@ -9,6 +9,8 @@ import torch
 from torch import nn
 from torchvision.models import resnet18
 
+from public.util.native_crash_diagnostics import native_call
+
 
 INPUT_WIDTH = 256
 INPUT_HEIGHT = 144
@@ -175,14 +177,22 @@ def _sam_mouse_crop(
 ) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
     frame_height, frame_width = frame.shape[:2]
     box = np.asarray(box_xyxy, dtype=np.float32)
-    results = segmenter.predict(
-        frame,
-        bboxes=[box.astype(float).tolist()],
-        imgsz=imgsz,
-        verbose=False,
-        save=False,
-        device=device_arg,
-    )
+    with native_call(
+        "mouse_trajectory",
+        "mobile_sam_predict",
+        frame_width=int(frame_width),
+        frame_height=int(frame_height),
+        imgsz=int(imgsz),
+        device=str(device_arg),
+    ):
+        results = segmenter.predict(
+            frame,
+            bboxes=[box.astype(float).tolist()],
+            imgsz=imgsz,
+            verbose=False,
+            save=False,
+            device=device_arg,
+        )
     if not results or results[0].masks is None or results[0].masks.data is None:
         raise RuntimeError("MobileSAM returned no mouse mask")
 
@@ -269,17 +279,27 @@ class E2XYPredictor:
         if self.cage_width_mm <= 0 or self.cage_depth_mm <= 0:
             raise ValueError("Cage physical dimensions must be positive")
 
-        checkpoint = torch.load(
-            self.weights_path,
-            map_location="cpu",
-            weights_only=False,
-        )
+        with native_call(
+            "mouse_trajectory",
+            "torch_load_xy_model",
+            weights_path=str(self.weights_path),
+        ):
+            checkpoint = torch.load(
+                self.weights_path,
+                map_location="cpu",
+                weights_only=False,
+            )
         state = checkpoint.get("state_dict") if isinstance(checkpoint, dict) else None
         if state is None:
             raise ValueError(f"E2 XY checkpoint has no state_dict: {self.weights_path}")
         self.model = CageMouseMaskYOLO6ResNet18()
         self.model.load_state_dict(state, strict=True)
-        self.model.to(self.device).eval()
+        with native_call(
+            "mouse_trajectory",
+            "torch_prepare_xy_model",
+            device=str(self.device),
+        ):
+            self.model.to(self.device).eval()
         try:
             from ultralytics.models.sam import SAM
         except ImportError as error:
@@ -287,7 +307,12 @@ class E2XYPredictor:
                 "The updated E2 XY mode requires an Ultralytics build that "
                 "provides ultralytics.models.sam.SAM"
             ) from error
-        self.segmenter = SAM(str(self.sam_weights_path))
+        with native_call(
+            "mouse_trajectory",
+            "mobile_sam_load",
+            weights_path=str(self.sam_weights_path),
+        ):
+            self.segmenter = SAM(str(self.sam_weights_path))
 
     def predict_batch(
         self,
@@ -373,8 +398,14 @@ class E2XYPredictor:
         if valid_indexes:
             mask_batch = torch.stack(mask_tensors).to(self.device)
             yolo_batch = torch.stack(yolo_tensors).to(self.device)
-            with torch.inference_mode():
-                relative_predictions = self.model(mask_batch, yolo_batch).detach().cpu().numpy()
+            with native_call(
+                "mouse_trajectory",
+                "torch_xy_inference",
+                batch_size=len(valid_indexes),
+                device=str(self.device),
+            ):
+                with torch.inference_mode():
+                    relative_predictions = self.model(mask_batch, yolo_batch).detach().cpu().numpy()
             for result_index, prediction in zip(valid_indexes, relative_predictions):
                 x_relative = float(prediction[0])
                 y_relative = float(prediction[1])

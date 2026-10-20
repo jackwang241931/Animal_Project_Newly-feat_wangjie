@@ -16,6 +16,10 @@ from loguru import logger
 
 from public.config_class.Exception_Info import ExceptionInfo
 from public.config_class.Log_Config import LogConfig
+from public.util.native_crash_diagnostics import (
+    crash_breadcrumb,
+    setup_native_crash_diagnostics,
+)
 
 
 def kill_process_tree(pid, including_parent=True):
@@ -225,6 +229,17 @@ def monitored_target(target_func, args, health_queue, process_id, exception_queu
     """包装目标函数以支持健康检查和异常捕获"""
     process_logger = None
 
+    # Windows uses the spawn start method for this application.  Native crash
+    # handlers configured by the controller are not inherited, so every child
+    # must initialize its own faulthandler and unbuffered breadcrumb file.
+    setup_native_crash_diagnostics(process_id=process_id)
+    crash_breadcrumb(
+        "process_monitor",
+        "monitored_target",
+        "ENTER",
+        target=getattr(target_func, "__qualname__", repr(target_func)),
+    )
+
     try:
         # 设置进程专用日志器
         if log_config_dict:
@@ -298,6 +313,18 @@ def monitored_target(target_func, args, health_queue, process_id, exception_queu
         # 安装异常处理器
         sys.excepthook = exception_handler
 
+        def thread_exception_handler(args):
+            crash_breadcrumb(
+                "python_thread",
+                getattr(args.thread, "name", "unknown"),
+                "PY_EXCEPTION",
+                exception_type=getattr(args.exc_type, "__name__", str(args.exc_type)),
+                exception_message=str(args.exc_value),
+            )
+            exception_handler(args.exc_type, args.exc_value, args.exc_traceback)
+
+        threading.excepthook = thread_exception_handler
+
         # 启动健康心跳
         if health_queue:
             heartbeat_thread = threading.Thread(
@@ -315,10 +342,24 @@ def monitored_target(target_func, args, health_queue, process_id, exception_queu
         logger.info(f"{process_id}, args 长度: {len(args)}")
 
         result = target_func(*args)
+        crash_breadcrumb(
+            "process_monitor",
+            "monitored_target",
+            "EXIT",
+            target=getattr(target_func, "__qualname__", repr(target_func)),
+        )
         logger.info(f"{process_id} 任务执行完成")
         return result
 
     except Exception as e:
+        crash_breadcrumb(
+            "process_monitor",
+            "monitored_target",
+            "PY_EXCEPTION",
+            target=getattr(target_func, "__qualname__", repr(target_func)),
+            exception_type=type(e).__name__,
+            exception_message=str(e),
+        )
         # 捕获并记录异常
         tb_text = traceback.format_exc()
 

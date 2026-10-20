@@ -29,6 +29,7 @@ from public.entity.enum.Public_Enum import AppState
 from public.entity.queue.ObjectQueueItem import ObjectQueueItem
 from public.function.Crash_handle.CrashHandle import CrashHandler
 from public.function.Modbus.New_Mod_Bus import ModbusRTUMasterNew
+from public.util.native_crash_diagnostics import native_call
 from public.util.shared_video_frames import shared_video_frame_store
 from public.util.time_util import time_util
 from theme.ThemeManager import ThemeManager
@@ -186,7 +187,8 @@ def start_qt_application():
     """
     # 启动qt
     logger.info("start Qt")
-    app = QApplication(sys.argv)
+    with native_call("gui", "qapplication_create"):
+        app = QApplication(sys.argv)
     # 屏幕大小
     # 获取屏幕大小
     screen = app.primaryScreen()
@@ -199,9 +201,10 @@ def start_qt_application():
     crash_handler = CrashHandler()
     crash_handler.crash_signal.connect(on_crash)
 
-    program_self_check_index_dialog = Program_self_check_index()
-    program_self_check_index_dialog.activateWindow()
-    return_Data = program_self_check_index_dialog.exec()
+    with native_call("gui", "program_self_check_dialog"):
+        program_self_check_index_dialog = Program_self_check_index()
+        program_self_check_index_dialog.activateWindow()
+        return_Data = program_self_check_index_dialog.exec()
     if return_Data != QDialog.DialogCode.Accepted:
         # This dialog runs before app.exec(). Entering the event loop after a
         # rejection leaves a windowless GUI process alive forever, preventing
@@ -211,9 +214,11 @@ def start_qt_application():
         app.closeAllWindows()
         return 0
 
-    main_window = MainWindow_Index()
+    with native_call("gui", "main_window_create"):
+        main_window = MainWindow_Index()
     logger.info("Application start")
-    main_window.show_frame()
+    with native_call("gui", "main_window_show"):
+        main_window.show_frame()
     # Startup dialogs and MainWindow construction run before app.exec() and may
     # legitimately spend several seconds importing modules. Monitor only the
     # live GUI event loop so startup work is not reported as a runtime freeze.
@@ -221,7 +226,8 @@ def start_qt_application():
     # Stop the watchdog before the slower device cleanup callback runs.
     app.aboutToQuit.connect(lambda: quit_qt_application(main_window))
     # 系统退出
-    exit_code = app.exec()
+    with native_call("gui", "qt_event_loop"):
+        exit_code = app.exec()
     # Normally aboutToQuit has already done this.  The explicit idempotent
     # call also covers event-loop termination initiated by the OS/window.
     quit_qt_application(main_window)

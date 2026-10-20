@@ -25,6 +25,7 @@ from public.util.ffmpeg_video_recorder import (
     FFmpegVideoRecorderThread,
 )
 from public.util.json_util import json_util
+from public.util.native_crash_diagnostics import native_call
 from public.util.project_paths import resolve_project_path
 from public.util.shared_video_frames import shared_video_frame_store
 from public.util.time_util import time_util
@@ -660,11 +661,18 @@ class UVCCameraProcessor(MyQThread):
 
         for backend in backends:
             try:
-                capture = (
-                    cv2.VideoCapture(index, backend)
-                    if backend is not None
-                    else cv2.VideoCapture(index)
-                )
+                with native_call(
+                    "deep_camera",
+                    "opencv_video_capture_open",
+                    camera_id=self.id,
+                    device_index=index,
+                    backend=backend,
+                ):
+                    capture = (
+                        cv2.VideoCapture(index, backend)
+                        if backend is not None
+                        else cv2.VideoCapture(index)
+                    )
             except cv2.error as error:
                 logger.warning(
                     f"deep_camera_{self.id} open failed: index={index}, "
@@ -680,7 +688,13 @@ class UVCCameraProcessor(MyQThread):
             frame_ok = False
             for _ in range(5):
                 try:
-                    frame_ok, _ = capture.read()
+                    with native_call(
+                        "deep_camera",
+                        "opencv_capture_warmup_read",
+                        camera_id=self.id,
+                        device_index=index,
+                    ):
+                        frame_ok, _ = capture.read()
                 except cv2.error as error:
                     logger.warning(f"deep_camera_{self.id} warmup failed: {error}")
                     frame_ok = False
@@ -876,7 +890,13 @@ class UVCCameraProcessor(MyQThread):
 
         start_time = time.time()
         try:
-            ret, color_image = self.capture.read()
+            with native_call(
+                "deep_camera",
+                "opencv_capture_read",
+                camera_id=self.id,
+                device_index=getattr(self, "device_index", None),
+            ):
+                ret, color_image = self.capture.read()
         except cv2.error as error:
             self._handle_capture_read_failure(f"OpenCV error: {error}")
             return

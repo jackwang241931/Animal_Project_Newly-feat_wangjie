@@ -50,6 +50,7 @@ from public.function.Modbus.New_Mod_Bus import ModbusRTUMasterNew
 from public.function.promise.AsyPromise import AsyPromise
 from public.system_health import ExperimentRunState, HealthPolicy, HealthState, HealthStore
 from public.util.custom_data_file_util import custom_data_file_util
+from public.util.native_crash_diagnostics import native_call
 from public.util.time_util import time_util
 from theme.ThemeQt6 import ThemedWindow
 from ui.MainWindow import Ui_MainWindow
@@ -173,10 +174,15 @@ class StopExperimentExportThread(QThread):
 
     def run(self):
         try:
-            export_path = custom_data_file_util.save_folder_contents_as_custom_file(
-                self.folder_path,
-                show_success_message=False,
-            )
+            with native_call(
+                "gui_export",
+                "stop_experiment_export",
+                folder_path=str(self.folder_path),
+            ):
+                export_path = custom_data_file_util.save_folder_contents_as_custom_file(
+                    self.folder_path,
+                    show_success_message=False,
+                )
             if export_path:
                 self.export_status.emit("原始数据导出成功")
                 self.export_finished.emit(True, str(export_path))
@@ -521,13 +527,19 @@ class PeriodicExcelExportThread(threading.Thread):
             if export_dir:
                 os.makedirs(export_dir, exist_ok=True)
 
-            self._create_snapshot(self.db_path, snapshot_db_path)
-            success = custom_data_file_util.export_data_to_csv(
-                export_file_path=self.export_file_path,
-                file_path=snapshot_db_path,
-                show_success_message=False,
-                use_atomic_replace=True
-            )
+            with native_call(
+                "gui_export",
+                "periodic_excel_export",
+                db_path=str(self.db_path),
+                export_path=str(self.export_file_path),
+            ):
+                self._create_snapshot(self.db_path, snapshot_db_path)
+                success = custom_data_file_util.export_data_to_csv(
+                    export_file_path=self.export_file_path,
+                    file_path=snapshot_db_path,
+                    show_success_message=False,
+                    use_atomic_replace=True
+                )
             message = f"定时导出实验数据{'成功' if success else '失败'}: {os.path.basename(self.export_file_path)}"
         except Exception as e:
             message = f"定时导出实验数据失败: {e}"
@@ -564,13 +576,19 @@ class ManualExcelExportThread(QThread):
                 os.makedirs(export_dir, exist_ok=True)
 
             # 先复制出一致性快照，Excel 导出只读快照，减少和实时写库的互相影响。
-            PeriodicExcelExportThread._create_snapshot(self.db_path, snapshot_db_path)
-            success = custom_data_file_util.export_data_to_csv(
-                export_file_path=self.export_file_path,
-                file_path=snapshot_db_path,
-                show_success_message=False,
-                use_atomic_replace=True,
-            )
+            with native_call(
+                "gui_export",
+                "manual_excel_export",
+                db_path=str(self.db_path),
+                export_path=str(self.export_file_path),
+            ):
+                PeriodicExcelExportThread._create_snapshot(self.db_path, snapshot_db_path)
+                success = custom_data_file_util.export_data_to_csv(
+                    export_file_path=self.export_file_path,
+                    file_path=snapshot_db_path,
+                    show_success_message=False,
+                    use_atomic_replace=True,
+                )
             if success:
                 self.export_finished.emit(True, self.export_file_path)
             else:
@@ -608,11 +626,17 @@ def stop_main_window_queue_thread(timeout_ms=5000):
         if thread.isRunning():
             thread.stop()
             thread.requestInterruption()
-            if not thread.wait(timeout_ms):
-                logger.error(
-                    f"MainWindow queue reader did not stop within {timeout_ms} ms"
-                )
-                return False
+            with native_call(
+                "gui_qthread",
+                "main_window_queue_wait",
+                timeout_ms=int(timeout_ms),
+                thread_name=getattr(thread, "name", type(thread).__name__),
+            ):
+                if not thread.wait(timeout_ms):
+                    logger.error(
+                        f"MainWindow queue reader did not stop within {timeout_ms} ms"
+                    )
+                    return False
 
         # Do this only after the native QThread has ended.  The worker must
         # never dereference a QWidget or a multiprocessing queue during Qt
@@ -3980,7 +4004,8 @@ class MainWindow_Index(ThemedWindow):
         self.stop_export_thread.export_status.connect(self._on_stop_export_status)
         self.stop_export_thread.export_finished.connect(self._on_stop_export_finished)
         self.stop_export_thread.finished.connect(self._on_stop_export_thread_ended)
-        self.stop_export_thread.start()
+        with native_call("gui_qthread", "stop_export_thread_start"):
+            self.stop_export_thread.start()
 
     def _on_stop_export_status(self, message):
         logger.info(message)
@@ -4009,7 +4034,8 @@ class MainWindow_Index(ThemedWindow):
         export_thread = self.stop_export_thread
         self.stop_export_thread = None
         if export_thread is not None:
-            export_thread.deleteLater()
+            with native_call("gui_qthread", "stop_export_thread_delete_later"):
+                export_thread.deleteLater()
 
     def _show_pending_stop_export_success_message(self):
         export_path = self.pending_stop_export_success_path
@@ -4127,7 +4153,8 @@ class MainWindow_Index(ThemedWindow):
         )
         self.manual_export_thread.export_finished.connect(self._on_manual_export_finished)
         self.manual_export_thread.finished.connect(self._on_manual_export_thread_finished)
-        self.manual_export_thread.start()
+        with native_call("gui_qthread", "manual_export_thread_start"):
+            self.manual_export_thread.start()
 
     def _on_manual_export_finished(self, success, message):
         if self.manual_export_progress is not None:
@@ -4146,7 +4173,8 @@ class MainWindow_Index(ThemedWindow):
         thread = self.manual_export_thread
         self.manual_export_thread = None
         if thread is not None:
-            thread.deleteLater()
+            with native_call("gui_qthread", "manual_export_thread_delete_later"):
+                thread.deleteLater()
 
     def close_tab(self, index):
         """关闭标签页"""

@@ -4,6 +4,8 @@ import traceback
 from PyQt6.QtCore import QThread, QMutex, QWaitCondition
 from loguru import logger
 
+from public.util.native_crash_diagnostics import crash_breadcrumb, native_call
+
 #logger = logger.bind(category="gui_logger")
 class MyQThread(QThread):
     def __init__(self, name):
@@ -27,12 +29,20 @@ class MyQThread(QThread):
             f"native_tid={self._native_thread_id} | "
             f"native_tid_hex=0x{self._native_thread_id:X} | daemon=False"
         )
+        crash_breadcrumb(
+            "qt_thread",
+            self.name,
+            "STARTED",
+            python_tid=self._python_thread_id,
+            native_tid=self._native_thread_id,
+        )
         self._running = True
         self._stop_requested = False
         self._paused = False  # 启动时重置状态
 
         try:
-            self.before_Runing_work()
+            with native_call("qt_thread", f"{self.name}.before_Runing_work"):
+                self.before_Runing_work()
 
             while not self._stop_requested and not self.isInterruptionRequested():
                 self.mutex.lock()
@@ -52,15 +62,34 @@ class MyQThread(QThread):
                 try:
                     self.dosomething()
                 except Exception as e:
-                    error_msg = [f"{self.name} dosomething error: {e}"]
-                    # 错误处理代码...
-                    logger.error("\n".join(error_msg))
+                    crash_breadcrumb(
+                        "qt_thread",
+                        f"{self.name}.dosomething",
+                        "PY_EXCEPTION",
+                        exception_type=type(e).__name__,
+                        exception_message=str(e),
+                    )
+                    logger.exception(f"{self.name} dosomething error: {e}")
                     break
 
         except Exception as e:
-            logger.error(f"{self.name} run() exception: {e}")
+            crash_breadcrumb(
+                "qt_thread",
+                f"{self.name}.run",
+                "PY_EXCEPTION",
+                exception_type=type(e).__name__,
+                exception_message=str(e),
+            )
+            logger.exception(f"{self.name} run() exception: {e}")
         finally:
             self._running = False
+            crash_breadcrumb(
+                "qt_thread",
+                self.name,
+                "EXITED",
+                python_tid=self._python_thread_id,
+                native_tid=self._native_thread_id,
+            )
             logger.warning(
                 f"[THREAD_LIFECYCLE] exited | name={self.name} | "
                 f"python_tid={self._python_thread_id} | "
@@ -93,6 +122,15 @@ class MyQThread(QThread):
 
     def stop(self):
         caller_native_id = threading.get_native_id()
+        crash_breadcrumb(
+            "qt_thread",
+            self.name,
+            "STOP_REQUESTED",
+            target_python_tid=self._python_thread_id,
+            target_native_tid=self._native_thread_id,
+            caller=threading.current_thread().name,
+            caller_native_tid=caller_native_id,
+        )
         logger.warning(
             f"[THREAD_LIFECYCLE] stop_requested | name={self.name} | "
             f"target_python_tid={self._python_thread_id} | "
@@ -119,15 +157,17 @@ class MyQThread(QThread):
 
             # Waiting from inside the same QThread would deadlock.
             if QThread.currentThread() != self and self.isRunning():
-                if not self.wait(5000):
-                    logger.error(f"{self.name}线程退出等待超时")
+                with native_call("qt_thread", f"{self.name}.wait", timeout_ms=5000):
+                    if not self.wait(5000):
+                        logger.error(f"{self.name}线程退出等待超时")
         except Exception as error:
             logger.exception(f"{self.name}删除线程清理失败: {error}")
         finally:
             # The old override never called Qt's implementation, so the
             # QObject wrapper could remain alive through interpreter teardown.
             if not self.isRunning():
-                super().deleteLater()
+                with native_call("qt_thread", f"{self.name}.deleteLater"):
+                    super().deleteLater()
             else:
                 # Never schedule QObject destruction while native code is
                 # still executing in the worker thread.
@@ -179,9 +219,18 @@ class MyThread(threading.Thread):
             f"native_tid={native_thread_id} | "
             f"native_tid_hex=0x{native_thread_id:X} | daemon={self.daemon}"
         )
+        crash_breadcrumb(
+            "python_thread",
+            self.name,
+            "STARTED",
+            python_tid=threading.get_ident(),
+            native_tid=native_thread_id,
+            daemon=self.daemon,
+        )
         self._running = True
         try:
-            self.before_Runing_work()
+            with native_call("python_thread", f"{self.name}.before_Runing_work"):
+                self.before_Runing_work()
             while self._running:
                 self.mutex.lock()
                 if self._paused:
@@ -192,6 +241,14 @@ class MyThread(threading.Thread):
                 self.dosomething()
         finally:
             self._running = False
+            crash_breadcrumb(
+                "python_thread",
+                self.name,
+                "EXITED",
+                python_tid=threading.get_ident(),
+                native_tid=native_thread_id,
+                daemon=self.daemon,
+            )
             logger.warning(
                 f"[THREAD_LIFECYCLE] exited | name={self.name} | "
                 f"python_tid={threading.get_ident()} | "

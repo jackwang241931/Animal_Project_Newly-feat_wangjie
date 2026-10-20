@@ -46,6 +46,8 @@ import numpy as np
 sys.path.insert(0, str(YOLO_ROOT))
 from ultralytics import YOLO
 
+from public.util.native_crash_diagnostics import native_call
+
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 CORNER_SMOOTH_ALPHA = 0.25
@@ -420,15 +422,23 @@ def resolve_mouse_weight(explicit: Optional[Path], box_weight: Path) -> Path:
 
 def run_yolo_single(model: YOLO, image_source: Path | np.ndarray, imgsz: int, conf: float) -> Any:
     source = str(image_source) if isinstance(image_source, Path) else image_source
-    results = model.predict(
-        source=source,
-        imgsz=imgsz,
-        conf=conf,
-        verbose=False,
-        save=False,
-        device="cpu",
-        half=False,
-    )
+    with native_call(
+        "mouse_trajectory",
+        "yolo_predict_single",
+        model_type=type(model).__name__,
+        source_type=type(image_source).__name__,
+        imgsz=int(imgsz),
+        conf=float(conf),
+    ):
+        results = model.predict(
+            source=source,
+            imgsz=imgsz,
+            conf=conf,
+            verbose=False,
+            save=False,
+            device="cpu",
+            half=False,
+        )
     if not results:
         raise RuntimeError(f"YOLO returned no results for {image_source}")
     return results[0]
@@ -444,16 +454,25 @@ def run_yolo_batch(
     if not image_sources:
         return []
     sources = [str(source) if isinstance(source, Path) else source for source in image_sources]
-    results = model.predict(
-        source=sources,
-        imgsz=imgsz,
-        conf=conf,
-        verbose=False,
-        save=False,
-        device="cpu",
-        half=False,
-        batch=max(int(batch_size), 1),
-    )
+    with native_call(
+        "mouse_trajectory",
+        "yolo_predict_batch",
+        model_type=type(model).__name__,
+        source_count=len(sources),
+        imgsz=int(imgsz),
+        conf=float(conf),
+        batch_size=max(int(batch_size), 1),
+    ):
+        results = model.predict(
+            source=sources,
+            imgsz=imgsz,
+            conf=conf,
+            verbose=False,
+            save=False,
+            device="cpu",
+            half=False,
+            batch=max(int(batch_size), 1),
+        )
     return list(results or [])
 
 

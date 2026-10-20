@@ -54,6 +54,7 @@ from Module.mouse_trajectory.trajectory_tuning import (
 from public.component.dialog.index.infrared_camera_read_SN_dialog_index import infrared_camera_read_SN_dialog
 from public.config_class.global_setting import global_setting
 from public.util.project_paths import resolve_project_path
+from public.util.native_crash_diagnostics import native_call
 from public.dao.SQLite.Monitor_Datas_Handle import Monitor_Datas_Handle
 from public.entity.MyQThread import MyQThread
 from public.util.folder_util import folder_util
@@ -105,7 +106,11 @@ class TrajectoryModuleLoaderThread(QThread):
     def run(self):
         global mouse_trajectory_thread_class
         try:
-            from Module.mouse_trajectory.service import MouseTrajectoryThread
+            with native_call(
+                "video_gui",
+                "load_mouse_trajectory_module",
+            ):
+                from Module.mouse_trajectory.service import MouseTrajectoryThread
 
             with trajectory_module_loader_lock:
                 mouse_trajectory_thread_class = MouseTrajectoryThread
@@ -1096,7 +1101,13 @@ class DisplayPanel(QWidget):
             try:
                 with open(image_path, "rb") as image_file:
                     image_data = image_file.read()
-                loaded = pixmap.loadFromData(image_data)
+                with native_call(
+                    "video_gui",
+                    "qpixmap_load_from_data",
+                    image_path=str(image_path),
+                    byte_count=len(image_data),
+                ):
+                    loaded = pixmap.loadFromData(image_data)
             except OSError:
                 loaded = False
             if loaded and not pixmap.isNull():
@@ -1165,7 +1176,14 @@ class DisplayPanel(QWidget):
                             QImage.Format.Format_RGB888,
                         )
 
-                pixmap = QPixmap.fromImage(image)
+                with native_call(
+                    "video_gui",
+                    "qpixmap_from_image",
+                    width=int(width),
+                    height=int(height),
+                    bytes_per_line=int(bytes_per_line),
+                ):
+                    pixmap = QPixmap.fromImage(image)
                 timings["convert_ms"] = (
                     time.perf_counter() - stage_start
                 ) * 1000.0

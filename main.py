@@ -20,6 +20,10 @@ import time
 os.environ.setdefault('KMP_DUPLICATE_LIB_OK', 'TRUE')
 os.environ.setdefault('OMP_NUM_THREADS', '1')
 os.environ.setdefault('MKL_NUM_THREADS', '1')
+# Spawned workers read this before importing ``main.py``.  It covers native
+# failures that occur while Torch/Qt/OpenCV modules are still being imported,
+# before the per-process crash files can be opened by monitored_target().
+os.environ.setdefault('PYTHONFAULTHANDLER', '1')
 import torch  # noqa: F401,E402
 import psutil
 from loguru import logger
@@ -618,7 +622,7 @@ def kill_process_tree(pid, including_parent=True):
 
 def test_integrated_monitor():
     freeze_support()
-    setup_crash_logging()
+    setup_crash_logging(process_id="main_process")
     multiprocessing.set_start_method('spawn', force=True)
     environment_only = environment_module_only_enabled()
     if not acquire_single_instance_lock():

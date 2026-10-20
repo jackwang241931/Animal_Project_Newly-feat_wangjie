@@ -26,6 +26,7 @@ from public.system_health import HealthPolicy, HealthReporter
 
 from public.util.folder_util import folder_util
 from public.util.json_util import json_util
+from public.util.native_crash_diagnostics import native_call
 from public.util.time_util import time_util
 import argparse
 import time
@@ -793,7 +794,12 @@ class Thermal_process(MyQThread):
             self.mi48.regwrite(0xC2, 0x64)
             self.mi48.set_emissivity(args.emissivity)
             self.mi48.set_offset_corr(3)
-            self.mi48.start(stream=True, with_header=True)
+            with native_call(
+                "infrared_camera",
+                "mi48_start_stream",
+                camera_id=self.id,
+            ):
+                self.mi48.start(stream=True, with_header=True)
             self.frame_buffer.clear()
 
             self.RA_Tmin = RollingAverageFilter(N=10)
@@ -859,7 +865,12 @@ class Thermal_process(MyQThread):
         self.mi48 = None
         if camera is not None:
             try:
-                camera.stop()
+                with native_call(
+                    "infrared_camera",
+                    "mi48_stop",
+                    camera_id=self.id,
+                ):
+                    camera.stop()
             except Exception as error:
                 logger.error(f"infrared camera {self.id} release failed: {error}")
 
@@ -887,7 +898,12 @@ class Thermal_process(MyQThread):
             cancel_read = getattr(serial_port, 'cancel_read', None)
             if callable(cancel_read):
                 try:
-                    cancel_read()
+                    with native_call(
+                        "infrared_camera",
+                        "serial_cancel_read",
+                        camera_id=self.id,
+                    ):
+                        cancel_read()
                 except Exception as error:
                     logger.debug(f"infrared camera {self.id} cancel read failed: {error}")
 
@@ -932,11 +948,21 @@ class Thermal_process(MyQThread):
                 self.datasave = None
             if self.vs is not None:
                 try:
-                    self.vs.stop()
+                    with native_call(
+                        "infrared_camera",
+                        "video_stream_stop",
+                        camera_id=self.id,
+                    ):
+                        self.vs.stop()
                 except Exception as error:
                     logger.error(f"infrared camera {self.id} video stream stop failed: {error}")
                 self.vs = None
-            cv.destroyAllWindows()
+            with native_call(
+                "infrared_camera",
+                "opencv_destroy_windows",
+                camera_id=self.id,
+            ):
+                cv.destroyAllWindows()
             self._running = False
             logger.info(f"infrared camera {self.id} capture thread released")
 
@@ -954,7 +980,12 @@ class Thermal_process(MyQThread):
 
         start_time = time.time()
         try:
-            raw_data, header = self.mi48.read()
+            with native_call(
+                "infrared_camera",
+                "mi48_read",
+                camera_id=self.id,
+            ):
+                raw_data, header = self.mi48.read()
         except Exception as error:
             self.consecutive_read_failures += 1
             self._report_camera_failure("camera_read_failed", error)
