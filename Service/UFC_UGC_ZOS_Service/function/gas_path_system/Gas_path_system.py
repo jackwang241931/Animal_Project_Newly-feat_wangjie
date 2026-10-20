@@ -452,6 +452,8 @@ class UFC_gas_path_system_close_thread(MyQThread):
             update_status_main_signal_gui_update=self.update_status_main_signal_gui_update,
             send_message=self.send_message)
         self.close_error = None
+        self.last_shutdown_status = None
+        self._stop_receipt_sent = False
         # Optional shutdown hook injected by the service coordinator.  The
         # documented order is pump off -> wait -> air valve off -> UFC off.
         self.before_close_ufc = None
@@ -471,9 +473,136 @@ class UFC_gas_path_system_close_thread(MyQThread):
         self.close_error = str(error)
         self.before_close_ufc = None
         logger.error(f"UFC关闭失败：{error}")
+        self._emit_ufc_stop_receipt(
+            False,
+            f"UFC关闭未确认：{error}",
+            self.last_shutdown_status,
+        )
         global wait_UFC_stop_finish_event
         wait_UFC_stop_finish_event.set()
         self.stop()
+
+    def _emit_ufc_stop_receipt(self, success, detail, status=None):
+        if self._stop_receipt_sent:
+            return
+        self._stop_receipt_sent = True
+        queue = global_setting.get_setting("queue", None)
+        if queue:
+            queue.put(
+                ObjectQueueItem(
+                    origin="Gas_path_system_ufc",
+                    to="MainWindow_index",
+                    title="stop_ufc_gap_system_return",
+                    data={
+                        "success": bool(success),
+                        "detail": str(detail),
+                        "pump_off_verified": bool(
+                            isinstance(status, dict)
+                            and status.get("air_pump") == 0
+                        ),
+                        "ufc_off_verified": bool(
+                            isinstance(status, dict)
+                            and status.get("ufc_status") == 0
+                        ),
+                        "status": status if isinstance(status, dict) else None,
+                    },
+                    time=time_util.get_format_from_time(time.time()),
+                )
+            )
+
+    def _execute_strict_command(self, message):
+        """Synchronously execute one safety write through the normal serial lock."""
+        outcome = {}
+        self.send_thread.send_message = message
+        self.send_thread.Send(
+            lambda value: outcome.update(success=True, value=value),
+            lambda error: outcome.update(success=False, error=error),
+        )
+        if not outcome.get("success", False):
+            raise RuntimeError(str(outcome.get("error") or "安全气路指令执行失败"))
+        value = outcome.get("value") or {}
+        if not value.get("send_state", False):
+            raise RuntimeError("安全气路指令未获得有效回包")
+        return value
+
+    def _read_ufc_shutdown_status(self):
+        self.send_thread.send_message = {
+            'port': global_setting.get_setting("port", None),
+            # 02 01 00 00 00 0C CRC-16
+            'data': number_util.set_int_to_4_bytes_list("C"),
+            'slave_id': '2',
+            'function_code': '1',
+            'timeout': 1,
+        }
+        result_data, _ = self.send_thread.Send_no_promise()
+        if not isinstance(result_data, dict):
+            raise RuntimeError("UFC状态查询未返回有效数据")
+        parsed = {}
+        for item in result_data.get('data') or []:
+            if not isinstance(item, dict):
+                continue
+            if item.get('desc') == '机器状态':
+                parsed['ufc_status'] = item.get('value')
+            elif item.get('desc') == '气泵':
+                parsed['air_pump'] = item.get('value')
+        try:
+            parsed = {
+                'ufc_status': int(parsed['ufc_status']),
+                'air_pump': int(parsed['air_pump']),
+            }
+        except (KeyError, TypeError, ValueError) as error:
+            raise RuntimeError(f"UFC状态响应缺少有效字段：{parsed}") from error
+        if parsed['ufc_status'] not in (0, 1) or parsed['air_pump'] not in (0, 1):
+            raise RuntimeError(f"UFC状态值无效：{parsed}")
+        self.last_shutdown_status = parsed
+        logger.info(f"UFC停止状态回读：{parsed}")
+        return parsed
+
+    def _send_and_verify_pump_off(self, port):
+        last_error = None
+        for attempt in range(1, 4):
+            try:
+                self._execute_strict_command({
+                    'port': port,
+                    'data': number_util.set_int_to_4_bytes_list("000A0000"),
+                    'slave_id': '2',
+                    'function_code': '5',
+                    'timeout': 1,
+                    'require_success': True,
+                })
+                status = self._read_ufc_shutdown_status()
+                if status['air_pump'] == 0:
+                    logger.info(f"UFC气泵关闭状态已确认，attempt={attempt}")
+                    return status
+                last_error = RuntimeError(f"关泵后状态仍为打开：{status}")
+            except Exception as error:
+                last_error = error
+            logger.warning(f"UFC关泵确认失败，准备重试 {attempt}/3：{last_error}")
+            time.sleep(0.3)
+        raise RuntimeError(f"UFC气泵关闭未确认：{last_error}")
+
+    def _send_and_verify_ufc_off(self, port):
+        last_error = None
+        for attempt in range(1, 4):
+            try:
+                self._execute_strict_command({
+                    'port': port,
+                    'data': number_util.set_int_to_4_bytes_list("000B0000"),
+                    'slave_id': '2',
+                    'function_code': '5',
+                    'timeout': 1,
+                    'require_success': True,
+                })
+                status = self._read_ufc_shutdown_status()
+                if status['air_pump'] == 0 and status['ufc_status'] == 0:
+                    logger.info(f"UFC及气泵关闭状态已确认，attempt={attempt}")
+                    return status
+                last_error = RuntimeError(f"UFC最终关闭状态不正确：{status}")
+            except Exception as error:
+                last_error = error
+            logger.warning(f"UFC关闭确认失败，准备重试 {attempt}/3：{last_error}")
+            time.sleep(0.3)
+        raise RuntimeError(f"UFC最终关闭未确认：{last_error}")
 
     def close_Gas_flow_rate_valve(self,resolve,reject,port):
         """1.气泵及设定鼠笼流量控制器关闭（新流程：直接关气泵，无需先关鼠笼和ZOS采样阀）"""
@@ -483,7 +612,8 @@ class UFC_gas_path_system_close_thread(MyQThread):
             'data': number_util.set_int_to_4_bytes_list(f"000A0000"),
             'slave_id': '2',
             'function_code': '5',
-            'timeout': 1
+            'timeout': 1,
+            'require_success': True,
         }
         self.update_status_main_signal_gui_update.send(
             f"{time_util.get_format_from_time(time.time())} | UFC-停止 1.气泵及设定鼠笼流量控制器关闭")
@@ -494,10 +624,12 @@ class UFC_gas_path_system_close_thread(MyQThread):
                                 title="stop_show_info_except_status_counts",
                                 data=f"{time_util.get_format_from_time(time.time())} | UFC-停止 1.气泵及设定鼠笼流量控制器关闭",
                                 time=time_util.get_format_from_time(time.time())))
-        self.send_thread.send_message = self.send_message
-        AsyPromise(self.send_thread.Send).then(
-            lambda _: AsyPromise(self.close_UFC_valve, port=port)
-        ).then(
+        try:
+            self._send_and_verify_pump_off(port)
+        except Exception as error:
+            reject(error)
+            return
+        AsyPromise(self.close_UFC_valve, port=port).then(
             lambda _: resolve()
         ).catch(reject)
     def close_UFC_valve(self,resolve,reject,port):
@@ -527,7 +659,8 @@ class UFC_gas_path_system_close_thread(MyQThread):
             'data': number_util.set_int_to_4_bytes_list(f"000B0000"),
             'slave_id': '2',
             'function_code': '5',
-            'timeout': 1
+            'timeout': 1,
+            'require_success': True,
         }
         self.update_status_main_signal_gui_update.send(
             f"{time_util.get_format_from_time(time.time())} | UFC-停止 2.UFC阀门关闭")
@@ -538,29 +671,31 @@ class UFC_gas_path_system_close_thread(MyQThread):
                                 title="stop_show_info_except_status_counts",
                                 data=f"{time_util.get_format_from_time(time.time())} | UFC-停止 2.UFC阀门关闭",
                                 time=time_util.get_format_from_time(time.time())))
-        self.send_thread.send_message = self.send_message
-        AsyPromise(self.send_thread.Send).then(
-            lambda _:AsyPromise(self.finish_close).then(
-                lambda r:resolve()
-            ).catch(lambda e: logger.error(f"{e}"))
+        try:
+            self._send_and_verify_ufc_off(port)
+        except Exception as error:
+            reject(error)
+            return
+        AsyPromise(self.finish_close).then(
+            lambda _: resolve()
         ).catch(reject)
 
     def finish_close(self,resolve,reject):
         self.before_close_ufc = None
         global_setting.set_setting("ufc_start_time_state", False)
-        # 释放 正在等待ufc启动的地方
-        global wait_UFC_stop_finish_event
-        wait_UFC_stop_finish_event.set()
         self.update_status_main_signal_gui_update.send(
             f"{time_util.get_format_from_time(time.time())} | UFC 已关闭")
         # 返回响应
 
-        queue = global_setting.get_setting("queue", None)
-        if queue:
-            queue.put(
-                ObjectQueueItem(origin="Gas_path_system_ufc", to="MainWindow_index", title="stop_ufc_gap_system_return",
-                                data=f"{time_util.get_format_from_time(time.time())} | UFC 已关闭",
-                                time=time_util.get_format_from_time(time.time())))
+        self._emit_ufc_stop_receipt(
+            True,
+            "UFC和气泵关闭状态已确认",
+            self.last_shutdown_status,
+        )
+        # 先发送带状态校验结果的回执，再释放等待线程，避免正常收尾把
+        # “线程结束”误当成“硬件已经确认关闭”。
+        global wait_UFC_stop_finish_event
+        wait_UFC_stop_finish_event.set()
         resolve()
 class UFC_gas_path_system_run_thread(MyQThread):
     """
@@ -839,6 +974,8 @@ class UFC_gas_path_system(Gas_path_system):
         global wait_UFC_stop_finish_event
         if not close_thread.isRunning():
             close_thread.close_error = None
+            close_thread.last_shutdown_status = None
+            close_thread._stop_receipt_sent = False
             wait_UFC_stop_finish_event.clear()
             close_thread.update_status_main_signal_gui_update = self.update_status_main_signal_gui_update
             close_thread.start()
@@ -1170,6 +1307,7 @@ class UGC_gas_path_system(Gas_path_system):
             'slave_id': '3',
             'function_code': '5',
             'timeout': 1,
+            'require_success': True,
         }
         self.send_thread.send_message = self.send_message
         self.update_status_main_signal_gui_update.send(
@@ -1742,6 +1880,7 @@ class ZOS_gas_path_system(Gas_path_system):
             'slave_id': '4',
             'function_code': '5',
             'timeout': 1,
+            'require_success': True,
         }
         self.send_thread.send_message = self.send_message
         self.update_status_main_signal_gui_update.send(
@@ -1797,6 +1936,7 @@ class ZOS_gas_path_system(Gas_path_system):
             'slave_id': '4',
             'function_code': '5',
             'timeout': 1,
+            'require_success': True,
         }
         self.send_thread.send_message = self.send_message
         self.update_status_main_signal_gui_update.send(

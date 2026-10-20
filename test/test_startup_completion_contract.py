@@ -1,5 +1,8 @@
 import ast
+import base64
+import json
 from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -331,27 +334,33 @@ class StartupCompletionContractTests(unittest.TestCase):
             MainWindow_Index._advance_startup_progress(fake)
         page.set_operation_progress.assert_called_with(99)
 
-    def test_stop_matches_legacy_parallel_export_and_finishes_after_both(self):
+    def test_stop_archives_only_after_backend_and_grace_complete(self):
         path = PROJECT_ROOT / "index" / "MainWindow_index.py"
         text = path.read_text(encoding="utf-8-sig")
         stop_method = _class_method(path, "MainWindow_Index", "stop_experiment")
         backend_method = _class_method(path, "MainWindow_Index", "_on_stop_backend_complete")
+        archive_method = _class_method(path, "MainWindow_Index", "_maybe_start_stop_archive")
         finalize_method = _class_method(path, "MainWindow_Index", "_maybe_finalize_stop")
         stop_source = ast.get_source_segment(text, stop_method)
         backend_source = ast.get_source_segment(text, backend_method)
+        archive_source = ast.get_source_segment(text, archive_method)
         finalize_source = ast.get_source_segment(text, finalize_method)
 
         self.assertIn("QTimer.singleShot(0, self.start_stop_cleanup_async)", stop_source)
         self.assertIn("self.show_stop_dialog_sync()", stop_source)
         self.assertNotIn("self.stop_update_gui_sync()", stop_source)
         self.assertIn("QTimer.singleShot(5000, self._on_stop_backend_grace_elapsed)", backend_source)
+        self.assertIn("not self._stop_archive_ready", archive_source)
+        self.assertIn("not self._stop_backend_complete", archive_source)
+        self.assertIn("not self._stop_backend_grace_complete", archive_source)
+        self.assertIn("QTimer.singleShot(100, self.stop_store_info)", archive_source)
         self.assertIn("not self._stop_backend_complete", finalize_source)
         self.assertIn("not self._stop_backend_grace_complete", finalize_source)
         self.assertIn("not self.stop_export_finished", finalize_source)
         self.assertIn("self.stop_update_gui_sync()", finalize_source)
         self.assertIn("self._show_pending_stop_export_success_message()", finalize_source)
 
-    def test_stop_backend_warning_still_waits_for_parallel_legacy_export(self):
+    def test_stop_backend_warning_still_starts_archive_after_grace(self):
         from index.MainWindow_index import MainWindow_Index
         from public.system_health import ExperimentRunState
 
@@ -364,6 +373,7 @@ class StartupCompletionContractTests(unittest.TestCase):
             stop_dialog_close_pending=False,
             stop_dialog=None,
             _append_workflow_runtime_log=Mock(),
+            _maybe_start_stop_archive=Mock(),
             _maybe_finalize_stop=Mock(),
         )
         fake._on_stop_backend_grace_elapsed = lambda: (
@@ -374,9 +384,10 @@ class StartupCompletionContractTests(unittest.TestCase):
 
         self.assertTrue(fake._stop_backend_complete)
         self.assertTrue(fake._stop_backend_grace_complete)
+        fake._maybe_start_stop_archive.assert_called_once_with()
         fake._maybe_finalize_stop.assert_called_once_with()
         self.assertIn(
-            "继续按旧版流程保存并导出",
+            "继续安全归档已有实验数据",
             fake._append_workflow_runtime_log.call_args.args[0],
         )
 
@@ -392,7 +403,8 @@ class StartupCompletionContractTests(unittest.TestCase):
         self.assertIn("int(stop_wait_seconds * 1000)", stop_source)
         self.assertIn("self._stop_backend_complete = True", timeout_source)
         self.assertIn("self._stop_backend_grace_complete = True", timeout_source)
-        self.assertNotIn("self._stop_operation_failed = True", timeout_source)
+        self.assertIn("self._stop_operation_failed = True", timeout_source)
+        self.assertIn("self._maybe_start_stop_archive()", timeout_source)
         self.assertIn("self._maybe_finalize_stop()", timeout_source)
 
     def test_monitor_sender_uses_the_legacy_stop_receipt_without_failure_gate(self):
@@ -419,6 +431,102 @@ class StartupCompletionContractTests(unittest.TestCase):
         self.assertIn('os.path.join(folder_path, "data", "data.db")', source)
         self.assertIn("file_path=experiment_db_file_path", source)
         self.assertIn("use_atomic_replace=True", source)
+        self.assertIn("_write_mdata_streaming", source)
+        self.assertIn("return custom_file_path", source)
+
+    def test_streaming_mdata_remains_legacy_json_compatible(self):
+        from public.util.custom_data_file_util import custom_data_file_util
+
+        with tempfile.TemporaryDirectory() as temp_root:
+            root = Path(temp_root)
+            source = root / "experiment"
+            (source / "nested").mkdir(parents=True)
+            payloads = {
+                "plain.bin": b"abc123" * 2000,
+                str(Path("nested") / "unicode.bin"): bytes(range(256)) * 37,
+            }
+            for relative_path, payload in payloads.items():
+                target = source / relative_path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(payload)
+
+            archive = root / "experiment.Mdata"
+            custom_data_file_util._write_mdata_streaming(str(source), str(archive))
+            decoded = json.loads(archive.read_text(encoding="utf-8-sig"))
+
+            self.assertEqual(set(decoded), set(payloads))
+            for relative_path, payload in payloads.items():
+                self.assertEqual(base64.b64decode(decoded[relative_path]), payload)
+
+    def test_archive_failure_preserves_original_experiment_directory(self):
+        from public.util.custom_data_file_util import custom_data_file_util
+
+        with tempfile.TemporaryDirectory() as temp_root:
+            source = Path(temp_root) / "experiment"
+            (source / "data").mkdir(parents=True)
+            (source / "data" / "data.db").write_bytes(b"sqlite-placeholder")
+
+            def write_archive(_folder, archive_path):
+                Path(archive_path).write_text("{}", encoding="utf-8-sig")
+
+            with patch.object(
+                custom_data_file_util,
+                "_write_mdata_streaming",
+                side_effect=write_archive,
+            ), patch.object(
+                custom_data_file_util,
+                "export_data_to_csv",
+                return_value=False,
+            ), patch(
+                "public.util.custom_data_file_util.folder_util.remove_non_empty_folder"
+            ) as remove_folder:
+                result = custom_data_file_util.save_folder_contents_as_custom_file(
+                    str(source),
+                    show_success_message=False,
+                )
+
+            self.assertFalse(result)
+            self.assertTrue(source.is_dir())
+            self.assertTrue((source / "data" / "data.db").is_file())
+            remove_folder.assert_not_called()
+
+    def test_ufc_shutdown_requires_ack_and_state_readback(self):
+        send_path = (
+            PROJECT_ROOT / "Service" / "UFC_UGC_ZOS_Service" / "function"
+            / "Send_Message" / "Send_Message.py"
+        )
+        gas_path = (
+            PROJECT_ROOT / "Service" / "UFC_UGC_ZOS_Service" / "function"
+            / "gas_path_system" / "Gas_path_system.py"
+        )
+        send_text = send_path.read_text(encoding="utf-8-sig")
+        gas_text = gas_path.read_text(encoding="utf-8-sig")
+        send_source = ast.get_source_segment(
+            send_text, _class_method(send_path, "Send_Message", "Send")
+        )
+        pump_source = ast.get_source_segment(
+            gas_text,
+            _class_method(
+                gas_path,
+                "UFC_gas_path_system_close_thread",
+                "_send_and_verify_pump_off",
+            ),
+        )
+        ufc_source = ast.get_source_segment(
+            gas_text,
+            _class_method(
+                gas_path,
+                "UFC_gas_path_system_close_thread",
+                "_send_and_verify_ufc_off",
+            ),
+        )
+
+        self.assertIn("require_success", send_source)
+        self.assertIn("not send_state", send_source)
+        self.assertIn("_read_ufc_shutdown_status", pump_source)
+        self.assertIn("status['air_pump'] == 0", pump_source)
+        self.assertIn("status['ufc_status'] == 0", ufc_source)
+        self.assertIn("status['air_pump'] == 0", ufc_source)
 
     def test_excel_export_uses_reference_cage_zero_when_runtime_config_is_missing(self):
         from public.function.Tansfer.DbTransferExcel import DbTransferExcel
@@ -438,16 +546,16 @@ class StartupCompletionContractTests(unittest.TestCase):
         self.assertIn('set_setting("experiment_root_path", data.get("experiment_root_path", None))', source)
         self.assertNotIn('"experiment_storage_path"', source)
 
-    def test_missing_stop_export_directory_follows_legacy_silent_finish(self):
+    def test_missing_stop_export_directory_is_visible_failure(self):
         path = PROJECT_ROOT / "index" / "MainWindow_index.py"
         source = ast.get_source_segment(
             path.read_text(encoding="utf-8-sig"),
             _class_method(path, "MainWindow_Index", "stop_store_info"),
         )
 
-        self.assertNotIn("实验数据目录不存在，无法生成 Mdata 和 Excel", source)
-        self.assertNotIn("self._stop_operation_failed = True", source)
         self.assertIn("self.stop_export_finished = True", source)
+        self.assertIn("self.stop_export_succeeded = False", source)
+        self.assertIn("未找到待归档的原始实验目录", source)
 
     def test_stop_status_freezes_immediately_and_has_terminal_labels(self):
         path = PROJECT_ROOT / "index" / "MainWindow_index.py"
@@ -470,7 +578,8 @@ class StartupCompletionContractTests(unittest.TestCase):
         self.assertNotIn("self.setEnabled(False)", stop_source)
         self.assertIn("page.refresh()", stop_source)
         self.assertIn("ExperimentRunState.STOPPING", context_source)
-        self.assertIn('set_operation_progress(100, "实验已停止")', finish_source)
+        self.assertIn("ExperimentRunState.STOP_FAILED", finish_source)
+        self.assertIn("实验已停止，但数据归档失败", finish_source)
 
     def test_stop_completion_gate_waits_for_both_conditions(self):
         from index.MainWindow_index import MainWindow_Index
@@ -483,8 +592,12 @@ class StartupCompletionContractTests(unittest.TestCase):
             stop_export_finished=False,
             _stop_timeout_timer=Mock(),
             _stop_operation_failed=False,
+            stop_export_succeeded=True,
             stop_update_gui_sync=Mock(),
             _show_pending_stop_export_success_message=Mock(),
+            _show_stop_export_failure_message=Mock(),
+            _show_stop_hardware_failure_message=Mock(),
+            _close_after_stop_if_requested=Mock(),
         )
         MainWindow_Index._maybe_finalize_stop(fake)
         fake.stop_export_finished = True
@@ -497,6 +610,7 @@ class StartupCompletionContractTests(unittest.TestCase):
         MainWindow_Index._maybe_finalize_stop(fake)
         fake.stop_update_gui_sync.assert_called_once_with()
         fake._show_pending_stop_export_success_message.assert_called_once_with()
+        fake._show_stop_export_failure_message.assert_not_called()
 
     def test_camera_stop_has_terminal_receipt_even_without_camera_instances(self):
         deep_path = PROJECT_ROOT / "Service" / "main_deep_camera.py"

@@ -94,6 +94,23 @@ class Send_Message:
                 # 使用带重试的发送方法
                 response, response_hex, send_state, return_data = self._send_with_retry()
 
+                # Most legacy polling calls tolerate a missing response and
+                # inspect send_state themselves.  Hardware shutdown writes do
+                # not: treating an unacknowledged pump/UFC-off command as a
+                # fulfilled promise can leave equipment running while the GUI
+                # reports a successful stop.  Callers opt into strict handling
+                # with require_success on the command description.
+                if self.send_message.get('require_success', False) and not send_state:
+                    error_msg = (
+                        "安全气路指令未获得有效回包："
+                        f"slave={self.send_message.get('slave_id')}, "
+                        f"function={self.send_message.get('function_code')}, "
+                        f"data={self.send_message.get('data')}"
+                    )
+                    logger.error(error_msg)
+                    reject(error_msg)
+                    return
+
                 # # 如果最终send_state仍为False，抛出异常
                 # if not send_state:
                 #     error_msg = "发送报文失败，经过重试后send_state仍为False"
@@ -135,13 +152,12 @@ class Send_Message:
                 logger.error(f"Send方法异常: {e}")
                 reject(e)
                 return
-            finally:
-                resolve({
-                    "data": return_data,
-                    "message": parser_message,
-                    "send_state": send_state,
-                    "response_hex": response_hex,
-                })
+            resolve({
+                "data": return_data,
+                "message": parser_message,
+                "send_state": send_state,
+                "response_hex": response_hex,
+            })
 
     def Send_no_promise(self):
         serial_lock = global_setting.get_setting('serial_lock', threading.Lock())

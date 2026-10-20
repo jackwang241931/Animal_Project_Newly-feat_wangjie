@@ -372,7 +372,10 @@ class read_queue_data_Thread(MyQThread):
                                 if isinstance(message.data, dict):
                                     failed = not message.data.get("success", True)
                                 else:
-                                    failed = any(word in stop_detail for word in ("错误", "失败", "超时"))
+                                    failed = any(
+                                        word in stop_detail
+                                        for word in ("错误", "失败", "超时", "未确认")
+                                    )
                                 if failed:
                                     self.stop_backend_issue_signal.emit(stop_detail or message.title)
                             if self._required_stop_ack_titles.issubset(self._stop_ack_titles):
@@ -925,6 +928,10 @@ class MainWindow_Index(ThemedWindow):
         self._stop_backend_grace_complete = False
         self._stop_operation_failed = False
         self._stop_cleanup_started = False
+        self._stop_archive_ready = False
+        self._stop_archive_started = False
+        self._stop_trajectory_finalization_failed = False
+        self._stop_backend_issue_details = []
         # Calibration values can arrive faster than matplotlib can redraw.
         # Keep data ingestion immediate but coalesce chart repaints on the GUI
         # thread so the queue reader never blocks on QWidget work.
@@ -1046,6 +1053,9 @@ class MainWindow_Index(ThemedWindow):
         self.manual_export_progress = None
         self.stop_export_thread = None
         self.stop_export_finished = True
+        self.stop_export_succeeded = True
+        self.stop_export_error = None
+        self.stop_export_source_path = None
         self.stop_dialog_close_pending = False
         self.pending_stop_export_success_path = None
         self._close_after_stop = False
@@ -3736,10 +3746,17 @@ class MainWindow_Index(ThemedWindow):
         self.old_Stop_experiment_status_text_reTurn = None
         self.old_stop_status_counts = 0
         self.stop_export_finished = False
+        self.stop_export_succeeded = False
+        self.stop_export_error = None
+        self.stop_export_source_path = None
         self.stop_dialog_close_pending = False
         self._stop_backend_complete = False
         self._stop_backend_grace_complete = False
         self._stop_cleanup_started = False
+        self._stop_archive_ready = False
+        self._stop_archive_started = False
+        self._stop_trajectory_finalization_failed = False
+        self._stop_backend_issue_details = []
         read_queue_data_thread._stop_ack_titles.clear()
         self.pending_stop_export_success_path = None
         self._stop_operation_failed = False
@@ -3811,9 +3828,9 @@ class MainWindow_Index(ThemedWindow):
                 self._mark_workflow_operation_failed("stop", error)
                 return
 
-        # 旧版收尾顺序：停止命令与数据归档并行；后台停止、5秒收尾和
-        # 数据导出全部完成后再恢复界面。硬件异常只写运行日志，不把
-        # 整个实验判成“停止失败”。
+        # 先请求轨迹/UI模块完成自身收尾，但数据归档必须等后台采集、
+        # 数据写入线程全部停止并经过5秒落盘宽限后才能启动，避免长
+        # 实验归档时仍有线程占用或继续写入data.db。
         QTimer.singleShot(0, self.start_stop_cleanup_async)
         stop_wait_seconds = self.show_stop_dialog_sync()
         self._stop_progress_started_at = time.monotonic()
@@ -3838,7 +3855,7 @@ class MainWindow_Index(ThemedWindow):
             return
         self._stop_backend_complete = True
         if self._stop_operation_failed:
-            warning = "部分后台模块停止回执异常，继续按旧版流程保存并导出已有实验数据。"
+            warning = "部分后台模块停止回执异常；保留异常状态，并继续安全归档已有实验数据。"
             self._append_workflow_runtime_log(warning, "停止")
             logger.warning(warning)
         self.stop_dialog_close_pending = True
@@ -3852,11 +3869,16 @@ class MainWindow_Index(ThemedWindow):
         if self.workflow_run_state != ExperimentRunState.STOPPING:
             return
         self._stop_backend_grace_complete = True
+        self._maybe_start_stop_archive()
         self._maybe_finalize_stop()
 
     def _on_stop_backend_issue(self, detail):
         logger.warning(f"backend stop warning: {detail}")
-        self._append_workflow_runtime_log(str(detail), "停止")
+        detail_text = str(detail or "后台模块关闭未确认")
+        self._stop_operation_failed = True
+        if detail_text not in self._stop_backend_issue_details:
+            self._stop_backend_issue_details.append(detail_text)
+        self._append_workflow_runtime_log(detail_text, "停止")
 
     def _on_stop_progress(self, detail):
         if self.workflow_run_state != ExperimentRunState.STOPPING:
@@ -3877,20 +3899,29 @@ class MainWindow_Index(ThemedWindow):
         if self._stop_timeout_timer is not None:
             self._stop_timeout_timer.stop()
         self.stop_update_gui_sync()
-        # Export success is independent from device-stop warnings.  The old
-        # workflow always showed the successfully saved workbook.
-        self._show_pending_stop_export_success_message()
+        if self.stop_export_succeeded:
+            self._show_pending_stop_export_success_message()
+        else:
+            self._show_stop_export_failure_message()
+        if self._stop_operation_failed:
+            self._show_stop_hardware_failure_message()
         close_after_stop = getattr(self, "_close_after_stop_if_requested", None)
-        if callable(close_after_stop):
+        # 硬件关闭未确认时不能自动退出，否则用户看不到安全告警，也无法
+        # 立即检查实体泵状态。
+        if callable(close_after_stop) and not self._stop_operation_failed:
             close_after_stop()
 
     def _on_stop_experiment_timeout(self):
         if self.workflow_run_state == ExperimentRunState.STOPPING:
-            warning = "停止回执等待已到旧版倒计时上限；继续等待数据导出完成并保留已有数据。"
+            warning = "停止回执等待超时，部分硬件/后台关闭状态未确认；继续归档已有数据。"
             self._stop_backend_complete = True
             self._stop_backend_grace_complete = True
+            self._stop_operation_failed = True
+            if warning not in self._stop_backend_issue_details:
+                self._stop_backend_issue_details.append(warning)
             self._append_workflow_runtime_log(warning, "停止")
             logger.warning(warning)
+            self._maybe_start_stop_archive()
             self._maybe_finalize_stop()
 
     def start_stop_cleanup_async(self):
@@ -3898,36 +3929,67 @@ class MainWindow_Index(ThemedWindow):
             return
         self._stop_cleanup_started = True
         AsyPromise(self.close_monitor_data_window).then(
-            lambda _: AsyPromise(self.stop_store_info_Qtimer)
+            lambda _: self._mark_stop_archive_ready()
         ).catch(self._on_stop_cleanup_failed)
 
     def _on_stop_cleanup_failed(self, error):
-        logger.error(f"{error}")
-        self.stop_export_finished = True
-        if self.workflow_run_state == ExperimentRunState.STOPPING:
-            self._maybe_finalize_stop()
-        if self.stop_dialog_close_pending and self.stop_dialog is not None:
-            self.stop_dialog.update_progress_value(self.stop_dialog.progress_max)
+        detail = f"轨迹/监控界面收尾未完全结束：{error}；继续归档核心实验数据。"
+        logger.error(detail)
+        self._stop_trajectory_finalization_failed = True
+        self._append_workflow_runtime_log(detail, "停止")
+        self._mark_stop_archive_ready()
+
+    def _mark_stop_archive_ready(self):
+        self._stop_archive_ready = True
+        self._maybe_start_stop_archive()
+
+    def _maybe_start_stop_archive(self):
+        if self.workflow_run_state != ExperimentRunState.STOPPING:
+            return
+        if (
+            not self._stop_archive_ready
+            or not self._stop_backend_complete
+            or not self._stop_backend_grace_complete
+            or self._stop_archive_started
+        ):
+            return
+        self._stop_archive_started = True
+        QTimer.singleShot(100, self.stop_store_info)
 
     def stop_update_gui_sync(self):
         self._stop_stop_progress()
         logger.error("stop_update_gui")
         global_setting.set_setting("app_state", AppState.CONFIGURING)
-        self._set_workflow_run_state(ExperimentRunState.STOPPED)
+        has_failure = self._stop_operation_failed or not self.stop_export_succeeded
+        self._set_workflow_run_state(
+            ExperimentRunState.STOP_FAILED if has_failure else ExperimentRunState.STOPPED
+        )
 
         # 更新main_gui组件显示
         self.change_enable_component_app_state_signal.emit()
         self.status_bar.update_status()
-        self.status_bar.update_tip("关闭实验监测成功！")
-        self._append_workflow_runtime_log("关闭实验监测成功！", "停止")
+        if self._stop_operation_failed:
+            status_text = "实验采集已停止，但部分硬件关闭状态未确认，请立即检查UFC和气泵。"
+        elif not self.stop_export_succeeded:
+            status_text = "实验已停止，但数据归档失败；原始实验目录已保留。"
+        elif self._stop_trajectory_finalization_failed:
+            status_text = "实验数据已保存；轨迹模块收尾存在警告，请查看日志。"
+        else:
+            status_text = "关闭实验监测成功！"
+        self.status_bar.update_tip(status_text)
+        self._append_workflow_runtime_log(status_text, "停止")
         page = getattr(self, "experiment_control_page", None)
         if page is not None:
-            page.set_operation_progress(100, "实验已停止")
-            page.operation_hint.setText("后台模块已停止，实验数据已保存。")
+            page.set_operation_progress(
+                100,
+                "停止完成但存在异常" if has_failure else "实验已停止",
+            )
+            page.operation_hint.setText(status_text)
         for action_dict in self.tool_bar_actions:
             if action_dict["obj_name"] == "start_experiment":
                 action_dict["action"]: QAction
-                action_dict["action"].setDisabled(False)
+                # 气路关闭状态未确认时禁止直接开始下一轮实验。
+                action_dict["action"].setDisabled(self._stop_operation_failed)
             if action_dict["obj_name"] == "stop_experiment":
                 action_dict["action"]: QAction
                 action_dict["action"].setDisabled(True)
@@ -3983,6 +4045,7 @@ class MainWindow_Index(ThemedWindow):
 
         # 停止实验 将文件夹的数据合并成一个数据文件
         folder_path_data = self._get_experiment_root_path()
+        self.stop_export_source_path = folder_path_data
         if folder_path_data is not None and os.path.exists(folder_path_data):
             if self.stop_dialog is not None:
                 self.stop_dialog.insert_data_signal.emit(f"正在导出数据.... ")
@@ -3990,6 +4053,12 @@ class MainWindow_Index(ThemedWindow):
             return
 
         self.stop_export_finished = True
+        self.stop_export_succeeded = False
+        self.stop_export_error = (
+            f"未找到待归档的原始实验目录：{folder_path_data or '未配置'}；"
+            "未生成Mdata。"
+        )
+        logger.error(self.stop_export_error)
         if self.stop_dialog_close_pending and self.stop_dialog is not None:
             self.stop_dialog.update_progress_value(self.stop_dialog.progress_max)
         self._maybe_finalize_stop()
@@ -4014,6 +4083,8 @@ class MainWindow_Index(ThemedWindow):
 
     def _on_stop_export_finished(self, success, message):
         self.stop_export_finished = True
+        self.stop_export_succeeded = bool(success)
+        self.stop_export_error = None if success else str(message or "未知归档错误")
         if success:
             logger.info(f"stop experiment data export succeeded: {message}")
             self.pending_stop_export_success_path = message
@@ -4041,9 +4112,33 @@ class MainWindow_Index(ThemedWindow):
         export_path = self.pending_stop_export_success_path
         self.pending_stop_export_success_path = None
         if export_path:
+            workbook_path = f"{os.path.splitext(export_path)[0]}.xlsx"
             custom_data_file_util.show_export_success_message(
                 export_path,
+                additional_file_paths=[workbook_path] if os.path.isfile(workbook_path) else None,
             )
+
+    def _show_stop_export_failure_message(self):
+        detail = self.stop_export_error or "未知归档错误"
+        source_path = self.stop_export_source_path or self._get_experiment_root_path()
+        QMessageBox.critical(
+            self,
+            "实验数据保存失败",
+            "实验已经停止，但Mdata/Excel归档没有完整成功。\n"
+            "原始实验目录不会删除，请勿手动清理。\n\n"
+            f"原始目录：{source_path or '未找到'}\n"
+            f"失败原因：{detail}",
+        )
+
+    def _show_stop_hardware_failure_message(self):
+        details = self._stop_backend_issue_details or ["后台/硬件关闭回执未确认"]
+        QMessageBox.critical(
+            self,
+            "硬件关闭状态未确认",
+            "实验采集流程已结束，但部分硬件没有返回可靠的关闭状态。\n"
+            "请立即检查UFC和气泵实体状态，确认关闭前不要开始下一次实验。\n\n"
+            + "\n".join(str(item) for item in details),
+        )
 
     def _finalize_mouse_trajectory_views(self) -> bool:
         trajectory_views = []
@@ -4081,8 +4176,12 @@ class MainWindow_Index(ThemedWindow):
         """
         # 关闭窗口
         if not self._finalize_mouse_trajectory_views():
-            raise RuntimeError(
-                "mouse trajectory finalization did not finish; experiment archive was not started"
+            self._stop_trajectory_finalization_failed = True
+            warning = "mouse trajectory finalization did not finish; core data archive will continue"
+            logger.warning(warning)
+            self._append_workflow_runtime_log(
+                "轨迹模块未能在限定时间内完整收尾，核心实验数据仍将继续归档。",
+                "停止",
             )
 
         for module in self.modules:
