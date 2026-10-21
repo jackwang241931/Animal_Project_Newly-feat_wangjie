@@ -490,26 +490,18 @@ class StartupCompletionContractTests(unittest.TestCase):
             self.assertTrue((source / "data" / "data.db").is_file())
             remove_folder.assert_not_called()
 
-    def test_ufc_shutdown_requires_ack_and_state_readback(self):
-        send_path = (
-            PROJECT_ROOT / "Service" / "UFC_UGC_ZOS_Service" / "function"
-            / "Send_Message" / "Send_Message.py"
-        )
+    def test_ufc_shutdown_uses_legacy_send_without_state_readback(self):
         gas_path = (
             PROJECT_ROOT / "Service" / "UFC_UGC_ZOS_Service" / "function"
             / "gas_path_system" / "Gas_path_system.py"
         )
-        send_text = send_path.read_text(encoding="utf-8-sig")
         gas_text = gas_path.read_text(encoding="utf-8-sig")
-        send_source = ast.get_source_segment(
-            send_text, _class_method(send_path, "Send_Message", "Send")
-        )
         pump_source = ast.get_source_segment(
             gas_text,
             _class_method(
                 gas_path,
                 "UFC_gas_path_system_close_thread",
-                "_send_and_verify_pump_off",
+                "close_Gas_flow_rate_valve",
             ),
         )
         ufc_source = ast.get_source_segment(
@@ -517,16 +509,16 @@ class StartupCompletionContractTests(unittest.TestCase):
             _class_method(
                 gas_path,
                 "UFC_gas_path_system_close_thread",
-                "_send_and_verify_ufc_off",
+                "_send_close_ufc_command",
             ),
         )
 
-        self.assertIn("require_success", send_source)
-        self.assertIn("not send_state", send_source)
-        self.assertIn("_read_ufc_shutdown_status", pump_source)
-        self.assertIn("status['air_pump'] == 0", pump_source)
-        self.assertIn("status['ufc_status'] == 0", ufc_source)
-        self.assertIn("status['air_pump'] == 0", ufc_source)
+        self.assertNotIn("require_success", pump_source)
+        self.assertNotIn("_read_ufc_shutdown_status", pump_source)
+        self.assertIn("AsyPromise(self.send_thread.Send)", pump_source)
+        self.assertNotIn("require_success", ufc_source)
+        self.assertNotIn("_read_ufc_shutdown_status", ufc_source)
+        self.assertIn("AsyPromise(self.send_thread.Send)", ufc_source)
 
     def test_excel_export_uses_reference_cage_zero_when_runtime_config_is_missing(self):
         from public.function.Tansfer.DbTransferExcel import DbTransferExcel

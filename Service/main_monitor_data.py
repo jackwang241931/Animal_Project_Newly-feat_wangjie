@@ -3637,47 +3637,13 @@ def stop():
         logger.error("stop_ufc_ugc_zos")
 
         if ufc_ugc_zos_thread is not None:
-            gas_controller = ufc_ugc_zos_thread
-            gas_controller.stop_btn_handle()
-            shutdown_errors = list(getattr(gas_controller, "_shutdown_errors", []) or [])
-            ufc_shutdown_unconfirmed = any(
-                "UFC" in str(error) or "气泵" in str(error)
-                for error in shutdown_errors
-            )
-            if ufc_shutdown_unconfirmed:
-                # 正常E流程未能确认关泵时，立即使用独立串口锁再执行一次
-                # 安全关泵。原始失败回执仍然保留，不能把兜底动作伪装成
-                # 整个UFC收尾成功。
-                fallback_result = emergency_stop_ufc_pump()
-                logger.critical(
-                    "normal shutdown UFC fallback completed: "
-                    f"result={fallback_result}, errors={shutdown_errors}"
-                )
-                queue = global_setting.get_setting("queue", None)
-                if queue:
-                    queue.put(ObjectQueueItem(
-                        origin="main_monitor_data",
-                        to="MainWindow_index",
-                        title="stop_show_info_except_status_counts",
-                        data=(
-                            "UFC正常收尾未确认，安全兜底关泵已回读确认"
-                            if fallback_result == 1
-                            else "UFC正常收尾未确认，安全兜底关泵仍未确认，请立即检查设备"
-                        ),
-                        time=time_util.get_format_from_time(time.time()),
-                    ))
-            gas_controller.stop()
-            gas_controller.deleteLater()
+            ufc_ugc_zos_thread.stop_btn_handle()
+            ufc_ugc_zos_thread.stop()
+            ufc_ugc_zos_thread.deleteLater()
             ufc_ugc_zos_thread=None
     except Exception as e:
         monitor_stop_succeeded = False
         logger.error(f"关闭实验监测ufc_ugc_zos错误，原因：{e}")
-        if not gas_path_was_skipped:
-            fallback_result = emergency_stop_ufc_pump()
-            logger.critical(
-                "gas shutdown raised unexpectedly; emergency pump-off fallback "
-                f"result={fallback_result}"
-            )
         queue = global_setting.get_setting("queue", None)
         if queue:
             queue.put(
