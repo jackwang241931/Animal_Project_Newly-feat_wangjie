@@ -743,11 +743,19 @@ class MainWindow_Index(ThemedWindow):
         )
 
     def _close_after_stop_if_requested(self):
-        """Close the main window only after stop and data export have completed."""
-        if not self._close_after_stop or self.workflow_run_state != ExperimentRunState.STOPPED:
+        """Close the app after the requested stop workflow reaches a terminal state."""
+        if not self._close_after_stop or self.workflow_run_state not in {
+            ExperimentRunState.STOPPED,
+            ExperimentRunState.STOP_FAILED,
+        }:
             return
         self._close_after_stop = False
         self._close_without_confirmation = True
+        for window in list(self.open_windows):
+            try:
+                window.close()
+            except Exception as error:
+                logger.warning(f"停止完成时关闭子窗口失败: {error}")
         QTimer.singleShot(0, self.close)
 
     def _prepare_close_stop_display(self):
@@ -769,6 +777,27 @@ class MainWindow_Index(ThemedWindow):
             self._prepare_close_stop_display()
             self._close_after_stop = True
             self.setEnabled(False)
+            event.ignore()
+            return
+
+        # A title-bar close during an active experiment is a request to stop
+        # the experiment, not permission to tear down Qt/processes immediately.
+        # Keep the window alive until the ordinary stop, archive, and backend
+        # acknowledgements have all completed; the stop finalizer will close it.
+        if self._experiment_needs_stop_before_close():
+            self._prepare_close_stop_display()
+            self._close_after_stop = True
+            self.stop_experiment()
+            for window in list(self.open_windows):
+                window.close()
+            if self.workflow_run_state == ExperimentRunState.STOPPING:
+                self.setEnabled(False)
+            else:
+                # The stop request could not be started (for example, the
+                # backend queue is unavailable); keep the window usable and
+                # do not close without a hardware shutdown attempt.
+                self._close_after_stop = False
+                self.setEnabled(True)
             event.ignore()
             return
 
@@ -1351,6 +1380,7 @@ class MainWindow_Index(ThemedWindow):
         else:
             self._stop_stop_progress()
             self._stop_operation_failed = True
+            self._close_after_stop = False
             self._set_workflow_run_state(ExperimentRunState.STOP_FAILED)
             status_text = "停止流程存在错误，请查看系统健康与运行日志。"
         if self.status_bar is not None:
@@ -3728,6 +3758,9 @@ class MainWindow_Index(ThemedWindow):
             return
         if self.workflow_run_state == ExperimentRunState.STOPPING:
             return
+        # Stopping is terminal for this run: after data/backend cleanup, close
+        # the application and let the process supervisor shut down its children.
+        self._close_after_stop = True
         self._append_workflow_runtime_log("正在停止实验...", "停止")
         self._stop_startup_progress()
         send_message_queue = global_setting.get_setting("send_message_queue", None)
@@ -3906,9 +3939,9 @@ class MainWindow_Index(ThemedWindow):
         if self._stop_operation_failed:
             self._show_stop_hardware_failure_message()
         close_after_stop = getattr(self, "_close_after_stop_if_requested", None)
-        # 硬件关闭未确认时不能自动退出，否则用户看不到安全告警，也无法
-        # 立即检查实体泵状态。
-        if callable(close_after_stop) and not self._stop_operation_failed:
+        # Surface export/hardware warnings first; after the user acknowledges
+        # them, honor the requested app close as well as the successful path.
+        if callable(close_after_stop):
             close_after_stop()
 
     def _on_stop_experiment_timeout(self):

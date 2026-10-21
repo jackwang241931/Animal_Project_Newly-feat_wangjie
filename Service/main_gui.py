@@ -126,11 +126,24 @@ def quit_qt_application(main_window=None):
     #     modbus.close()
     # 不同进程的全局变量不同，所以让数据监控进程来关闭modbus
     send_message_queue = global_setting.get_setting("send_message_queue", None)
-    if send_message_queue:
+    run_state = getattr(main_window, "workflow_run_state", None)
+    run_state_value = getattr(run_state, "value", run_state)
+    stop_backend_completed = bool(
+        main_window is not None
+        and run_state_value in {"stopped", "stop_failed"}
+        and getattr(main_window, "_stop_backend_complete", False)
+        and not getattr(main_window, "_stop_operation_failed", False)
+    )
+    if send_message_queue and not stop_backend_completed:
         send_message_queue.put(
             ObjectQueueItem(origin="main_gui", to="main_monitor_data", title="stop_modbus",
 
                             time=time_util.get_format_from_time(time.time())))
+    elif stop_backend_completed:
+        # The experiment stop workflow already executed the full ordered gas
+        # shutdown and closed its sender.  Avoid reconnecting COM3 here and
+        # issuing a second, abbreviated pump/UFC shutdown sequence.
+        logger.info("完整实验停止流程已完成，跳过退出时重复重连串口关泵")
 
     if main_window is not None:
         try:

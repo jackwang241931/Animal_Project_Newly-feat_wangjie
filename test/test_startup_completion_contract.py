@@ -360,6 +360,38 @@ class StartupCompletionContractTests(unittest.TestCase):
         self.assertIn("self.stop_update_gui_sync()", finalize_source)
         self.assertIn("self._show_pending_stop_export_success_message()", finalize_source)
 
+    def test_stop_button_and_titlebar_close_exit_after_the_same_stop_workflow(self):
+        main_window_path = PROJECT_ROOT / "index" / "MainWindow_index.py"
+        main_window_text = main_window_path.read_text(encoding="utf-8-sig")
+        stop_source = ast.get_source_segment(
+            main_window_text,
+            _class_method(main_window_path, "MainWindow_Index", "stop_experiment"),
+        )
+        close_source = ast.get_source_segment(
+            main_window_text,
+            _class_method(main_window_path, "MainWindow_Index", "closeEvent"),
+        )
+        close_after_stop_source = ast.get_source_segment(
+            main_window_text,
+            _class_method(main_window_path, "MainWindow_Index", "_close_after_stop_if_requested"),
+        )
+
+        self.assertIn("self._close_after_stop = True", stop_source)
+        self.assertIn("self._experiment_needs_stop_before_close()", close_source)
+        self.assertIn("self.stop_experiment()", close_source)
+        self.assertIn("ExperimentRunState.STOPPED", close_after_stop_source)
+        self.assertIn("ExperimentRunState.STOP_FAILED", close_after_stop_source)
+
+        gui_path = PROJECT_ROOT / "Service" / "main_gui.py"
+        gui_text = gui_path.read_text(encoding="utf-8-sig")
+        quit_method = next(
+            node for node in ast.parse(gui_text).body
+            if isinstance(node, ast.FunctionDef) and node.name == "quit_qt_application"
+        )
+        quit_source = ast.get_source_segment(gui_text, quit_method)
+        self.assertIn("not stop_backend_completed", quit_source)
+        self.assertIn("完整实验停止流程已完成", quit_source)
+
     def test_stop_backend_warning_still_starts_archive_after_grace(self):
         from index.MainWindow_index import MainWindow_Index
         from public.system_health import ExperimentRunState
