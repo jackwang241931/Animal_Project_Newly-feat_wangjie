@@ -103,6 +103,30 @@ def _stop_ufc_activity_before_emergency_command():
     controller = ufc_ugc_zos_thread
     if controller is None:
         return
+    controller._experiment_stop_requested = True
+    runtime_stop_event = getattr(controller, "_runtime_air_stop_event", None)
+    if runtime_stop_event is not None:
+        runtime_stop_event.set()
+    for calibration_name in (
+            "Zero_carlibration_obj",
+            "Range_carlibration_obj",
+            "Startup_air_calibration_obj",
+            "Startup_o2_span_air_calibration_obj",
+    ):
+        calibration = getattr(controller, calibration_name, None)
+        if calibration is None:
+            continue
+        if hasattr(calibration, "is_STOP"):
+            calibration.is_STOP = True
+        request_stop = getattr(calibration, "request_stop", None)
+        if callable(request_stop):
+            try:
+                request_stop()
+            except Exception:
+                logger.exception(f"应用退出时取消{calibration_name}失败")
+        request_interruption = getattr(calibration, "requestInterruption", None)
+        if callable(request_interruption):
+            request_interruption()
     ufc = getattr(controller, "UFC_gas_path_system_obj", None)
     if ufc is None:
         return
@@ -3223,6 +3247,8 @@ def main(q, send_message_q, health_snapshot_queue=None,
     global_setting.set_setting("queue", q)
     global_setting.set_setting("send_message_queue", send_message_q)
     global_setting.set_setting("ufc_emergency_shutdown_active", False)
+    global_setting.set_setting("application_shutdown_requested", False)
+    global_setting.set_setting("application_shutdown_serial_closed", False)
     _start_ufc_emergency_shutdown_watcher(
         emergency_shutdown_request,
         emergency_shutdown_complete,
@@ -3751,11 +3777,64 @@ def stop():
 
 
 def stop_modbus():
+    """Freeze gas tasks, leave UFC off as the final command, then close serial.
+
+    The GUI sends this request while handling the top-right close button.  A
+    plain serial close used to race stale startup/calibration callbacks, which
+    could make an old ``000A00FF`` command the final command seen by the UFC.
+    This path intentionally does not restore strict response confirmation: it
+    only preserves command ordering during application shutdown.
+    """
+    if global_setting.get_setting("application_shutdown_serial_closed", False):
+        return
+
+    global_setting.set_setting("application_shutdown_requested", True)
+    global_setting.set_setting("calibration_cancel_requested", True)
+    # Send_Message checks this flag after it acquires the serial lock, so every
+    # queued ordinary gas command is rejected before touching the hardware.
+    global_setting.set_setting("ufc_emergency_shutdown_active", True)
+    _stop_ufc_activity_before_emergency_command()
+
     modbus: ModbusRTUMasterNew = global_setting.get_setting("modbus", None)
-    if modbus is not None:
+    if modbus is None:
+        global_setting.set_setting("application_shutdown_serial_closed", True)
+        return
+
+    serial_lock = global_setting.get_setting("serial_lock", None)
+    lock_acquired = False
+    try:
+        if serial_lock is not None:
+            lock_acquired = serial_lock.acquire(timeout=5.0)
+            if not lock_acquired:
+                logger.error("应用退出时等待串口锁超时，将直接关闭串口")
+
+        if serial_lock is None or lock_acquired:
+            for payload, description in (
+                    ("000A0000", "UFC气泵关闭"),
+                    ("000B0000", "UFC关闭"),
+            ):
+                try:
+                    _, response_hex, send_state, _ = modbus.send_command(
+                        slave_id="2",
+                        function_code="5",
+                        data_hex_list=number_util.set_int_to_4_bytes_list(payload),
+                        is_parse_response=False,
+                    )
+                    logger.info(
+                        f"应用退出最终安全指令已发送：{description}, "
+                        f"send_state={send_state}, response={response_hex}"
+                    )
+                except Exception as error:
+                    # Keep the old best-effort semantics: no UI failure gate
+                    # and no shutdown retry/readback loop.
+                    logger.warning(f"应用退出最终安全指令发送异常：{description}, {error}")
+
         logger.error("stop_modbus_stop_experiment")
         modbus.close()
-    pass
+        global_setting.set_setting("application_shutdown_serial_closed", True)
+    finally:
+        if lock_acquired:
+            serial_lock.release()
 if __name__ == "__main__":
     q = multiprocessing.Queue()
     send_message_q = multiprocessing.Queue()

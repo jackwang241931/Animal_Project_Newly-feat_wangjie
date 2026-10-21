@@ -520,6 +520,32 @@ class StartupCompletionContractTests(unittest.TestCase):
         self.assertNotIn("_read_ufc_shutdown_status", ufc_source)
         self.assertIn("AsyPromise(self.send_thread.Send)", ufc_source)
 
+    def test_ufc_worker_cannot_clear_a_shutdown_request_from_a_stale_callback(self):
+        gas_path = (
+            PROJECT_ROOT / "Service" / "UFC_UGC_ZOS_Service" / "function"
+            / "gas_path_system" / "Gas_path_system.py"
+        )
+        gas_text = gas_path.read_text(encoding="utf-8-sig")
+        worker_start = ast.get_source_segment(
+            gas_text,
+            _class_method(
+                gas_path,
+                "UFC_gas_path_system_start_thread",
+                "ufc_start",
+            ),
+        )
+        explicit_start = ast.get_source_segment(
+            gas_text,
+            _class_method(gas_path, "UFC_gas_path_system", "start"),
+        )
+
+        self.assertNotIn("self.is_stop=False", worker_start.replace(" ", ""))
+        self.assertIn("_reject_if_startup_cancelled", worker_start)
+        self.assertIn(
+            "self.ufc_gas_path_system_start_thread.is_stop = False",
+            explicit_start,
+        )
+
     def test_excel_export_uses_reference_cage_zero_when_runtime_config_is_missing(self):
         from public.function.Tansfer.DbTransferExcel import DbTransferExcel
 

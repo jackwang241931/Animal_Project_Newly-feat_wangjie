@@ -34,6 +34,8 @@ def _is_calibration_stop_requested(calibration):
         getattr(calibration, "is_STOP", False)
         or (callable(interruption_requested) and interruption_requested())
         or global_setting.get_setting("calibration_cancel_requested", False)
+        or global_setting.get_setting("application_shutdown_requested", False)
+        or global_setting.get_setting("ufc_emergency_shutdown_active", False)
     )
 
 
@@ -2383,7 +2385,7 @@ def _patched_start_ufc_if_needed_for_zero_v2(self, resolve, reject, port):
         resolve()
         return
 
-    if self.is_STOP:
+    if _is_calibration_stop_requested(self):
         reject("stop")
         return
 
@@ -2431,7 +2433,7 @@ def _patched_open_gas_pump_and_flow_for_zero_v2(self, resolve, reject, port):
         resolve()
         return
 
-    if self.is_STOP:
+    if _is_calibration_stop_requested(self):
         reject("stop")
         return
 

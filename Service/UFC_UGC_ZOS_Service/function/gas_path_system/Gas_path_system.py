@@ -189,6 +189,20 @@ class UFC_gas_path_system_start_thread(MyQThread):
             return None
         return value if value in (0, 1) else None
 
+    def _startup_cancelled(self):
+        """Return whether this startup chain is no longer allowed to send commands."""
+        return bool(
+            self.is_stop
+            or global_setting.get_setting("application_shutdown_requested", False)
+            or global_setting.get_setting("ufc_emergency_shutdown_active", False)
+        )
+
+    def _reject_if_startup_cancelled(self, reject):
+        if not self._startup_cancelled():
+            return False
+        reject("UFC启动已取消")
+        return True
+
     @staticmethod
     def _require_send_success(result, step_name):
         if not isinstance(result, dict) or not result.get("send_state", False):
@@ -257,8 +271,15 @@ class UFC_gas_path_system_start_thread(MyQThread):
         return None
 
     def ufc_start(self, resolve, reject):
-        self.is_stop=False
+        # is_stop is reset only by UFC_gas_path_system.start() when a new
+        # experiment is explicitly started.  Resetting it here can revive a
+        # stale asynchronous callback after the user has stopped the
+        # experiment or closed the application.
+        if self._reject_if_startup_cancelled(reject):
+            return
         time.sleep(0.01)
+        if self._reject_if_startup_cancelled(reject):
+            return
         ufc_status = self._get_startup_state('ufc_status')
         if ufc_status == 1:
             self.update_status_main_signal_gui_update.send(
@@ -295,15 +316,19 @@ class UFC_gas_path_system_start_thread(MyQThread):
         ).catch(reject)
 
     def _configure_flow_then_start_pump(self, resolve, reject):
+        if self._reject_if_startup_cancelled(reject):
+            return
+
         def start_pump(_):
+            if self._reject_if_startup_cancelled(reject):
+                return
             AsyPromise(self.gas_and_flow_rate_start).then(resolve).catch(reject)
 
         AsyPromise(self.configure_flow_controllers).then(start_pump).catch(reject)
 
     def configure_flow_controllers(self, resolve, reject):
         """Set all eight cage channels and the reference channel before the pump starts."""
-        if self.is_stop:
-            reject("Stop")
+        if self._reject_if_startup_cancelled(reject):
             return
         port = global_setting.get_setting("port", None)
         if port is None:
@@ -316,8 +341,7 @@ class UFC_gas_path_system_start_thread(MyQThread):
             return
 
         def set_channel(index):
-            if self.is_stop:
-                reject("Stop")
+            if self._reject_if_startup_cancelled(reject):
                 return
             if index == len(setpoints):
                 resolve()
@@ -344,7 +368,7 @@ class UFC_gas_path_system_start_thread(MyQThread):
                     f"{time_util.get_format_from_time(time.time())} | "
                     f"UFC 启动-步骤3.1.通道{channel}流量设定成功：{value}"
                 )
-                if self.is_stop:
+                if self._startup_cancelled():
                     raise RuntimeError("Stop")
                 time.sleep(delay)
                 set_channel(index + 1)
@@ -354,10 +378,11 @@ class UFC_gas_path_system_start_thread(MyQThread):
         set_channel(0)
 
     def gas_and_flow_rate_start(self, resolve, reject):
-        if self.is_stop:
-            reject("Stop")
+        if self._reject_if_startup_cancelled(reject):
             return
         time.sleep(0.01)
+        if self._reject_if_startup_cancelled(reject):
+            return
         air_pump_status = self._get_startup_state('air_pump')
         if air_pump_status == 1:
             self.update_status_main_signal_gui_update.send(
@@ -403,14 +428,12 @@ class UFC_gas_path_system_start_thread(MyQThread):
         :param reject:
         :return:
         """
-        if self.is_stop:
-            reject("Stop")
+        if self._reject_if_startup_cancelled(reject):
             return
         # 等待时间
         time_index = 0
         while time_index < float(global_setting.get_setting('UFC_UGC_ZOS_config')['UFC']['wait_time']):
-            if self.is_stop:
-                reject("Stop")
+            if self._reject_if_startup_cancelled(reject):
                 return
             self.update_status_main_signal_gui_update.send(
                 f"{time_util.get_format_from_time(time.time())} | UFC-启动 步骤5.等待气泵和流量控制器稳定，此过程需{time_index}/{float(global_setting.get_setting('UFC_UGC_ZOS_config')['UFC']['wait_time'])}秒")
@@ -741,6 +764,15 @@ class UFC_gas_path_system(Gas_path_system):
         :return:
         """
         time.sleep(0.01)
+        if (
+                global_setting.get_setting("application_shutdown_requested", False)
+                or global_setting.get_setting("ufc_emergency_shutdown_active", False)
+        ):
+            reject("应用正在关闭，禁止重新启动UFC气路")
+            return
+        # A new experiment is the only valid place to clear the previous
+        # experiment's stop request.
+        self.ufc_gas_path_system_start_thread.is_stop = False
         self.update_status_main_signal_gui_update.send(f"{time_util.get_format_from_time(time.time())} | UFC 开始启动{'.'*100}")
 
         # dlg = RunningCagesDialog(None, total_cages=8)

@@ -1,6 +1,7 @@
 """No-hardware tests for collecting real P1 environmental and gas evidence."""
 
 import queue
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
@@ -120,6 +121,55 @@ class MonitorHealthBridgeTests(unittest.TestCase):
         self.assertFalse(send_state)
         self.assertIn("已阻止", return_data["response_msg"])
         sender.modbus.send_command.assert_not_called()
+
+    def test_application_shutdown_blocks_stale_start_and_leaves_ufc_off(self):
+        serial_lock = Mock()
+        serial_lock.acquire.return_value = True
+        modbus = Mock()
+        modbus.send_command.return_value = (None, None, False, {})
+        start_thread = SimpleNamespace(is_stop=False)
+        run_thread = Mock()
+        run_thread.isRunning.return_value = False
+        controller = SimpleNamespace(
+            _experiment_stop_requested=False,
+            _runtime_air_stop_event=Mock(),
+            Zero_carlibration_obj=None,
+            Range_carlibration_obj=None,
+            Startup_air_calibration_obj=None,
+            Startup_o2_span_air_calibration_obj=None,
+            UFC_gas_path_system_obj=SimpleNamespace(
+                ufc_gas_path_system_start_thread=start_thread,
+                ufc_gas_path_system_run_thread=run_thread,
+            ),
+        )
+
+        with patch.dict(global_setting._setting, {
+            "modbus": modbus,
+            "serial_lock": serial_lock,
+            "application_shutdown_requested": False,
+            "application_shutdown_serial_closed": False,
+            "calibration_cancel_requested": False,
+            "ufc_emergency_shutdown_active": False,
+        }, clear=False), patch.object(
+            main_monitor_data, "ufc_ugc_zos_thread", controller
+        ):
+            main_monitor_data.stop_modbus()
+
+            self.assertTrue(global_setting.get_setting("application_shutdown_requested"))
+            self.assertTrue(global_setting.get_setting("ufc_emergency_shutdown_active"))
+            self.assertTrue(controller._experiment_stop_requested)
+            self.assertTrue(start_thread.is_stop)
+
+        payloads = [
+            call.kwargs["data_hex_list"]
+            for call in modbus.send_command.call_args_list
+        ]
+        self.assertEqual(payloads, [
+            ["00", "0A", "00", "00"],
+            ["00", "0B", "00", "00"],
+        ])
+        modbus.close.assert_called_once_with()
+        serial_lock.release.assert_called_once_with()
 
 
 if __name__ == "__main__":
