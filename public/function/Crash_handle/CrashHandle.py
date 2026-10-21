@@ -58,6 +58,7 @@ class CrashHandler(QObject):
         self._last_gui_heartbeat = time.monotonic()
         self._watchdog_timeout_seconds = 3.0
         self._watchdog_stop_event = threading.Event()
+        self._watchdog_pause_event = threading.Event()
         self._watchdog_thread = None
         self._watchdog_timer = None
         self.setup_logging()
@@ -130,6 +131,7 @@ class CrashHandler(QObject):
         self._watchdog_timeout_seconds = max(1.0, float(timeout_seconds))
         self._last_gui_heartbeat = time.monotonic()
         self._watchdog_stop_event.clear()
+        self._watchdog_pause_event.clear()
 
         self._watchdog_timer = QTimer(self)
         self._watchdog_timer.setInterval(500)
@@ -149,12 +151,23 @@ class CrashHandler(QObject):
         if self._watchdog_timer is not None:
             self._watchdog_timer.stop()
 
+    def pause_gui_watchdog(self):
+        """A deliberate shutdown join is not a GUI freeze."""
+        self._watchdog_pause_event.set()
+
+    def resume_gui_watchdog(self):
+        self._last_gui_heartbeat = time.monotonic()
+        self._watchdog_pause_event.clear()
+
     def _update_gui_heartbeat(self):
         self._last_gui_heartbeat = time.monotonic()
 
     def _watch_gui_heartbeat(self):
         freeze_reported = False
         while not self._watchdog_stop_event.wait(0.5):
+            if self._watchdog_pause_event.is_set():
+                freeze_reported = False
+                continue
             delay = time.monotonic() - self._last_gui_heartbeat
             if delay >= self._watchdog_timeout_seconds and not freeze_reported:
                 freeze_reported = True

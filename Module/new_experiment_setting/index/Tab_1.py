@@ -4,6 +4,7 @@ import math
 import time
 import typing
 import threading
+from queue import Empty
 from functools import partial
 from pathlib import Path
 
@@ -46,7 +47,9 @@ class read_queue_data_Thread(MyQThread):
     def dosomething(self):
         if not self.queue.empty():
             try:
-                message: ObjectQueueItem = self.queue.get()
+                message: ObjectQueueItem = self.queue.get_nowait()
+            except Empty:
+                return
             except Exception as e:
                 logger.error(f"{self.name}发生错误{e}")
                 return

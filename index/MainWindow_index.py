@@ -685,9 +685,10 @@ class MainWindow_Index(ThemedWindow):
         This is separate from the experiment stop workflow.  It is only the
         final Qt teardown barrier, so it does not send any UFC/gas command.
         """
-        if getattr(self, "_shutdown_prepared", False):
-            return
+        if getattr(self, "_shutdown_prepared_success", False):
+            return True
         self._shutdown_prepared = True
+        success = True
         logger.info("开始 Qt GUI 退出清理：先停止窗口线程和导出任务")
 
         # Do not allow queued timer callbacks to touch widgets while the
@@ -707,6 +708,7 @@ class MainWindow_Index(ThemedWindow):
                 periodic_thread.join(timeout=timeout_ms / 1000.0)
                 if periodic_thread.is_alive():
                     logger.error("定时 Excel 导出线程未能在退出前结束")
+                    success = False
 
         # Export QThreads are parented to this window.  Block their signals
         # before waiting; their work is allowed to finish, but no completion
@@ -722,14 +724,19 @@ class MainWindow_Index(ThemedWindow):
                     thread.quit()
                     if not thread.wait(timeout_ms):
                         logger.error(f"{name} 未能在退出前结束")
+                        success = False
             except RuntimeError as error:
                 logger.warning(f"退出时清理 {name} 跳过已销毁对象: {error}")
             except Exception as error:
                 logger.exception(f"退出时清理 {name} 失败: {error}")
+                success = False
 
         # The module-level queue reader is shared by the workflow page and
         # must be stopped before this window is released.
-        stop_main_window_queue_thread(timeout_ms=timeout_ms)
+        if not stop_main_window_queue_thread(timeout_ms=timeout_ms):
+            success = False
+        self._shutdown_prepared_success = success
+        return success
 
     def _experiment_needs_stop_before_close(self):
         """Return whether closing must wait for the experiment stop/export flow."""
@@ -767,10 +774,38 @@ class MainWindow_Index(ThemedWindow):
             except Exception as error:
                 logger.debug(f"unable to show experiment control page while stopping: {error}")
 
+    def _accept_close_after_thread_barrier(self, event):
+        """Keep Qt alive if a GUI worker cannot be joined safely."""
+        from public.entity.MyQThread import stop_registered_qthreads
+
+        watchdog = getattr(self, "_gui_watchdog", None)
+        if watchdog is not None:
+            watchdog.pause_gui_watchdog()
+        try:
+            prepared = self.prepare_for_shutdown(timeout_ms=15000)
+            joined = stop_registered_qthreads(timeout_ms=15000)
+        except Exception as error:
+            logger.exception(f"GUI 退出线程屏障失败: {error}")
+            prepared = joined = False
+        if prepared and joined:
+            event.accept()
+            return
+        logger.error("GUI 线程未全部退出，本次关闭已取消；实验停止结果保持不变")
+        if watchdog is not None:
+            watchdog.resume_gui_watchdog()
+        self._close_without_confirmation = True
+        self.setEnabled(True)
+        event.ignore()
+        QMessageBox.warning(
+            self,
+            "关闭暂缓",
+            "后台界面线程尚未退出。程序保持打开以避免崩溃；请稍后再关闭。",
+        )
+
     def closeEvent(self, event):
         if self._close_without_confirmation:
             self._close_without_confirmation = False
-            event.accept()
+            self._accept_close_after_thread_barrier(event)
             return
 
         if self.workflow_run_state == ExperimentRunState.STOPPING:
@@ -821,7 +856,7 @@ class MainWindow_Index(ThemedWindow):
                     self.setEnabled(False)
                     event.ignore()
                 else:
-                    event.accept()
+                    self._accept_close_after_thread_barrier(event)
             else:
                 event.ignore()
         else:
@@ -842,7 +877,7 @@ class MainWindow_Index(ThemedWindow):
                     self.setEnabled(False)
                     event.ignore()
                 else:
-                    event.accept()
+                    self._accept_close_after_thread_barrier(event)
             else:
                 event.ignore()
         pass

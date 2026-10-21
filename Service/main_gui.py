@@ -24,7 +24,7 @@ from public.component.dialog.index.infrared_camera_config_dialog_index import in
 from public.config_class import global_load
 from public.config_class.global_setting import global_setting
 from public.config_class.ini_parser import ini_parser
-from public.entity.MyQThread import MyThread, MyQThread
+from public.entity.MyQThread import MyThread, MyQThread, stop_registered_qthreads
 from public.entity.enum.Public_Enum import AppState
 from public.entity.queue.ObjectQueueItem import ObjectQueueItem
 from public.function.Crash_handle.CrashHandle import CrashHandler
@@ -147,19 +147,24 @@ def quit_qt_application(main_window=None):
 
     if main_window is not None:
         try:
-            main_window.prepare_for_shutdown()
+            main_window.prepare_for_shutdown(timeout_ms=15000)
         except Exception as error:
             logger.exception(f"窗口退出清理失败: {error}")
 
     # aboutToQuit runs on Qt's GUI thread.  Stop every queue reader before
     # QWidget/QApplication destruction.  Do not call sys.exit() here.
+    wait_ms = 15000 if main_window is not None else 2000
     if read_queue_data_thread.isRunning():
         read_queue_data_thread.blockSignals(True)
         read_queue_data_thread.stop()
         read_queue_data_thread.requestInterruption()
-        if not read_queue_data_thread.wait(5000):
+        if not read_queue_data_thread.wait(wait_ms):
             logger.warning("main GUI queue reader did not stop before Qt shutdown")
-    stop_main_window_queue_thread(timeout_ms=5000)
+    stop_main_window_queue_thread(timeout_ms=wait_ms)
+    # Hidden workflow pages have their own module-level queue readers.  They
+    # survive MainWindow cleanup unless joined explicitly, and can emit into
+    # destroyed QWidgets while SIP is tearing down the interpreter.
+    stop_registered_qthreads(timeout_ms=wait_ms)
     shared_video_frame_store.close_reader()
 
 def on_crash( error_msg):
@@ -229,6 +234,7 @@ def start_qt_application():
 
     with native_call("gui", "main_window_create"):
         main_window = MainWindow_Index()
+    main_window._gui_watchdog = crash_handler
     logger.info("Application start")
     with native_call("gui", "main_window_show"):
         main_window.show_frame()

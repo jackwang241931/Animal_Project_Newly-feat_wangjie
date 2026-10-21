@@ -1,5 +1,7 @@
 import threading
 import traceback
+import time
+import weakref
 
 from PyQt6.QtCore import QThread, QMutex, QWaitCondition
 from loguru import logger
@@ -7,6 +9,69 @@ from loguru import logger
 from public.util.native_crash_diagnostics import crash_breadcrumb, native_call
 
 #logger = logger.bind(category="gui_logger")
+_registered_qthreads = weakref.WeakSet()
+_registered_qthreads_lock = threading.Lock()
+
+
+def stop_registered_qthreads(timeout_ms=15000):
+    """Stop and join GUI MyQThreads before SIP/Qt interpreter teardown.
+
+    Request every stop first so a page with many workers does not consume a
+    separate timeout for each worker.  Keep strong references until every
+    wait has completed; module-level and hidden-page threads are included.
+    """
+    with _registered_qthreads_lock:
+        threads = list(_registered_qthreads)
+
+    running = []
+    failed = []
+    for thread in threads:
+        try:
+            if not thread.isRunning() or QThread.currentThread() == thread:
+                continue
+            thread.blockSignals(True)
+            thread.stop()
+            thread.requestInterruption()
+            thread.quit()
+            running.append(thread)
+        except RuntimeError as error:
+            logger.warning(f"Qt 退出时跳过已销毁线程: {error}")
+        except Exception as error:
+            failed.append(getattr(thread, "name", type(thread).__name__))
+            logger.exception(f"Qt 退出时请求停止线程失败: {error}")
+
+    deadline = time.monotonic() + timeout_ms / 1000.0
+    for thread in running:
+        try:
+            remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
+            with native_call("qt_thread", f"{thread.name}.shutdown_wait", timeout_ms=remaining_ms):
+                if not thread.wait(remaining_ms):
+                    failed.append(thread.name)
+        except Exception as error:
+            failed.append(getattr(thread, "name", type(thread).__name__))
+            logger.exception(f"Qt 退出时等待线程失败: {error}")
+
+    # Catch a worker started during this barrier (for example by a late page
+    # callback) instead of reporting success from the initial snapshot alone.
+    with _registered_qthreads_lock:
+        remaining = list(_registered_qthreads)
+    for thread in remaining:
+        try:
+            if thread.isRunning() and QThread.currentThread() != thread:
+                failed.append(thread.name)
+        except RuntimeError:
+            pass
+
+    if failed:
+        failed = sorted(set(failed))
+        logger.critical(f"Qt 退出前仍有线程未结束: {failed}")
+        crash_breadcrumb("qt_thread", "shutdown_barrier", "TIMEOUT", threads=failed)
+        return False
+    logger.info(f"Qt 退出线程屏障完成: joined={len(running)}")
+    crash_breadcrumb("qt_thread", "shutdown_barrier", "COMPLETED", joined=len(running))
+    return True
+
+
 class MyQThread(QThread):
     def __init__(self, name):
         super().__init__()
@@ -19,6 +84,16 @@ class MyQThread(QThread):
         self._stop_requested = False
         self._python_thread_id = None
         self._native_thread_id = None
+        with _registered_qthreads_lock:
+            _registered_qthreads.add(self)
+
+    def start(self, priority=QThread.Priority.InheritPriority):
+        # Set these before QThread.start(): a stop immediately after start
+        # must not be undone when the worker eventually enters run().
+        if not self.isRunning():
+            self._stop_requested = False
+            self._paused = False
+        super().start(priority)
 
     def run(self):
         self._python_thread_id = threading.get_ident()
@@ -37,8 +112,6 @@ class MyQThread(QThread):
             native_tid=self._native_thread_id,
         )
         self._running = True
-        self._stop_requested = False
-        self._paused = False  # 启动时重置状态
 
         try:
             with native_call("qt_thread", f"{self.name}.before_Runing_work"):

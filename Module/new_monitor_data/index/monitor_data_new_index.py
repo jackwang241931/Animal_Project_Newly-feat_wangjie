@@ -1,5 +1,6 @@
 import time
 import typing
+from queue import Empty
 
 from PyQt6 import QtGui
 from PyQt6.QtCore import QRect, QSize, Qt, QTimer
@@ -33,7 +34,9 @@ class read_queue_data_Thread(MyQThread):
         if not self.queue.empty():
             # logger.error(f"{self.queue.qsize()}")
             try:
-                message: ObjectQueueItem = self.queue.get()
+                message: ObjectQueueItem = self.queue.get_nowait()
+            except Empty:
+                return
             except Exception as e:
                 logger.error(f"{self.name}发生错误{e}")
                 return
