@@ -1193,7 +1193,7 @@ class Range_Carlibration(Gas_Carlibration, MyQThread):
         config = global_setting.get_setting("UFC_UGC_ZOS_config")['Calibration']
         start_time = time.time()
 
-        max_timeout = float(config.get('calibration_max_timeout', 300))
+        max_timeout = float(config.get('co2_span_max_timeout', config.get('calibration_max_timeout', 300)))
         stable_duration = float(config.get('co2_span_stable_duration', 30))
         sample_interval = float(config.get('calibration_sample_interval', 1))
         threshold = float(config.get('span_calibration_carbon_threshold', 5))
@@ -2035,7 +2035,7 @@ def _patched_range_cyclic_sampling_of_ugc_carbon_sensor(self, resolve, reject, p
 
     config = global_setting.get_setting("UFC_UGC_ZOS_config")['Calibration']
     start_time = time.time()
-    max_timeout = float(config.get('calibration_max_timeout', 300))
+    max_timeout = float(config.get('co2_span_max_timeout', config.get('calibration_max_timeout', 300)))
     stable_duration = float(config.get('co2_span_stable_duration', 30))
     sample_interval = float(config.get('calibration_sample_interval', 1))
     threshold = float(config.get('span_calibration_carbon_threshold', 5))

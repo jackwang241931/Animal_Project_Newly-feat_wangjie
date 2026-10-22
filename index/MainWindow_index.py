@@ -133,6 +133,7 @@ def _calculate_o2_span_full_air_wait_seconds(
         # sampling and safe shutdown allowance, otherwise the GUI can report
         # startup failure while the backend is still calibrating.
         calibration_timeout = max(config_float("calibration_max_timeout", 300), 300)
+        co2_span_timeout = config_float("co2_span_max_timeout", calibration_timeout)
         co2_zero_purge = config_float("co2_zero_purge_time", 120, 0)
         co2_span_purge = config_float("co2_span_purge_time", 120, 0)
         safe_shutdown_allowance = 120
@@ -141,7 +142,7 @@ def _calculate_o2_span_full_air_wait_seconds(
             + calibration_timeout
             + safe_shutdown_allowance
             + co2_span_purge
-            + calibration_timeout
+            + co2_span_timeout
             + safe_shutdown_allowance
         )
     return total
@@ -3407,7 +3408,15 @@ class MainWindow_Index(ThemedWindow):
                 calibration_timeout = max(float(calibration_config.get('calibration_max_timeout', 300)), 0)
             except (TypeError, ValueError):
                 calibration_timeout = 300
-            start_wait_times += calibration_timeout
+            if startup_calibration_mode == "span":
+                try:
+                    co2_span_timeout = max(float(calibration_config.get('co2_span_max_timeout', calibration_timeout)), 0)
+                except (TypeError, ValueError):
+                    co2_span_timeout = calibration_timeout
+                # Standalone Span runs the O2 and CO2 stability stages in sequence.
+                start_wait_times += calibration_timeout + co2_span_timeout
+            else:
+                start_wait_times += calibration_timeout
             self.start_dialog.countdown_seconds = start_wait_times
             self.start_dialog.current_seconds = start_wait_times
         elif startup_calibration_mode in {"o2_span_air", "co2_o2_span_air"}:
@@ -3426,7 +3435,12 @@ class MainWindow_Index(ThemedWindow):
                 calibration_timeout = max(float(calibration_config.get('calibration_max_timeout', 300)), 0)
             except (TypeError, ValueError):
                 calibration_timeout = 300
-            start_wait_times += 2 * calibration_timeout
+            try:
+                co2_span_timeout = max(float(calibration_config.get('co2_span_max_timeout', calibration_timeout)), 0)
+            except (TypeError, ValueError):
+                co2_span_timeout = calibration_timeout
+            # Zero plus standalone Span (O2 stage, then CO2 stage).
+            start_wait_times += 2 * calibration_timeout + co2_span_timeout
             self.start_dialog.countdown_seconds = start_wait_times
             self.start_dialog.current_seconds = start_wait_times
 
