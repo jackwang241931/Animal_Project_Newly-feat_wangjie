@@ -10,6 +10,7 @@ from public.entity.enum.Public_Enum import GapSystem_Running_Type
 from public.entity.queue.ObjectQueueItem import ObjectQueueItem
 from public.function.Modbus.Modbus_Type import Modbus_Slave_Type
 from public.function.Modbus.New_Mod_Bus import ModbusRTUMasterNew
+from public.function.Modbus.response_match import matches_write_single_coil_response
 from public.util.time_util import time_util
 
 
@@ -55,6 +56,24 @@ class Send_Message:
                 else:
                     logger.critical(
                         f"报文{self.send_message['slave_id']}{self.send_message['function_code']}{self.send_message['data']},出现问题！：发收时间：{(end_time - start_time):.3f}秒")
+
+                # Safety-critical function-05 writes require the exact echo of
+                # this request, not merely a valid CRC from a stale response.
+                if send_state and self.send_message.get('require_matching_response', False):
+                    request = self.modbus.build_frame(
+                        self.send_message['slave_id'],
+                        self.send_message['function_code'],
+                        self.send_message['data'],
+                    )
+                    if not matches_write_single_coil_response(request, response):
+                        logger.error(
+                            f"安全气路回包不匹配: request={request.hex() if request else None}, "
+                            f"response={response.hex() if response else None}"
+                        )
+                        send_state = False
+                        if isinstance(return_data, dict):
+                            return_data['response_state'] = False
+                            return_data['response_msg'] = '安全气路回包与本次指令不匹配'
 
                 # 如果发送状态为True，返回成功结果
                 if send_state:

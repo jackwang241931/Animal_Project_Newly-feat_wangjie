@@ -30,6 +30,7 @@ from public.entity.barrier.ActionCompleteBarrier import ActionCompleteBarrier
 from public.entity.queue.ObjectQueueItem import ObjectQueueItem
 from public.function.Monitor_data_storage.DataStorage import store_data_with_result
 from public.function.promise.AsyPromise import AsyPromise
+from public.function.Modbus.response_match import matches_ufc_status_response
 from public.util.number_util import number_util
 from public.util.string_util import String_util
 from public.util.time_util import time_util
@@ -493,7 +494,7 @@ class UFC_gas_path_system_close_thread(MyQThread):
     def _finish_close_failure(self, error):
         self.close_error = str(error)
         self.before_close_ufc = None
-        logger.error(f"UFC关闭失败：{error}")
+        logger.error(f"UFC关泵/关闭未确认，请检查实体气泵：{error}")
         global wait_UFC_stop_finish_event
         wait_UFC_stop_finish_event.set()
         self.stop()
@@ -506,7 +507,9 @@ class UFC_gas_path_system_close_thread(MyQThread):
             'data': number_util.set_int_to_4_bytes_list(f"000A0000"),
             'slave_id': '2',
             'function_code': '5',
-            'timeout': 1
+            'timeout': 1,
+            'require_success': True,
+            'require_matching_response': True,
         }
         self.update_status_main_signal_gui_update.send(
             f"{time_util.get_format_from_time(time.time())} | UFC-停止 1.气泵及设定鼠笼流量控制器关闭")
@@ -536,6 +539,12 @@ class UFC_gas_path_system_close_thread(MyQThread):
                                     time=time_util.get_format_from_time(time.time())))
             time_index += 1
             time.sleep(float(global_setting.get_setting('UFC_UGC_ZOS_config')['UFC']['wait_time_delay']))
+        try:
+            self._read_ufc_shutdown_status()
+        except Exception as error:
+            reject(f"关泵状态未确认，未发送0B=00：{error}")
+            return
+
         hook = self.before_close_ufc
         if callable(hook):
             AsyPromise(hook).then(
@@ -544,13 +553,61 @@ class UFC_gas_path_system_close_thread(MyQThread):
             return
         self._send_close_ufc_command(resolve, reject, port)
 
+    def _read_ufc_shutdown_status(self):
+        """Confirm the reported pump state before disabling UFC control."""
+        modbus = self.send_thread.modbus
+        serial_lock = global_setting.get_setting("serial_lock", None)
+        if modbus is None or serial_lock is None:
+            raise RuntimeError("串口或通信锁不可用")
+
+        last_error = "未收到有效状态回包"
+        for attempt in range(1, 4):
+            with serial_lock:
+                response, response_hex, send_state, _ = modbus.send_command(
+                    slave_id="2",
+                    function_code="1",
+                    data_hex_list=number_util.set_int_to_4_bytes_list("C"),
+                    is_parse_response=False,
+                )
+                if not send_state or not matches_ufc_status_response(response):
+                    last_error = f"状态回包无效：{response_hex}"
+                else:
+                    parsed, _ = modbus.parse_response(
+                        response=response,
+                        response_hex=response.hex(),
+                        send_state=True,
+                        slave_id="2",
+                        function_code="1",
+                    )
+                    pump_state = None
+                    if isinstance(parsed, dict):
+                        for item in parsed.get("data") or []:
+                            if isinstance(item, dict) and item.get("desc") == "气泵":
+                                try:
+                                    pump_state = int(item.get("value"))
+                                except (TypeError, ValueError):
+                                    pass
+                                break
+                    logger.warning(
+                        f"UFC停止状态确认 attempt={attempt}/3, "
+                        f"response={response_hex}, air_pump={pump_state}"
+                    )
+                    if pump_state == 0:
+                        return
+                    last_error = f"气泵状态不是关闭：{pump_state}"
+            if attempt < 3:
+                time.sleep(0.2)
+        raise RuntimeError(last_error)
+
     def _send_close_ufc_command(self, resolve, reject, port):
         self.send_message = {
             'port': port,
             'data': number_util.set_int_to_4_bytes_list(f"000B0000"),
             'slave_id': '2',
             'function_code': '5',
-            'timeout': 1
+            'timeout': 1,
+            'require_success': True,
+            'require_matching_response': True,
         }
         self.update_status_main_signal_gui_update.send(
             f"{time_util.get_format_from_time(time.time())} | UFC-停止 2.UFC阀门关闭")
@@ -565,7 +622,7 @@ class UFC_gas_path_system_close_thread(MyQThread):
         AsyPromise(self.send_thread.Send).then(
             lambda _:AsyPromise(self.finish_close).then(
                 lambda r:resolve()
-            ).catch(lambda e: logger.error(f"{e}"))
+            ).catch(reject)
         ).catch(reject)
 
     def finish_close(self,resolve,reject):

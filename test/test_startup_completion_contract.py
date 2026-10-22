@@ -381,6 +381,7 @@ class StartupCompletionContractTests(unittest.TestCase):
         self.assertIn("self.stop_experiment()", close_source)
         self.assertIn("ExperimentRunState.STOPPED", close_after_stop_source)
         self.assertIn("ExperimentRunState.STOP_FAILED", close_after_stop_source)
+        self.assertIn("if self._stop_operation_failed:", close_after_stop_source)
 
         gui_path = PROJECT_ROOT / "Service" / "main_gui.py"
         gui_text = gui_path.read_text(encoding="utf-8-sig")
@@ -522,7 +523,7 @@ class StartupCompletionContractTests(unittest.TestCase):
             self.assertTrue((source / "data" / "data.db").is_file())
             remove_folder.assert_not_called()
 
-    def test_ufc_shutdown_uses_legacy_send_without_state_readback(self):
+    def test_ufc_shutdown_requires_matched_writes_and_pump_state_before_lock(self):
         gas_path = (
             PROJECT_ROOT / "Service" / "UFC_UGC_ZOS_Service" / "function"
             / "gas_path_system" / "Gas_path_system.py"
@@ -545,11 +546,17 @@ class StartupCompletionContractTests(unittest.TestCase):
             ),
         )
 
-        self.assertNotIn("require_success", pump_source)
-        self.assertNotIn("_read_ufc_shutdown_status", pump_source)
+        self.assertIn("'require_success': True", pump_source)
+        self.assertIn("'require_matching_response': True", pump_source)
         self.assertIn("AsyPromise(self.send_thread.Send)", pump_source)
-        self.assertNotIn("require_success", ufc_source)
-        self.assertNotIn("_read_ufc_shutdown_status", ufc_source)
+        wait_source = ast.get_source_segment(
+            gas_text,
+            _class_method(gas_path, "UFC_gas_path_system_close_thread", "close_UFC_valve"),
+        )
+        self.assertLess(wait_source.index("time.sleep("), wait_source.index("self._read_ufc_shutdown_status()"))
+        self.assertLess(wait_source.index("self._read_ufc_shutdown_status()"), wait_source.index("self._send_close_ufc_command"))
+        self.assertIn("'require_success': True", ufc_source)
+        self.assertIn("'require_matching_response': True", ufc_source)
         self.assertIn("AsyPromise(self.send_thread.Send)", ufc_source)
 
     def test_ufc_worker_cannot_clear_a_shutdown_request_from_a_stale_callback(self):
@@ -661,6 +668,18 @@ class StartupCompletionContractTests(unittest.TestCase):
         fake.stop_update_gui_sync.assert_called_once_with()
         fake._show_pending_stop_export_success_message.assert_called_once_with()
         fake._show_stop_export_failure_message.assert_not_called()
+
+    def test_unconfirmed_hardware_stop_keeps_gui_open_after_warning(self):
+        from index.MainWindow_index import MainWindow_Index
+        from public.system_health import ExperimentRunState
+
+        fake = SimpleNamespace(
+            _close_after_stop=True,
+            workflow_run_state=ExperimentRunState.STOP_FAILED,
+            _stop_operation_failed=True,
+        )
+        MainWindow_Index._close_after_stop_if_requested(fake)
+        self.assertFalse(fake._close_after_stop)
 
     def test_camera_stop_has_terminal_receipt_even_without_camera_instances(self):
         deep_path = PROJECT_ROOT / "Service" / "main_deep_camera.py"

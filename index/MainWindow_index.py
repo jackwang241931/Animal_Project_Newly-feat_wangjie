@@ -757,6 +757,11 @@ class MainWindow_Index(ThemedWindow):
             ExperimentRunState.STOP_FAILED,
         }:
             return
+        if self._stop_operation_failed:
+            # Keep the hardware warning visible instead of exiting as if the
+            # pump were confirmed off. An explicit close remains available.
+            self._close_after_stop = False
+            return
         self._close_after_stop = False
         self._close_without_confirmation = True
         for window in list(self.open_windows):
@@ -3981,12 +3986,12 @@ class MainWindow_Index(ThemedWindow):
         if self._stop_timeout_timer is not None:
             self._stop_timeout_timer.stop()
         self.stop_update_gui_sync()
+        if self._stop_operation_failed:
+            self._show_stop_hardware_failure_message()
         if self.stop_export_succeeded:
             self._show_pending_stop_export_success_message()
         else:
             self._show_stop_export_failure_message()
-        if self._stop_operation_failed:
-            self._show_stop_hardware_failure_message()
         close_after_stop = getattr(self, "_close_after_stop_if_requested", None)
         # Surface export/hardware warnings first; after the user acknowledges
         # them, honor the requested app close as well as the successful path.
