@@ -528,6 +528,7 @@ class ExperimentControlPage(_BaseWorkflowPage):
         self._stopping_calibrations: set[str] = set()
         self._combined_calibration = False
         self._standalone_calibration_kind: str | None = None
+        self._standalone_calibration_stopping = False
         self._main_log_render_signature = None
         self._main_log_rendered_entries = ()
         self.main_log_list = QTableWidget(0, 2)
@@ -603,12 +604,25 @@ class ExperimentControlPage(_BaseWorkflowPage):
         actions = QHBoxLayout()
         self.start_button = QPushButton("▶ 开始实验"); self.start_button.setObjectName("primary")
         self.stop_button = QPushButton("■ 终止实验"); self.stop_button.setObjectName("danger")
+        self.stop_standalone_calibration_button = QPushButton("停止独立校准")
+        self.stop_standalone_calibration_button.setObjectName("danger")
+        self.stop_standalone_calibration_button.setToolTip(
+            "立即终止当前独立校准，并执行结束校准、关闭气路和关泵流程"
+        )
         for button in (self.start_button, self.stop_button):
             button.setMinimumSize(96, 32)
             button.setMaximumSize(116, 36)
+        self.stop_standalone_calibration_button.setMinimumSize(116, 32)
+        self.stop_standalone_calibration_button.setMaximumSize(140, 36)
         self.start_button.clicked.connect(self._start_experiment)
         self.stop_button.clicked.connect(self._stop_experiment)
-        actions.addWidget(self.start_button); actions.addWidget(self.stop_button); actions.addStretch(1)
+        self.stop_standalone_calibration_button.clicked.connect(
+            self._stop_standalone_calibration
+        )
+        actions.addWidget(self.start_button)
+        actions.addWidget(self.stop_button)
+        actions.addWidget(self.stop_standalone_calibration_button)
+        actions.addStretch(1)
         action_box.addLayout(actions)
         self.operation_hint = QLabel("终止实验需要二次确认，默认不会因健康告警自动终止。")
         self.operation_hint.setProperty("hint", True); action_box.addWidget(self.operation_hint)
@@ -650,7 +664,10 @@ class ExperimentControlPage(_BaseWorkflowPage):
                 )
             )
             self.calibration_buttons[f"standalone_{kind}"] = button
-            standalone_actions.addWidget(button, index // 2, index % 2)
+            if index == 2:
+                standalone_actions.addWidget(button, 1, 0, 1, 2)
+            else:
+                standalone_actions.addWidget(button, index // 2, index % 2)
         calibration_box.addLayout(standalone_actions)
         self.calibration_evidence = QLabel("校准读数（采样流量、O₂、CO₂、气室压差、气室温度）：未知")
         self.calibration_evidence.setProperty("hint", True); self.calibration_evidence.setVisible(True); calibration_box.addWidget(self.calibration_evidence)
@@ -989,11 +1006,39 @@ class ExperimentControlPage(_BaseWorkflowPage):
             return
 
         self._standalone_calibration_kind = kind
+        self._standalone_calibration_stopping = False
         self._active_calibrations.add("standalone")
         self.calibration_status.setText(f"{label}启动中")
         self.set_operation_progress(0, f"{label}请求已发送")
         self.operation_hint.setText(f"正在执行{label}；完成后不会启动实验。")
         self.start_button.setEnabled(False)
+        self._update_calibration_buttons()
+
+    def _stop_standalone_calibration(self) -> None:
+        kind = self._standalone_calibration_kind
+        if kind is None:
+            self.operation_hint.setText("当前没有正在执行的独立校准。")
+            return
+        if self._standalone_calibration_stopping:
+            self.operation_hint.setText("停止请求已发送，正在执行安全收尾。")
+            return
+        labels = {
+            "co2_zero_span": "CO2校零和span",
+            "o2_span": "O2校span",
+            "air_o2_co2": "氧气和二氧化碳空气校准",
+        }
+        label = labels.get(kind, "独立校准")
+        if not self._send_monitor_command("stop_standalone_calibration"):
+            return
+        self._standalone_calibration_stopping = True
+        self.calibration_status.setText(f"{label}停止中")
+        self.set_operation_progress(
+            self.operation_progress.value(),
+            f"正在终止{label}并执行安全收尾",
+        )
+        self.operation_hint.setText(
+            "停止请求已发送；正在结束当前校准并关闭气路、气泵，请勿再次操作。"
+        )
         self._update_calibration_buttons()
 
     def on_standalone_calibration_response(self, response: Mapping[str, Any] | None) -> None:
@@ -1006,18 +1051,39 @@ class ExperimentControlPage(_BaseWorkflowPage):
         if phase == "accepted" and payload.get("success", False):
             global_setting.set_setting("standalone_calibration_ui_active", True)
             self._standalone_calibration_kind = kind
+            self._standalone_calibration_stopping = False
             self._active_calibrations.add("standalone")
             self.calibration_status.setText(f"{label}进行中")
             self.set_operation_progress(5, f"{label}进行中")
             self.operation_hint.setText(message or f"正在执行{label}。")
-        elif phase in {"finished", "failed", "rejected"}:
+        elif phase == "stopping" and payload.get("success", False):
+            global_setting.set_setting("standalone_calibration_ui_active", True)
+            self._standalone_calibration_kind = kind
+            self._standalone_calibration_stopping = True
+            self._active_calibrations.add("standalone")
+            self.calibration_status.setText(f"{label}停止中")
+            self.set_operation_progress(
+                self.operation_progress.value(),
+                f"正在终止{label}并执行安全收尾",
+            )
+            self.operation_hint.setText(
+                message or "正在结束校准并安全关闭气路、气泵。"
+            )
+        elif phase in {"finished", "stopped", "failed", "rejected"}:
             global_setting.set_setting("standalone_calibration_ui_active", False)
             self._standalone_calibration_kind = None
+            self._standalone_calibration_stopping = False
             self._active_calibrations.clear()
             self._stopping_calibrations.clear()
             if phase == "finished" and payload.get("success", False):
                 self.calibration_status.setText(f"{label}完成")
                 self.set_operation_progress(100, f"{label}完成")
+            elif phase == "stopped" and payload.get("success", False):
+                self.calibration_status.setText(f"{label}已停止")
+                self.set_operation_progress(
+                    self.operation_progress.value(),
+                    f"{label}已停止，安全收尾完成",
+                )
             else:
                 self.calibration_status.setText(f"{label}失败")
                 self.set_operation_progress(0, f"{label}失败")
@@ -1135,6 +1201,10 @@ class ExperimentControlPage(_BaseWorkflowPage):
             self.calibration_buttons[f"standalone_{kind}"].setEnabled(
                 standalone_enabled
             )
+        self.stop_standalone_calibration_button.setEnabled(
+            self._standalone_calibration_kind is not None
+            and not self._standalone_calibration_stopping
+        )
 
     def on_calibration_event(self, event: str) -> None:
         """React to calibration start, finish and failed events from the backend."""

@@ -1375,6 +1375,9 @@ class read_queue_data_Thread(MyQThread):
                     case 'start_standalone_calibration':
                         start_standalone_calibration(message.data)
                         pass
+                    case 'stop_standalone_calibration':
+                        stop_standalone_calibration()
+                        pass
                     case 'start_calibration':
                         start_calibration()
                         pass
@@ -3490,6 +3493,33 @@ def start_standalone_calibration(data):
         logger.exception(f"启动独立校准{label}失败")
         return reject(f"{label}启动失败：{exc}")
 
+    _send_main_window_status("standalone_calibration_response", result)
+    return result
+
+
+def stop_standalone_calibration():
+    """Stop the active independent stage, then run its safe shutdown path."""
+    global ufc_ugc_zos_thread
+    controller = ufc_ugc_zos_thread
+    if controller is None or not getattr(
+            controller, "standalone_calibration_active", False
+    ):
+        result = {
+            "success": False,
+            "phase": "rejected",
+            "message": "当前没有正在执行的独立校准",
+        }
+    else:
+        try:
+            result = controller.stop_standalone_calibration()
+        except Exception as exc:
+            logger.exception("停止独立校准失败")
+            result = {
+                "success": False,
+                "phase": "failed",
+                "kind": getattr(controller, "_standalone_calibration_kind", None),
+                "message": f"停止独立校准失败：{exc}",
+            }
     _send_main_window_status("standalone_calibration_response", result)
     return result
 
