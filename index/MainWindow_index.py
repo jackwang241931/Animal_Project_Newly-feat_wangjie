@@ -203,6 +203,7 @@ class read_queue_data_Thread(MyQThread):
     start_failed_signal = pyqtSignal(str)
     operation_progress_signal = pyqtSignal(int, str)
     calibration_event_signal = pyqtSignal(str)
+    standalone_calibration_response_signal = pyqtSignal(object)
     # Calibration detail widgets are QWidgets and must only be touched from
     # the GUI thread.  The queue reader runs in a worker thread, so it emits a
     # small description of the update instead of calling the dialog directly.
@@ -468,6 +469,10 @@ class read_queue_data_Thread(MyQThread):
                             if not response.get("success", False):
                                 self.operation_progress_signal.emit(0, "空气校准启动失败")
                                 self.calibration_event_signal.emit("air_failed")
+                    case 'standalone_calibration_response':
+                        if self.window is not None:
+                            response = message.data if isinstance(message.data, dict) else {}
+                            self.standalone_calibration_response_signal.emit(response)
                     case 'set_calibration_values':
                         """
                         设置校准窗口显示值
@@ -1023,6 +1028,9 @@ class MainWindow_Index(ThemedWindow):
         read_queue_data_thread.calibration_event_signal.connect(
             self._on_calibration_event
         )
+        read_queue_data_thread.standalone_calibration_response_signal.connect(
+            self._on_standalone_calibration_response
+        )
         read_queue_data_thread.calibration_detail_update_signal.connect(
             self._on_calibration_detail_update
         )
@@ -1449,6 +1457,11 @@ class MainWindow_Index(ThemedWindow):
             # shared bar follows the legacy dialog's overall elapsed-time scale.
             if self.workflow_run_state == ExperimentRunState.STARTING:
                 page.set_operation_progress(page.operation_progress.value(), label)
+            elif (
+                    getattr(page, "_standalone_calibration_kind", None) is not None
+                    and value >= 100
+            ):
+                page.set_operation_progress(95, f"{label}，正在安全关闭气路")
             else:
                 page.set_operation_progress(value, label)
 
@@ -1504,6 +1517,11 @@ class MainWindow_Index(ThemedWindow):
             ExperimentRunState.STOP_FAILED,
         }:
             page.on_calibration_event(event)
+
+    def _on_standalone_calibration_response(self, response) -> None:
+        page = getattr(self, "experiment_control_page", None)
+        if page is not None:
+            page.on_standalone_calibration_response(response)
 
     def _on_calibration_detail_update(self, update) -> None:
         """Apply calibration-detail updates on the GUI thread only.

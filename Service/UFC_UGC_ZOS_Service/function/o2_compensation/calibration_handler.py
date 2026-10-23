@@ -187,6 +187,10 @@ class CalibrationHandler:
             self.gains[ch] = 1.0
         lock = cfg.get("air_lock", AIR_NOMINAL)
         self.air_lock = float(lock) if lock is not None else AIR_NOMINAL
+        saved_air_measured = cfg.get("air_measured")
+        self.air_measured = (
+            float(saved_air_measured) if saved_air_measured is not None else None
+        )
         self.air_cal_count = int(cfg.get("air_cal_count", 0))
         self.target_o2 = float(cfg.get("target_o2", AIR_NOMINAL))
         saved_target_span = cfg.get("target_span")
@@ -241,6 +245,36 @@ class CalibrationHandler:
             self.last_phase = "air"
             self.skip_b_update = not _BOOT_AIR_DONE
         logger.info("air cal points=%s skip_b=%s lock=%.4f", self.target_points, self.skip_b_update, self.air_lock)
+        return True
+
+    def finish_span_only(self):
+        """Persist a standalone O2 Span result without consuming Air samples.
+
+        The combined calibration keeps Span data in memory until the following
+        Air stage.  A user-requested standalone Span calibration instead updates
+        only the per-channel Span offsets and deliberately preserves the
+        existing Air lock and Air reference records.
+        """
+        with self.lock:
+            if self.cal_mode != "full" or not self.span_done:
+                raise RuntimeError("O2 Span采样未完成，不能保存独立Span结果")
+
+            for channel in self.channels:
+                measured = self._stable_median(self.phase_data[channel]["span"])
+                if np.isnan(measured):
+                    raise RuntimeError(f"{channel}缺少有效O2 Span采样")
+                self.offsets[channel] = float(self.target_span - measured)
+                self.gains[channel] = 1.0
+
+            self.last_phase = "span"
+            self.calibrated = True
+            self.completed = True
+            self.is_active = False
+            self._save_unlocked()
+            logger.info(
+                "standalone span calibration saved, target_span={:.4f}",
+                self.target_span,
+            )
         return True
 
     def add_data(self, channel, o2_partial, zos_temp, gas_pressure, o2_percent, zos_rh=None, sht_temp=None, sht_rh=None):

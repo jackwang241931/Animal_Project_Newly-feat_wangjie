@@ -101,6 +101,12 @@ class Monitor_start_state_Thread(MyQThread):
 
 
 class UFC_UGC_ZOS_index(MyQThread):
+    STANDALONE_CALIBRATION_LABELS = {
+        "co2_zero_span": "CO2校零和span",
+        "o2_span": "O2校span",
+        "air_o2_co2": "氧气和二氧化碳空气校准",
+    }
+
     def __init__(self):
         super().__init__(name="UFC_UGC_ZOS_index")
         self.ispause = False
@@ -118,6 +124,11 @@ class UFC_UGC_ZOS_index(MyQThread):
         self._runtime_air_thread = None
         self._runtime_air_stop_event = threading.Event()
         self._runtime_air_lock = threading.Lock()
+        self._standalone_calibration_active = False
+        self._standalone_calibration_kind = None
+        self._standalone_calibration_chain = None
+        self._standalone_calibration_lock = threading.Lock()
+        self._standalone_shutdown_in_progress = False
 
         self.send_message = {
             'port': '',
@@ -740,6 +751,164 @@ class UFC_UGC_ZOS_index(MyQThread):
         self.UFC_gas_path_system_obj.set_startup_status(startup_status)
         return startup_status
 
+    @property
+    def standalone_calibration_active(self):
+        with self._standalone_calibration_lock:
+            return self._standalone_calibration_active
+
+    def start_standalone_calibration(self, kind):
+        """Start one calibration stage without starting an experiment."""
+        kind = str(kind or "").strip().lower()
+        label = self.STANDALONE_CALIBRATION_LABELS.get(kind)
+        if label is None:
+            return {"success": False, "message": f"不支持的独立校准类型：{kind}"}
+        if global_setting.get_setting("application_shutdown_requested", False):
+            return {"success": False, "message": "应用正在关闭，无法启动独立校准"}
+        if global_setting.get_setting("port", None) is None:
+            return {"success": False, "message": "未选择串口，无法启动独立校准"}
+
+        with self._standalone_calibration_lock:
+            if self._standalone_calibration_active:
+                active_label = self.STANDALONE_CALIBRATION_LABELS.get(
+                    self._standalone_calibration_kind,
+                    "其他独立校准",
+                )
+                return {
+                    "success": False,
+                    "message": f"{active_label}正在进行，请等待完成",
+                }
+            self._standalone_calibration_active = True
+            self._standalone_calibration_kind = kind
+            self._standalone_shutdown_in_progress = False
+
+        try:
+            self._prepare_new_start()
+            self._prepare_startup_calibration_cages()
+            self.update_status_main_signal_gui_update.send(
+                f"{time_util.get_format_from_time(time.time())} | "
+                f"启动独立校准：{label}；本次不会启动实验",
+                title=GapSystem_Running_Type.STARTUP_AIR_CALIBRATION,
+            )
+
+            chain = (
+                AsyPromise(self.UFC_gas_state_check_obj.read_start_status)
+                .then(self._remember_ufc_start_status)
+                .then(lambda _: AsyPromise(self.ZOS_gas_path_system_obj.start))
+                .then(lambda _: AsyPromise(self.UGC_gas_path_system_obj.start))
+                .then(lambda _: AsyPromise(self.UFC_gas_path_system_obj.start))
+            )
+
+            if kind == "co2_zero_span":
+                chain = (
+                    chain
+                    .then(lambda _: AsyPromise(
+                        self.co2_zero_calibration_obj_calibrate_wrapped
+                    ))
+                    .then(lambda _: AsyPromise(
+                        self.co2_span_calibration_obj_calibrate_wrapped
+                    ))
+                )
+            elif kind == "o2_span":
+                self.Startup_o2_span_air_calibration_obj.reset_stop()
+                chain = chain.then(
+                    lambda _: AsyPromise(
+                        self.Startup_o2_span_air_calibration_obj.run_span_standalone
+                    )
+                )
+            else:
+                self.Startup_air_calibration_obj.clear_continued_o2_calibration()
+                chain = (
+                    chain
+                    .then(lambda _: AsyPromise(self.Startup_air_calibration_obj.start))
+                    .then(lambda _: AsyPromise(
+                        self.Startup_air_calibration_obj.wait_air_calibration_prepare
+                    ))
+                    .then(lambda _: AsyPromise(self.Startup_air_calibration_obj.run))
+                    .then(lambda _: AsyPromise(self.Startup_air_calibration_obj.stop))
+                )
+
+            self._standalone_calibration_chain = chain
+            chain.then(
+                lambda _: self._finish_standalone_calibration(True, None)
+            ).catch(
+                lambda error: self._finish_standalone_calibration(False, error)
+            )
+        except Exception as exc:
+            logger.exception(f"启动独立校准{label}失败")
+            self._finish_standalone_calibration(False, exc)
+            return {"success": False, "message": f"{label}启动失败：{exc}"}
+
+        return {
+            "success": True,
+            "phase": "accepted",
+            "kind": kind,
+            "label": label,
+            "message": f"{label}已启动；完成后只关闭气路，不会启动实验",
+        }
+
+    def _finish_standalone_calibration(self, stage_success, stage_error):
+        """Always run the documented gas shutdown after one standalone stage."""
+        with self._standalone_calibration_lock:
+            if not self._standalone_calibration_active:
+                return
+            if self._standalone_shutdown_in_progress:
+                return
+            self._standalone_shutdown_in_progress = True
+            kind = self._standalone_calibration_kind
+
+        def complete(_=None, stop_error=None):
+            errors = []
+            if stage_error is not None:
+                errors.append(str(stage_error))
+            if stop_error is not None:
+                errors.append(f"安全收尾异常：{stop_error}")
+            errors.extend(str(item) for item in self._shutdown_errors)
+            success = bool(stage_success and not errors)
+            label = self.STANDALONE_CALIBRATION_LABELS.get(kind, kind)
+            message = (
+                f"{label}完成，气路已安全关闭，实验未启动"
+                if success
+                else f"{label}失败或收尾未确认：{'；'.join(errors) or '未知错误'}"
+            )
+            with self._standalone_calibration_lock:
+                self._standalone_calibration_active = False
+                self._standalone_calibration_kind = None
+                self._standalone_calibration_chain = None
+                self._standalone_shutdown_in_progress = False
+            self._publish_standalone_calibration_result(
+                success=success,
+                kind=kind,
+                message=message,
+            )
+
+        try:
+            stop_promise = self.stop_btn_handle()
+            stop_promise.then(
+                lambda _: complete()
+            ).catch(
+                lambda error: complete(stop_error=error)
+            )
+        except Exception as exc:
+            logger.exception("独立校准安全收尾启动失败")
+            complete(stop_error=exc)
+
+    def _publish_standalone_calibration_result(self, success, kind, message):
+        queue = global_setting.get_setting("queue", None)
+        if queue:
+            queue.put(ObjectQueueItem(
+                origin="UFC_UGC_ZOS_index",
+                to="MainWindow_index",
+                title="standalone_calibration_response",
+                data={
+                    "success": bool(success),
+                    "phase": "finished" if success else "failed",
+                    "kind": kind,
+                    "label": self.STANDALONE_CALIBRATION_LABELS.get(kind, kind),
+                    "message": str(message),
+                },
+                time=time_util.get_format_from_time(time.time()),
+            ))
+
     def start_btn_handle_with_co2_air_calibration(self):
         """启动气路，并在进入正常实验前执行 CO2 Air 空气校准。"""
         self._prepare_new_start()
@@ -1117,7 +1286,7 @@ class UFC_UGC_ZOS_index(MyQThread):
             stop_message = "停止气路完成"
             logger.info(stop_message)
         queue = global_setting.get_setting("queue", None)
-        if queue:
+        if queue and not self._standalone_shutdown_in_progress:
             queue.put(
                 ObjectQueueItem(origin="UFC_UGC_ZOS_index", to="MainWindow_index", title="stop_gap_system_return",
                                 data=stop_message,

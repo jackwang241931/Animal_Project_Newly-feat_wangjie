@@ -353,6 +353,37 @@ class Startup_O2_Span_Air_Calibration:
             span_path_prepared=True,
         )
 
+    def run_span_standalone(self, resolve, reject):
+        """Run and save only O2 Span, without continuing into the Air stage."""
+
+        def finish_span(handler):
+            failure = None
+            try:
+                handler.finish_span_only()
+                reload_o2_compensation_config()
+                self._send_text(
+                    "O2 Span独立校准完成；已更新Span偏移，保留原有Air基准"
+                )
+            except Exception as exc:
+                failure = exc
+                logger.exception(f"{self.name}: 保存独立O2 Span结果失败")
+            finally:
+                cleanup_error = self._restore_safe_gas_state()
+                self._finish_running_state()
+                if cleanup_error is not None and failure is None:
+                    failure = RuntimeError(f"O2 Span安全收尾失败：{cleanup_error}")
+
+            if failure is not None:
+                reject(failure)
+            else:
+                resolve(True)
+
+        self._run_span_only(
+            finish_span,
+            reject,
+            switch_to_air=False,
+        )
+
     def _run_span_only(
         self,
         resolve,

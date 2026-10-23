@@ -527,6 +527,7 @@ class ExperimentControlPage(_BaseWorkflowPage):
         self._active_calibrations: set[str] = set()
         self._stopping_calibrations: set[str] = set()
         self._combined_calibration = False
+        self._standalone_calibration_kind: str | None = None
         self._main_log_render_signature = None
         self._main_log_rendered_entries = ()
         self.main_log_list = QTableWidget(0, 2)
@@ -619,7 +620,10 @@ class ExperimentControlPage(_BaseWorkflowPage):
         calibration_box.addWidget(self.calibration_status)
         self.calibration_buttons: dict[str, QPushButton] = {}
         air_button = QPushButton("空气校准")
-        air_button.setToolTip("实验前选择完整 O₂ Span+Air；实验运行中启动单独 Air 空气校准")
+        air_button.setToolTip(
+            "实验前选择完整 CO2校零→CO2 Span→O2 Span→氧气和二氧化碳空气校准；"
+            "实验运行中启动单独 Air 空气校准"
+        )
         air_button.clicked.connect(self._start_air_calibration)
         self.calibration_buttons["air"] = air_button
         self.calibration_details_button = QPushButton("显示校准信息详情")
@@ -629,6 +633,25 @@ class ExperimentControlPage(_BaseWorkflowPage):
         calibration_actions.addWidget(air_button, 1)
         calibration_actions.addWidget(self.calibration_details_button, 1)
         calibration_box.addLayout(calibration_actions)
+
+        standalone_actions = QGridLayout()
+        standalone_actions.setSpacing(8)
+        standalone_specs = (
+            ("co2_zero_span", "CO2校零和span"),
+            ("o2_span", "O2校span"),
+            ("air_o2_co2", "氧气和二氧化碳空气校准"),
+        )
+        for index, (kind, label) in enumerate(standalone_specs):
+            button = QPushButton(label)
+            button.setToolTip(f"只执行{label}，完成后关闭气路，不启动实验")
+            button.clicked.connect(
+                lambda _checked=False, selected_kind=kind: self._start_standalone_calibration(
+                    selected_kind
+                )
+            )
+            self.calibration_buttons[f"standalone_{kind}"] = button
+            standalone_actions.addWidget(button, index // 2, index % 2)
+        calibration_box.addLayout(standalone_actions)
         self.calibration_evidence = QLabel("校准读数（采样流量、O₂、CO₂、气室压差、气室温度）：未知")
         self.calibration_evidence.setProperty("hint", True); self.calibration_evidence.setVisible(True); calibration_box.addWidget(self.calibration_evidence)
         self._update_calibration_buttons()
@@ -915,6 +938,85 @@ class ExperimentControlPage(_BaseWorkflowPage):
             return False
         return True
 
+    def _standalone_calibration_ready(self) -> bool:
+        if self._last_run_status in {"starting", "running", "monitoring", "stopping"} or getattr(
+                self, "_last_can_stop", False
+        ):
+            self.operation_hint.setText("请先停止实验，再执行独立校准。")
+            return False
+        if global_setting.get_setting("environment_module_only", False):
+            self.operation_hint.setText("仅环境模块模式不运行气路，无法执行独立校准。")
+            return False
+        if not global_setting.get_setting("air_modules_all_valid", False):
+            self.operation_hint.setText("请先确认串口并完成检测，UFC、UGC、ZOS全部通过后再校准。")
+            return False
+        if global_setting.get_setting("send_message_queue", None) is None:
+            self.operation_hint.setText("后台采集服务未连接，操作未发送。")
+            return False
+        return True
+
+    def _start_standalone_calibration(self, kind: str) -> None:
+        labels = {
+            "co2_zero_span": "CO2校零和span",
+            "o2_span": "O2校span",
+            "air_o2_co2": "氧气和二氧化碳空气校准",
+        }
+        label = labels.get(kind)
+        if label is None or not self._standalone_calibration_ready():
+            return
+        if self._active_calibrations or self._standalone_calibration_kind is not None:
+            self.operation_hint.setText("已有校准正在进行，请等待完成后再操作。")
+            return
+        if QMessageBox.question(
+                self,
+                f"确认{label}",
+                f"本次只执行{label}，完成后关闭气路，不会启动实验。是否继续？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        if not self._open_calibration_details(f"standalone_{kind}"):
+            return
+        if not self._send_monitor_command(
+                "start_standalone_calibration",
+                {"kind": kind},
+        ):
+            return
+
+        self._standalone_calibration_kind = kind
+        self._active_calibrations.add("standalone")
+        self.calibration_status.setText(f"{label}启动中")
+        self.set_operation_progress(0, f"{label}请求已发送")
+        self.operation_hint.setText(f"正在执行{label}；完成后不会启动实验。")
+        self.start_button.setEnabled(False)
+        self._update_calibration_buttons()
+
+    def on_standalone_calibration_response(self, response: Mapping[str, Any] | None) -> None:
+        payload = dict(response) if isinstance(response, Mapping) else {}
+        phase = str(payload.get("phase") or "")
+        kind = str(payload.get("kind") or self._standalone_calibration_kind or "")
+        label = str(payload.get("label") or kind or "独立校准")
+        message = str(payload.get("message") or "")
+
+        if phase == "accepted" and payload.get("success", False):
+            self._standalone_calibration_kind = kind
+            self._active_calibrations.add("standalone")
+            self.calibration_status.setText(f"{label}进行中")
+            self.set_operation_progress(5, f"{label}进行中")
+            self.operation_hint.setText(message or f"正在执行{label}。")
+        elif phase in {"finished", "failed", "rejected"}:
+            self._standalone_calibration_kind = None
+            self._active_calibrations.clear()
+            self._stopping_calibrations.clear()
+            if phase == "finished" and payload.get("success", False):
+                self.calibration_status.setText(f"{label}完成")
+                self.set_operation_progress(100, f"{label}完成")
+            else:
+                self.calibration_status.setText(f"{label}失败")
+                self.set_operation_progress(0, f"{label}失败")
+            self.operation_hint.setText(message or self.calibration_status.text())
+        self._update_calibration_buttons()
+
     def _start_calibration(self, key: str) -> None:
         # Before the experiment starts, these buttons select the startup workflow.
         # The backend performs the selected calibration in the normal start chain.
@@ -1014,8 +1116,27 @@ class ExperimentControlPage(_BaseWorkflowPage):
             and not self._active_calibrations
             and not self._stopping_calibrations
         )
+        standalone_enabled = (
+            gas_enabled
+            and gas_valid
+            and before_experiment
+            and not self._active_calibrations
+            and not self._stopping_calibrations
+            and self._standalone_calibration_kind is None
+        )
+        for kind in ("co2_zero_span", "o2_span", "air_o2_co2"):
+            self.calibration_buttons[f"standalone_{kind}"].setEnabled(
+                standalone_enabled
+            )
+
     def on_calibration_event(self, event: str) -> None:
         """React to calibration start, finish and failed events from the backend."""
+        # Independent calibration owns the page state until the backend has
+        # also finished the shared safe gas-path shutdown.  The lower-level
+        # stage events may report 100% before that shutdown has completed, so
+        # they must not clear or replace the independent-calibration status.
+        if self._standalone_calibration_kind is not None:
+            return
         channel, _, phase = event.partition("_")
         if channel not in {"zero", "span", "air"}:
             return
@@ -1045,10 +1166,10 @@ class ExperimentControlPage(_BaseWorkflowPage):
         self._update_calibration_buttons()
 
     def _start_air_calibration(self) -> None:
-        """Select full Span+Air before start, or run standalone Air while running."""
+        """Select the existing full sequence, or run Air while experimenting."""
         if self._last_run_status not in {"running", "monitoring"}:
             # The single pre-experiment Air button represents the complete
-            # documented workflow: CO2 zero, O2 Span, CO2 Span, then the
+            # documented workflow: CO2 zero, CO2 Span, O2 Span, then the
             # shared O2/CO2 Air acquisition.
             self._select_startup_calibration("co2_o2_span_air")
             return
@@ -1118,14 +1239,20 @@ class ExperimentControlPage(_BaseWorkflowPage):
         if status != self._last_run_status and status in {"running", "monitoring"}:
             self.set_operation_progress(100, "实验已启动")
         if status != self._last_run_status and status in {"not_started", "initialized", "configuring", "stopped"}:
-            self._active_calibrations.clear()
-            self._stopping_calibrations.clear()
-            self._combined_calibration = False
+            if self._standalone_calibration_kind is None:
+                self._active_calibrations.clear()
+                self._stopping_calibrations.clear()
+                self._combined_calibration = False
         self._last_run_status = status
         running = status in {"running", "monitoring", "starting"}
         can_stop = bool(context.get("can_stop_experiment", False))
         self._last_can_stop = can_stop
-        self.start_button.setEnabled(not running and not can_stop and status != "stopping")
+        self.start_button.setEnabled(
+            not running
+            and not can_stop
+            and status != "stopping"
+            and self._standalone_calibration_kind is None
+        )
         self.stop_button.setEnabled((running or can_stop) and status != "stopping")
         self._update_calibration_buttons()
         health_snapshot = _provider_value(self._health_source)

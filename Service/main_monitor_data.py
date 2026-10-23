@@ -1315,6 +1315,18 @@ class read_queue_data_Thread(MyQThread):
                                 },
                             )
                     case 'start':
+                        if (
+                                ufc_ugc_zos_thread is not None
+                                and getattr(
+                                    ufc_ugc_zos_thread,
+                                    "standalone_calibration_active",
+                                    False,
+                                )
+                        ):
+                            error = "独立校准正在进行，完成并安全关闭气路后才能开始实验"
+                            logger.warning(error)
+                            _send_main_window_status("start_experiment_failed", error)
+                            return
                         data = message.data
                         if data is not None:
                             global_setting.set_setting("start_experiment_time", data.get("start_experiment_time",time.time()))
@@ -1359,6 +1371,9 @@ class read_queue_data_Thread(MyQThread):
                         pass
                     case 'start_air_calibration':
                         start_air_calibration()
+                        pass
+                    case 'start_standalone_calibration':
+                        start_standalone_calibration(message.data)
                         pass
                     case 'start_calibration':
                         start_calibration()
@@ -3426,6 +3441,59 @@ def start_air_calibration():
             result.get("message", "空气校准请求被拒绝"),
         )
     _send_main_window_status("runtime_air_calibration_response", result)
+
+
+def start_standalone_calibration(data):
+    """Run one calibration stage while the experiment remains stopped."""
+    global ufc_ugc_zos_thread
+    request = data if isinstance(data, dict) else {}
+    kind = str(request.get("kind") or "").strip().lower()
+    labels = UFC_UGC_ZOS_index.STANDALONE_CALIBRATION_LABELS
+    label = labels.get(kind, kind or "未知校准")
+
+    def reject(message):
+        payload = {
+            "success": False,
+            "phase": "rejected",
+            "kind": kind,
+            "label": label,
+            "message": str(message),
+        }
+        logger.warning(payload["message"])
+        _send_main_window_status("standalone_calibration_response", payload)
+        return payload
+
+    if kind not in labels:
+        return reject(f"不支持的独立校准类型：{kind}")
+    if _environment_module_only_enabled():
+        return reject("仅环境模块模式不运行气路，独立校准请求已拒绝")
+    if global_setting.get_setting("port", None) is None:
+        return reject("未选择串口，无法启动独立校准")
+
+    current = ufc_ugc_zos_thread
+    if current is not None and getattr(current, "standalone_calibration_active", False):
+        return reject("已有独立校准正在进行，请等待完成")
+    if current is not None and all(
+            getattr(current, name, None) is not None
+            for name in (
+                "UFC_gas_path_system_obj",
+                "UGC_gas_path_system_obj",
+                "ZOS_gas_path_system_obj",
+            )
+    ):
+        return reject("实验气路正在使用中，不能启动独立校准")
+
+    try:
+        ufc_ugc_zos_thread = UFC_UGC_ZOS_index()
+        result = ufc_ugc_zos_thread.start_standalone_calibration(kind)
+    except Exception as exc:
+        logger.exception(f"启动独立校准{label}失败")
+        return reject(f"{label}启动失败：{exc}")
+
+    _send_main_window_status("standalone_calibration_response", result)
+    return result
+
+
 def start_calibration():
     """
       校0 和span
