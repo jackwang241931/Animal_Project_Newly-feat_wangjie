@@ -293,9 +293,15 @@ class read_queue_data_Thread(MyQThread):
                                         "o2_span_air", "co2_o2_span_air",
                                     }
                                 )
+                                standalone_calibration_active = bool(
+                                    global_setting.get_setting(
+                                        "standalone_calibration_ui_active",
+                                        False,
+                                    )
+                                )
                                 calibration_active = bool(
                                     getattr(self.window, "_active_calibration_channels", set())
-                                ) or startup_calibration_active
+                                ) or startup_calibration_active or standalone_calibration_active
                                 runtime_text = str(message.data)
                                 is_wait_or_purge = any(
                                     marker in runtime_text for marker in ("等待", "置换")
@@ -310,8 +316,18 @@ class read_queue_data_Thread(MyQThread):
                                         for marker in ("Air", "空气", "Span", "CO2", "O2", "UFC", "UGC", "ZOS", "校准", "气路")
                                     )
                                 )
-                                if calibration_active and (
-                                    is_wait_or_purge or is_gas_stage_transition
+                                if standalone_calibration_active:
+                                    # Independent calibration has no legacy
+                                    # startup dialog. Show every gas-path line
+                                    # in both the calibration window and the P3
+                                    # runtime log instead of only transitions.
+                                    self.calibration_detail_update_signal.emit({
+                                        "kind": "message",
+                                        "message": runtime_text,
+                                        "has_time": True,
+                                    })
+                                elif calibration_active and (
+                                        is_wait_or_purge or is_gas_stage_transition
                                 ):
                                     # Gas-path countdowns and stage transitions
                                     # may use the general runtime channel rather
@@ -368,6 +384,15 @@ class read_queue_data_Thread(MyQThread):
                             # 将运行信息放入status栏中
                             stop_detail = message.data.get("detail", "") if isinstance(message.data, dict) else str(message.data)
                             self.stop_progress_signal.emit(stop_detail)
+                            if global_setting.get_setting(
+                                    "standalone_calibration_ui_active",
+                                    False,
+                            ):
+                                self.calibration_detail_update_signal.emit({
+                                    "kind": "message",
+                                    "message": stop_detail,
+                                    "has_time": True,
+                                })
                                 # self.window.start_dialog.update_progress_value(1)
                             if message.title in self._required_stop_ack_titles:
                                 self._stop_ack_titles.add(message.title)
@@ -1522,6 +1547,11 @@ class MainWindow_Index(ThemedWindow):
         page = getattr(self, "experiment_control_page", None)
         if page is not None:
             page.on_standalone_calibration_response(response)
+        if isinstance(response, dict):
+            phase = str(response.get("phase") or "")
+            message = str(response.get("message") or "").strip()
+            if phase in {"finished", "failed", "rejected"} and message:
+                self.cache_calibration_detail_log(message, has_time=True)
 
     def _on_calibration_detail_update(self, update) -> None:
         """Apply calibration-detail updates on the GUI thread only.

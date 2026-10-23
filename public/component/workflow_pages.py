@@ -977,10 +977,15 @@ class ExperimentControlPage(_BaseWorkflowPage):
             return
         if not self._open_calibration_details(f"standalone_{kind}"):
             return
+        # The GUI queue reader uses this flag to mirror every gas-path message
+        # into both the calibration details and the P3 runtime log, including
+        # the preparation messages that can arrive before the accepted reply.
+        global_setting.set_setting("standalone_calibration_ui_active", True)
         if not self._send_monitor_command(
                 "start_standalone_calibration",
                 {"kind": kind},
         ):
+            global_setting.set_setting("standalone_calibration_ui_active", False)
             return
 
         self._standalone_calibration_kind = kind
@@ -999,12 +1004,14 @@ class ExperimentControlPage(_BaseWorkflowPage):
         message = str(payload.get("message") or "")
 
         if phase == "accepted" and payload.get("success", False):
+            global_setting.set_setting("standalone_calibration_ui_active", True)
             self._standalone_calibration_kind = kind
             self._active_calibrations.add("standalone")
             self.calibration_status.setText(f"{label}进行中")
             self.set_operation_progress(5, f"{label}进行中")
             self.operation_hint.setText(message or f"正在执行{label}。")
         elif phase in {"finished", "failed", "rejected"}:
+            global_setting.set_setting("standalone_calibration_ui_active", False)
             self._standalone_calibration_kind = None
             self._active_calibrations.clear()
             self._stopping_calibrations.clear()
