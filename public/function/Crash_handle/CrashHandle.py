@@ -55,6 +55,12 @@ class CrashHandler(QObject):
 
     def __init__(self):
         super().__init__()
+        self._previous_sys_excepthook = sys.excepthook
+        self._previous_threading_excepthook = threading.excepthook
+        self._previous_private_excepthook = getattr(sys, '_excepthook', None)
+        self._had_private_excepthook = hasattr(sys, '_excepthook')
+        self._previous_signal_handlers = {}
+        self._shutdown_complete = False
         self._last_gui_heartbeat = time.monotonic()
         self._watchdog_timeout_seconds = 3.0
         self._watchdog_stop_event = threading.Event()
@@ -83,12 +89,14 @@ class CrashHandler(QObject):
     def setup_signal_handling(self):
         """设置信号处理"""
         # 处理SIGTERM, SIGINT等信号
-        signal.signal(signal.SIGTERM, self.handle_signal)
-        signal.signal(signal.SIGINT, self.handle_signal)
+        for signal_number in (signal.SIGTERM, signal.SIGINT):
+            self._previous_signal_handlers[signal_number] = signal.getsignal(signal_number)
+            signal.signal(signal_number, self.handle_signal)
 
         # Windows下的特殊处理
         if os.name == 'nt':
             try:
+                self._previous_signal_handlers[signal.SIGBREAK] = signal.getsignal(signal.SIGBREAK)
                 signal.signal(signal.SIGBREAK, self.handle_signal)
             except AttributeError:
                 pass
@@ -149,7 +157,79 @@ class CrashHandler(QObject):
     def stop_gui_watchdog(self):
         self._watchdog_stop_event.set()
         if self._watchdog_timer is not None:
-            self._watchdog_timer.stop()
+            try:
+                self._watchdog_timer.stop()
+            except RuntimeError:
+                pass
+
+    @staticmethod
+    def _handler_belongs_to(handler, owner):
+        return getattr(handler, '__self__', None) is owner
+
+    def shutdown(self, app=None, join_timeout_seconds=3.0):
+        """Detach global callbacks before the QObject wrapper is destroyed.
+
+        ``sys.excepthook``, ``threading.excepthook`` and ``signal.signal`` all
+        keep strong references to bound methods. Leaving those references in
+        place lets a CrashHandler QObject survive until interpreter teardown,
+        after QApplication and its Qt runtime may already have been deleted.
+        """
+        if self._shutdown_complete:
+            return True
+        self._shutdown_complete = True
+        self.stop_gui_watchdog()
+
+        if app is not None:
+            try:
+                app.aboutToQuit.disconnect(self.stop_gui_watchdog)
+            except (TypeError, RuntimeError):
+                pass
+
+        timer = self._watchdog_timer
+        if timer is not None:
+            try:
+                timer.timeout.disconnect(self._update_gui_heartbeat)
+            except (TypeError, RuntimeError):
+                pass
+
+        watchdog_thread = self._watchdog_thread
+        if (
+            watchdog_thread is not None
+            and watchdog_thread is not threading.current_thread()
+            and watchdog_thread.is_alive()
+        ):
+            watchdog_thread.join(timeout=max(0.0, float(join_timeout_seconds)))
+        watchdog_stopped = watchdog_thread is None or not watchdog_thread.is_alive()
+        if not watchdog_stopped:
+            logger.error("GUI watchdog thread did not stop before Qt teardown")
+
+        if self._handler_belongs_to(sys.excepthook, self):
+            sys.excepthook = self._previous_sys_excepthook
+        if self._handler_belongs_to(threading.excepthook, self):
+            threading.excepthook = self._previous_threading_excepthook
+        private_hook = getattr(sys, '_excepthook', None)
+        if self._handler_belongs_to(private_hook, self):
+            if self._had_private_excepthook:
+                sys._excepthook = self._previous_private_excepthook
+            else:
+                delattr(sys, '_excepthook')
+
+        for signal_number, previous_handler in self._previous_signal_handlers.items():
+            try:
+                current_handler = signal.getsignal(signal_number)
+                if self._handler_belongs_to(current_handler, self):
+                    signal.signal(signal_number, previous_handler)
+            except (AttributeError, OSError, RuntimeError, ValueError):
+                pass
+
+        self._watchdog_thread = None
+        self._watchdog_timer = None
+        self._previous_signal_handlers.clear()
+        logger.info(
+            "CrashHandler shutdown completed | "
+            f"watchdog_stopped={watchdog_stopped}"
+        )
+        return watchdog_stopped
 
     def pause_gui_watchdog(self):
         """A deliberate shutdown join is not a GUI freeze."""

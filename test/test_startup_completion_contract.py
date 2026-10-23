@@ -49,6 +49,13 @@ class StartupCompletionContractTests(unittest.TestCase):
         close_reader.assert_called_once_with()
         app.closeAllWindows.assert_called_once_with()
         app.exec.assert_not_called()
+        crash_handler.shutdown.assert_called_once_with(
+            app=app,
+            join_timeout_seconds=3.0,
+        )
+        dialog.blockSignals.assert_called_once_with(True)
+        dialog.close.assert_called_once_with()
+        dialog.deleteLater.assert_called_once_with()
 
     def test_legacy_dialog_messages_are_forwarded_to_workflow_runtime_log(self):
         from index.MainWindow_index import MainWindow_Index

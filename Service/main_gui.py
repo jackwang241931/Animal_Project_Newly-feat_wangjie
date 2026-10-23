@@ -1,3 +1,4 @@
+import gc
 import os
 import sys
 import time
@@ -12,7 +13,8 @@ os.environ.setdefault('KMP_DUPLICATE_LIB_OK', 'TRUE')
 os.environ.setdefault('OMP_NUM_THREADS', '1')
 os.environ.setdefault('MKL_NUM_THREADS', '1')
 import torch  # noqa: F401,E402
-from PyQt6.QtCore import QThreadPool, QRect, QTimer, pyqtSignal
+from PyQt6 import sip
+from PyQt6.QtCore import QCoreApplication, QEvent, QThreadPool, QRect, QTimer, pyqtSignal
 from PyQt6.QtWidgets import QApplication, QDialog, QMessageBox
 from blinker import signal
 from loguru import logger
@@ -109,6 +111,150 @@ read_queue_data_thread = read_queue_data_Thread(name="main_gui_read_queue_data_t
 _qt_shutdown_started = False
 
 
+def _qt_object_is_deleted(obj):
+    """Return whether a PyQt wrapper no longer owns a live C++ object."""
+    if obj is None:
+        return True
+    try:
+        return bool(sip.isdeleted(obj))
+    except (TypeError, RuntimeError):
+        return False
+
+
+def _queue_qt_object_delete(obj, label, close_first=True):
+    """Queue one QObject for deletion while QApplication is still alive."""
+    if obj is None:
+        return
+    with native_call(
+        "gui_teardown",
+        f"{label}_delete_later",
+        object_type=type(obj).__name__,
+        object_id=id(obj),
+    ):
+        if _qt_object_is_deleted(obj):
+            logger.info(f"Qt退出清理跳过已销毁对象: {label}")
+            return
+        try:
+            obj.blockSignals(True)
+        except (AttributeError, RuntimeError):
+            pass
+        if close_first:
+            try:
+                obj.close()
+            except (AttributeError, RuntimeError):
+                pass
+        try:
+            obj.deleteLater()
+        except (AttributeError, RuntimeError) as error:
+            logger.warning(f"Qt退出清理无法延迟销毁 {label}: {error}")
+
+
+def _flush_qt_deferred_deletes(app):
+    """Deliver DeferredDelete events without restarting the full event loop."""
+    if app is None or QCoreApplication.instance() is not app:
+        return
+    # Deleting a parent can enqueue deletion of children. Two passes make the
+    # ordering deterministic while deliberately excluding timers/user events.
+    for pass_number in (1, 2):
+        with native_call(
+            "gui_teardown",
+            "flush_deferred_deletes",
+            pass_number=pass_number,
+        ):
+            QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
+def _teardown_qt_runtime(
+    app,
+    main_window=None,
+    startup_dialog=None,
+    crash_handler=None,
+    shutdown_callback=None,
+):
+    """Destroy Python-owned Qt objects before returning to multiprocessing.
+
+    PyQt local variables must not be left for frame/interpreter finalization:
+    their implicit destruction order may release QApplication before a
+    QWidget wrapper.  That ordering caused the SIP access violation recorded
+    for p_main_gui PID 40304.
+    """
+    global infrared_camera_config_dialog_obj, deep_camera_config_dialog_obj
+
+    if app is None:
+        return
+
+    with native_call("gui_teardown", "begin"):
+        pass
+
+    if shutdown_callback is not None and not _qt_object_is_deleted(app):
+        with native_call("gui_teardown", "disconnect_shutdown_callback"):
+            try:
+                app.aboutToQuit.disconnect(shutdown_callback)
+            except (TypeError, RuntimeError):
+                pass
+
+    if main_window is not None and not _qt_object_is_deleted(main_window):
+        try:
+            main_window._gui_watchdog = None
+        except (AttributeError, RuntimeError):
+            pass
+
+    if crash_handler is not None:
+        with native_call("gui_teardown", "crash_handler_shutdown"):
+            shutdown = getattr(crash_handler, "shutdown", None)
+            if callable(shutdown):
+                shutdown(app=app, join_timeout_seconds=3.0)
+            try:
+                crash_handler.crash_signal.disconnect(on_crash)
+            except (AttributeError, TypeError, RuntimeError):
+                pass
+
+    # Clear module/global references before processing DeferredDelete events.
+    global_setting.set_setting("active_infrared_camera_config_dialog", None)
+    known_objects = [
+        ("infrared_camera_config_dialog", infrared_camera_config_dialog_obj),
+        ("deep_camera_config_dialog", deep_camera_config_dialog_obj),
+        ("main_window", main_window),
+        ("startup_dialog", startup_dialog),
+        ("crash_handler", crash_handler),
+    ]
+    infrared_camera_config_dialog_obj = None
+    deep_camera_config_dialog_obj = None
+
+    # Include any QMessageBox/configuration window that was not tracked by the
+    # main window. Keep a unique object list because the same widget may be
+    # reachable through both a global and QApplication.topLevelWidgets().
+    if QCoreApplication.instance() is app and not _qt_object_is_deleted(app):
+        try:
+            known_objects.extend(
+                (f"top_level_{index}_{type(widget).__name__}", widget)
+                for index, widget in enumerate(QApplication.topLevelWidgets())
+            )
+        except RuntimeError as error:
+            logger.warning(f"Qt退出清理无法枚举顶层窗口: {error}")
+
+    seen_ids = set()
+    for label, obj in known_objects:
+        if obj is None or obj is app or id(obj) in seen_ids:
+            continue
+        seen_ids.add(id(obj))
+        _queue_qt_object_delete(obj, label)
+
+    _flush_qt_deferred_deletes(app)
+
+    # Break Python reference cycles while QApplication is guaranteed alive.
+    with native_call("gui_teardown", "collect_qt_wrappers"):
+        gc.collect()
+
+    # QApplication is always the final Qt object destroyed. Explicit deletion
+    # prevents CPython frame cleanup from choosing an unsafe wrapper order.
+    if QCoreApplication.instance() is app and not _qt_object_is_deleted(app):
+        with native_call("gui_teardown", "qapplication_delete"):
+            sip.delete(app)
+
+    logger.info("Qt GUI对象已按安全顺序完成释放")
+
+
 def quit_qt_application(main_window=None):
     """
     退出QT程序
@@ -203,55 +349,82 @@ def start_qt_application():
     qt程序开始
     :return: 无
     """
-    # 启动qt
-    logger.info("start Qt")
-    with native_call("gui", "qapplication_create"):
-        app = QApplication(sys.argv)
-    # 屏幕大小
-    # 获取屏幕大小
-    screen = app.primaryScreen()
+    global _qt_shutdown_started
+    _qt_shutdown_started = False
+    app = None
+    screen = None
+    program_self_check_index_dialog = None
+    crash_handler = None
+    main_window = None
+    shutdown_callback = None
 
-    screen_rect :QRect= screen.availableGeometry()
-    screen_rect.setHeight(screen_rect.height()-30)
-    global_setting.set_setting("screen", screen_rect)
-    # 绑定突出事件
-    # 程序崩溃闪退监听
-    crash_handler = CrashHandler()
-    crash_handler.crash_signal.connect(on_crash)
+    try:
+        # 启动qt
+        logger.info("start Qt")
+        with native_call("gui", "qapplication_create"):
+            app = QApplication(sys.argv)
+        # 屏幕大小
+        # 获取屏幕大小
+        screen = app.primaryScreen()
 
-    with native_call("gui", "program_self_check_dialog"):
-        program_self_check_index_dialog = Program_self_check_index()
-        program_self_check_index_dialog.activateWindow()
-        return_Data = program_self_check_index_dialog.exec()
-    if return_Data != QDialog.DialogCode.Accepted:
-        # This dialog runs before app.exec(). Entering the event loop after a
-        # rejection leaves a windowless GUI process alive forever, preventing
-        # the parent controller from reclaiming the remaining child processes.
-        logger.info("Startup cancelled by user; closing GUI process")
-        quit_qt_application()
-        app.closeAllWindows()
-        return 0
+        screen_rect :QRect= screen.availableGeometry()
+        screen_rect.setHeight(screen_rect.height()-30)
+        global_setting.set_setting("screen", screen_rect)
+        # 绑定突出事件
+        # 程序崩溃闪退监听
+        crash_handler = CrashHandler()
+        crash_handler.crash_signal.connect(on_crash)
 
-    with native_call("gui", "main_window_create"):
-        main_window = MainWindow_Index()
-    main_window._gui_watchdog = crash_handler
-    logger.info("Application start")
-    with native_call("gui", "main_window_show"):
-        main_window.show_frame()
-    # Startup dialogs and MainWindow construction run before app.exec() and may
-    # legitimately spend several seconds importing modules. Monitor only the
-    # live GUI event loop so startup work is not reported as a runtime freeze.
-    crash_handler.start_gui_watchdog(app, timeout_seconds=3.0)
-    # Stop the watchdog before the slower device cleanup callback runs.
-    app.aboutToQuit.connect(lambda: quit_qt_application(main_window))
-    # 系统退出
-    with native_call("gui", "qt_event_loop"):
-        exit_code = app.exec()
-    # Normally aboutToQuit has already done this.  The explicit idempotent
-    # call also covers event-loop termination initiated by the OS/window.
-    quit_qt_application(main_window)
-    logger.info(f"Qt event loop returned | exit_code={exit_code}")
-    return exit_code
+        with native_call("gui", "program_self_check_dialog"):
+            program_self_check_index_dialog = Program_self_check_index()
+            program_self_check_index_dialog.activateWindow()
+            return_Data = program_self_check_index_dialog.exec()
+        if return_Data != QDialog.DialogCode.Accepted:
+            # This dialog runs before app.exec(). Entering the event loop after
+            # a rejection leaves a windowless GUI process alive forever.
+            logger.info("Startup cancelled by user; closing GUI process")
+            quit_qt_application()
+            app.closeAllWindows()
+            return 0
+
+        with native_call("gui", "main_window_create"):
+            main_window = MainWindow_Index()
+        main_window._gui_watchdog = crash_handler
+        logger.info("Application start")
+        with native_call("gui", "main_window_show"):
+            main_window.show_frame()
+        # Startup dialogs and MainWindow construction run before app.exec() and may
+        # legitimately spend several seconds importing modules. Monitor only the
+        # live GUI event loop so startup work is not reported as a runtime freeze.
+        crash_handler.start_gui_watchdog(app, timeout_seconds=3.0)
+        # Keep the callable so teardown can disconnect the closure that owns
+        # the final Python reference to MainWindow_Index.
+        shutdown_callback = lambda: quit_qt_application(main_window)
+        app.aboutToQuit.connect(shutdown_callback)
+        # 系统退出
+        with native_call("gui", "qt_event_loop"):
+            exit_code = app.exec()
+        # Normally aboutToQuit has already done this.  The explicit idempotent
+        # call also covers event-loop termination initiated by the OS/window.
+        quit_qt_application(main_window)
+        logger.info(f"Qt event loop returned | exit_code={exit_code}")
+        return exit_code
+    finally:
+        _teardown_qt_runtime(
+            app=app,
+            main_window=main_window,
+            startup_dialog=program_self_check_index_dialog,
+            crash_handler=crash_handler,
+            shutdown_callback=shutdown_callback,
+        )
+        # These assignments make the intended decref order explicit even
+        # though their native C++ objects have already been deleted above.
+        shutdown_callback = None
+        main_window = None
+        program_self_check_index_dialog = None
+        crash_handler = None
+        screen = None
+        app = None
 
 
 def main(q, send_message_q, runtime_diagnostics_queue=None, system_health_snapshot_queue=None):
