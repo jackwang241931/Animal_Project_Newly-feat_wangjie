@@ -3487,13 +3487,61 @@ def start_standalone_calibration(data):
         return reject("实验气路正在使用中，不能启动独立校准")
 
     try:
-        ufc_ugc_zos_thread = UFC_UGC_ZOS_index()
-        result = ufc_ugc_zos_thread.start_standalone_calibration(kind)
+        controller = UFC_UGC_ZOS_index()
+        result = controller.reserve_standalone_calibration(kind)
     except Exception as exc:
         logger.exception(f"启动独立校准{label}失败")
         return reject(f"{label}启动失败：{exc}")
 
+    if not result.get("success", False):
+        return reject(result.get("message", f"{label}启动请求被拒绝"))
+
+    ufc_ugc_zos_thread = controller
     _send_main_window_status("standalone_calibration_response", result)
+
+    def run_standalone_worker():
+        try:
+            worker_result = controller.start_standalone_calibration(
+                kind,
+                pre_reserved=True,
+            )
+            if not worker_result.get("success", False):
+                logger.error(
+                    f"独立校准工作线程未启动：{worker_result.get('message')}"
+                )
+                if controller.standalone_calibration_active:
+                    controller._finish_standalone_calibration(
+                        False,
+                        RuntimeError(worker_result.get("message", "启动失败")),
+                    )
+        except Exception as exc:
+            logger.exception(f"独立校准工作线程异常：{label}")
+            if controller.standalone_calibration_active:
+                controller._finish_standalone_calibration(False, exc)
+
+    worker = threading.Thread(
+        target=run_standalone_worker,
+        name=f"standalone-calibration-{kind}",
+        daemon=False,
+    )
+    controller._standalone_worker_thread = worker
+    try:
+        worker.start()
+    except Exception as exc:
+        logger.exception(f"独立校准工作线程启动失败：{label}")
+        with controller._standalone_calibration_lock:
+            controller._standalone_calibration_active = False
+            controller._standalone_calibration_kind = None
+        failed = {
+            "success": False,
+            "phase": "failed",
+            "kind": kind,
+            "label": label,
+            "message": f"{label}工作线程启动失败：{exc}",
+        }
+        _send_main_window_status("standalone_calibration_response", failed)
+        return failed
+
     return result
 
 
@@ -3511,6 +3559,10 @@ def stop_standalone_calibration():
         }
     else:
         try:
+            logger.warning(
+                "后台已收到停止独立校准命令："
+                f"kind={getattr(controller, '_standalone_calibration_kind', None)}"
+            )
             result = controller.stop_standalone_calibration()
         except Exception as exc:
             logger.exception("停止独立校准失败")

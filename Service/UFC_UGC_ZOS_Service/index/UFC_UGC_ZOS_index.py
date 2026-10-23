@@ -132,6 +132,7 @@ class UFC_UGC_ZOS_index(MyQThread):
         self._standalone_user_stop_requested = False
         self._standalone_air_calibration_started = False
         self._standalone_stop_watchdog_event = threading.Event()
+        self._standalone_worker_thread = None
 
         self.send_message = {
             'port': '',
@@ -759,8 +760,8 @@ class UFC_UGC_ZOS_index(MyQThread):
         with self._standalone_calibration_lock:
             return self._standalone_calibration_active
 
-    def start_standalone_calibration(self, kind):
-        """Start one calibration stage without starting an experiment."""
+    def reserve_standalone_calibration(self, kind):
+        """Reserve standalone state before its long-running worker starts."""
         kind = str(kind or "").strip().lower()
         label = self.STANDALONE_CALIBRATION_LABELS.get(kind)
         if label is None:
@@ -788,8 +789,49 @@ class UFC_UGC_ZOS_index(MyQThread):
             self._standalone_stop_watchdog_event.clear()
 
         try:
+            # Reset cancellation flags before the request is acknowledged.
+            # The worker must not clear them later, otherwise an immediate
+            # stop click can race startup and be lost.
             self._prepare_new_start()
             self._runtime_air_stop_event.clear()
+        except Exception as exc:
+            with self._standalone_calibration_lock:
+                self._standalone_calibration_active = False
+                self._standalone_calibration_kind = None
+            return {
+                "success": False,
+                "message": f"{label}启动准备失败：{exc}",
+            }
+
+        return {
+            "success": True,
+            "phase": "accepted",
+            "kind": kind,
+            "label": label,
+            "message": f"{label}已启动；完成后只关闭气路，不会启动实验",
+        }
+
+    def start_standalone_calibration(self, kind, pre_reserved=False):
+        """Start one calibration stage without starting an experiment."""
+        kind = str(kind or "").strip().lower()
+        label = self.STANDALONE_CALIBRATION_LABELS.get(kind)
+        if not pre_reserved:
+            reservation = self.reserve_standalone_calibration(kind)
+            if not reservation.get("success", False):
+                return reservation
+        else:
+            with self._standalone_calibration_lock:
+                reservation_is_valid = (
+                    self._standalone_calibration_active
+                    and self._standalone_calibration_kind == kind
+                )
+            if label is None or not reservation_is_valid:
+                return {
+                    "success": False,
+                    "message": "独立校准启动预约已失效",
+                }
+
+        try:
             self._prepare_startup_calibration_cages()
             self.update_status_main_signal_gui_update.send(
                 f"{time_util.get_format_from_time(time.time())} | "
@@ -798,7 +840,9 @@ class UFC_UGC_ZOS_index(MyQThread):
             )
 
             chain = (
-                AsyPromise(self.UFC_gas_state_check_obj.read_start_status)
+                self._run_standalone_step(
+                    self.UFC_gas_state_check_obj.read_start_status
+                )
                 .then(self._remember_ufc_start_status)
                 .then(lambda _: self._run_standalone_step(
                     self.ZOS_gas_path_system_obj.start
@@ -860,7 +904,7 @@ class UFC_UGC_ZOS_index(MyQThread):
             self._finish_standalone_calibration(False, exc)
             return {"success": False, "message": f"{label}启动失败：{exc}"}
 
-        return {
+        return reservation if not pre_reserved else {
             "success": True,
             "phase": "accepted",
             "kind": kind,
