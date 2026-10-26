@@ -126,6 +126,12 @@ def request_emergency_ufc_shutdown(reason, timeout_seconds=20.0):
             f"was unavailable: reason={reason}"
         )
         return False
+    if result == 3:
+        logger.info(
+            "UFC emergency shutdown skipped because no gas-control session was "
+            f"active: reason={reason}"
+        )
+        return True
 
     logger.critical(f"UFC emergency shutdown failed: reason={reason}")
     return False

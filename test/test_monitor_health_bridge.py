@@ -72,6 +72,8 @@ class MonitorHealthBridgeTests(unittest.TestCase):
             "serial_lock": serial_lock,
         }, clear=False), patch.object(
             main_monitor_data, "ufc_ugc_zos_thread", None
+        ), patch.object(
+            main_monitor_data, "_ufc_shutdown_writes_required", return_value=True
         ), patch.object(main_monitor_data.time, "sleep"):
             result = main_monitor_data.emergency_stop_ufc_pump()
 
@@ -98,11 +100,30 @@ class MonitorHealthBridgeTests(unittest.TestCase):
             "serial_lock": serial_lock,
         }, clear=False), patch.object(
             main_monitor_data, "ufc_ugc_zos_thread", None
+        ), patch.object(
+            main_monitor_data, "_ufc_shutdown_writes_required", return_value=True
         ):
             result = main_monitor_data.emergency_stop_ufc_pump()
 
         self.assertEqual(result, 0)
         serial_lock.release.assert_called_once_with()
+
+    def test_emergency_shutdown_without_gas_session_does_not_touch_serial(self):
+        modbus = Mock()
+
+        with patch.dict(global_setting._setting, {
+            "port": "COM7",
+            "modbus": modbus,
+            "ufc_start_time_state": False,
+            "is_calibrating": False,
+        }, clear=False), patch.object(
+            main_monitor_data, "ufc_ugc_zos_thread", None
+        ):
+            result = main_monitor_data.emergency_stop_ufc_pump()
+
+        self.assertEqual(result, 3)
+        modbus.send_command.assert_not_called()
+        modbus.close.assert_not_called()
 
     def test_regular_gas_command_is_blocked_after_emergency_shutdown_starts(self):
         sender = Send_Message.__new__(Send_Message)
@@ -170,6 +191,28 @@ class MonitorHealthBridgeTests(unittest.TestCase):
         ])
         modbus.close.assert_called_once_with()
         serial_lock.release.assert_called_once_with()
+
+    def test_application_shutdown_without_gas_session_only_closes_serial(self):
+        modbus = Mock()
+
+        with patch.dict(global_setting._setting, {
+            "modbus": modbus,
+            "application_shutdown_requested": False,
+            "application_shutdown_serial_closed": False,
+            "calibration_cancel_requested": False,
+            "ufc_emergency_shutdown_active": False,
+            "ufc_start_time_state": False,
+            "is_calibrating": False,
+        }, clear=False), patch.object(
+            main_monitor_data, "ufc_ugc_zos_thread", None
+        ):
+            main_monitor_data.stop_modbus()
+
+            self.assertTrue(global_setting.get_setting("application_shutdown_requested"))
+            self.assertTrue(global_setting.get_setting("application_shutdown_serial_closed"))
+
+        modbus.send_command.assert_not_called()
+        modbus.close.assert_called_once_with()
 
 
 if __name__ == "__main__":

@@ -139,6 +139,30 @@ def _stop_ufc_activity_before_emergency_command():
         run_thread.stop()
 
 
+def _ufc_shutdown_writes_required():
+    """Return whether this monitor process may have activated the UFC gas path.
+
+    Merely selecting a serial port creates a Modbus object, but it does not
+    start an experiment or a standalone calibration.  Application shutdown
+    must not turn that dormant object into a new serial connection just to
+    send UFC commands: some controllers change hardware state when the port is
+    opened or when an unsolicited system-off write is received.
+    """
+    controller = ufc_ugc_zos_thread
+    if controller is not None:
+        if getattr(controller, "standalone_calibration_active", False):
+            return True
+        if getattr(controller, "UFC_gas_path_system_obj", None) is not None:
+            return True
+
+    # Keep a conservative fallback for a shutdown racing the asynchronous gas
+    # close path after the controller reference has already been released.
+    return bool(
+        global_setting.get_setting("ufc_start_time_state", False)
+        or global_setting.get_setting("is_calibrating", False)
+    )
+
+
 def _extract_ufc_pump_state(parsed_response):
     if not isinstance(parsed_response, dict):
         return None
@@ -156,12 +180,20 @@ def emergency_stop_ufc_pump():
     """Synchronously stop and verify the UFC pump after a GUI crash.
 
     Returns 1 when pump-off was verified, 2 when the write was acknowledged
-    but state verification was unavailable, and 0 when the write failed.
+    but state verification was unavailable, 3 when this process never
+    activated the gas path, and 0 when the write failed.
     """
     # From this point onward no asynchronous gas-path/calibration callback may
     # issue another command.  The emergency write below bypasses the regular
     # Send_Message wrapper, so it remains allowed.
     global_setting.set_setting("ufc_emergency_shutdown_active", True)
+
+    if not _ufc_shutdown_writes_required():
+        logger.warning(
+            "UFC emergency shutdown skipped: no experiment or standalone "
+            "calibration activated the gas path"
+        )
+        return 3
 
     port = global_setting.get_setting("port", None)
     modbus = global_setting.get_setting("modbus", None)
@@ -3947,6 +3979,17 @@ def stop_modbus():
 
     modbus: ModbusRTUMasterNew = global_setting.get_setting("modbus", None)
     if modbus is None:
+        global_setting.set_setting("application_shutdown_serial_closed", True)
+        return
+
+    if not _ufc_shutdown_writes_required():
+        logger.info(
+            "应用退出未检测到活动实验或独立校准："
+            "跳过UFC控制指令，仅关闭现有串口连接"
+        )
+        # close() never opens or reconnects the serial port.  This keeps an
+        # unused configured port completely hardware-neutral during exit.
+        modbus.close()
         global_setting.set_setting("application_shutdown_serial_closed", True)
         return
 
