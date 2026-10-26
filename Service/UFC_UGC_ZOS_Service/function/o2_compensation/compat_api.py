@@ -22,6 +22,7 @@ except Exception:  # pragma: no cover - logging must never break the API
     logger = logging.getLogger(__name__)
 
 from . import o2_realtime_core as _core
+from . import o2_post_compensator as _post
 
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[4]
@@ -178,7 +179,9 @@ def has_valid_reference_dry_oxygen_sample() -> bool:
 
 
 def reload_o2_compensation_config():
-    return _core.reload_o2_compensation_config()
+    _core.reload_o2_compensation_config()
+    _post.reload_o2_post_compensation_config()
+    return True
 
 
 def get_o2_calibration_handler(target_points: int | None = None, channels=None):
@@ -209,6 +212,23 @@ def start_new_o2_calibration(
     return bool(handler.start_new_calibration(span_value=span_value))
 
 
+def start_span_o2_calibration(
+    target_points: int | None = None,
+    span_value: float | None = None,
+    channels=None,
+):
+    """Start the Span stage while preserving the host-controlled finish path."""
+    selected_channels = _default_channel_order() if channels is None else channels
+    handler = get_o2_calibration_handler(
+        target_points=target_points,
+        channels=selected_channels,
+    )
+    starter = getattr(handler, "start_span_o2", None)
+    if callable(starter):
+        return bool(starter(target_points=target_points, span_value=span_value))
+    return bool(handler.start_new_calibration(span_value=span_value))
+
+
 def append_o2_calibration_data(
     channel, o2_partial, zos_temp, gas_pressure, o2_percent, zos_rh,
     sht_temp=None, sht_rh=None,
@@ -227,6 +247,8 @@ def append_o2_calibration_data(
     if success:
         reload_o2_compensation_config()
     return success
+
+
 def get_o2_calibration_status():
     status = get_o2_calibration_handler().get_status()
     if not isinstance(status, dict):
@@ -301,6 +323,19 @@ def calculate_o2_compensated(
         return -1
 
 
+def post_compensate_o2(channel, o2_dry, ref_o2):
+    """Apply optional second-stage compensation behind the stable host API."""
+    return _post.post_compensate_o2(channel, o2_dry, ref_o2)
+
+
+def get_o2_post_compensation_settings(channel=None):
+    return _post.get_o2_post_compensation_settings(channel)
+
+
+def reload_o2_post_compensation_config():
+    return _post.reload_o2_post_compensation_config()
+
+
 __all__ = [
     "append_o2_calibration_data",
     "create_o2_calibration_handler",
@@ -308,8 +343,12 @@ __all__ = [
     "get_o2_calibration_handler",
     "get_o2_calibration_status",
     "get_realtime_o2_compensator",
+    "get_o2_post_compensation_settings",
     "has_valid_reference_dry_oxygen_sample",
+    "post_compensate_o2",
     "reload_o2_compensation_config",
+    "reload_o2_post_compensation_config",
     "start_new_o2_calibration",
+    "start_span_o2_calibration",
     "validate_o2_supplier_contract",
 ]

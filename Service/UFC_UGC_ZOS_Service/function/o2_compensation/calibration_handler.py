@@ -231,6 +231,18 @@ class CalibrationHandler:
         )
         return True
 
+    def start_span_o2(self, target_points=None, span_value=None):
+        """Compatibility entry point for a Span-first calibration run.
+
+        The existing host decides after Span collection whether to continue to
+        Air calibration or persist a standalone Span result.  Keep that state
+        machine authoritative instead of auto-saving inside this method.
+        """
+        return self.start_new_calibration(
+            target_points=target_points,
+            span_value=span_value,
+        )
+
     def start_air_touchup(self, target_points=None):
         global _BOOT_AIR_DONE
         if target_points is not None:

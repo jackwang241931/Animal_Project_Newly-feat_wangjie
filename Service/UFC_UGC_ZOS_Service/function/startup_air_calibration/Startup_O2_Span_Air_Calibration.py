@@ -11,7 +11,7 @@ from Service.UFC_UGC_ZOS_Service.function.calibration_channels import (
 from Service.UFC_UGC_ZOS_Service.function.o2_compensation import (
     get_o2_calibration_handler,
     reload_o2_compensation_config,
-    start_new_o2_calibration,
+    start_span_o2_calibration,
 )
 from public.config_class.global_setting import global_setting
 from public.entity.enum.Public_Enum import GapSystem_Running_Type
@@ -113,7 +113,7 @@ class Startup_O2_Span_Air_Calibration:
 
     @staticmethod
     def _span_value():
-        raw = global_setting.get_setting("span_standard_oxygen_value", 20.50)
+        raw = global_setting.get_setting("span_standard_oxygen_value", 20.56)
         try:
             value = float(raw)
         except (TypeError, ValueError) as exc:
@@ -418,7 +418,7 @@ class Startup_O2_Span_Air_Calibration:
                 raise RuntimeError("未配置已启用笼位，无法执行O2 Span校准")
             self._active_channels = tuple(active_channels)
             handler_channels = [self._channel_name(channel) for channel in active_channels]
-            start_new_o2_calibration(
+            start_span_o2_calibration(
                 target_points=target_points,
                 span_value=span_value,
                 channels=handler_channels,
@@ -547,7 +547,7 @@ class Startup_O2_Span_Air_Calibration:
                 raise RuntimeError("未配置已启用笼位，无法执行O2 Span+空气校准")
             self._active_channels = tuple(active_channels)
             handler_channels = [self._channel_name(channel) for channel in active_channels]
-            start_new_o2_calibration(
+            start_span_o2_calibration(
                 target_points=target_points,
                 span_value=span_value,
                 channels=handler_channels,

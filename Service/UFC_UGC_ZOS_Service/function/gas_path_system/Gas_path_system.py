@@ -15,8 +15,11 @@ from loguru import logger
 
 from Service.UFC_UGC_ZOS_Service.function.o2_compensation import (
     calculate_o2_compensated,
+    get_o2_post_compensation_settings,
+    get_realtime_o2_compensator,
     get_reference_dry_oxygen_percent,
     has_valid_reference_dry_oxygen_sample,
+    post_compensate_o2,
 )
 from Service.UFC_UGC_ZOS_Service.function.o2_compensation.host_wet_o2_guard import (
     WetOxygenAnomalyGuard,
@@ -1592,12 +1595,59 @@ class ZOS_gas_path_system_run_thread(MyQThread):
         )
 
         if is_reference_cage:
+            reference_value = get_reference_dry_oxygen_percent()
+            post_settings = get_o2_post_compensation_settings()
+            if (
+                post_settings.get("enabled", False)
+                and self._is_valid_dry_oxygen_value(compensation_value)
+                and has_valid_reference_dry_oxygen_sample()
+            ):
+                # The second-stage formula uses air_lock as FiO2.  Persist the
+                # same value for REF so downstream DO2/VO2 calculations do not
+                # mix the legacy 20.930 reference with a 20.950 air lock.
+                reference_value = float(compensation_value)
             self._set_data_value(
                 data_items,
                 "干基氧浓度(%)",
-                get_reference_dry_oxygen_percent(),
+                reference_value,
             )
             return result_data
+
+        # The supplier's channel coefficients are a second stage applied only
+        # after a real REF sample exists.  Keeping this here guarantees that a
+        # value is never post-compensated twice elsewhere in the pipeline.
+        if (
+            self._is_valid_dry_oxygen_value(compensation_value)
+            and has_valid_reference_dry_oxygen_sample()
+        ):
+            primary_value = float(compensation_value)
+            reference_value = float(get_realtime_o2_compensator().air_lock)
+            compensation_value = post_compensate_o2(
+                channel_id,
+                primary_value,
+                reference_value,
+            )
+            if not self._is_valid_dry_oxygen_value(compensation_value):
+                compensation_value = primary_value
+            elif not math.isclose(
+                float(compensation_value),
+                primary_value,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            ):
+                settings = get_o2_post_compensation_settings(channel_id)
+                logger.debug(
+                    "O2二次补偿：channel={}, 一次补偿值={:.6f}, "
+                    "REF/air_lock={:.6f}, gain={:.6f}, bias={:.6f}, "
+                    "min_do2={:.6f}, 最终值={:.6f}",
+                    channel_id,
+                    primary_value,
+                    reference_value,
+                    float(settings["gain"]),
+                    float(settings["bias"]),
+                    float(settings["min_do2"]),
+                    float(compensation_value),
+                )
 
         self._set_or_reuse_dry_oxygen_value(
             data_items,

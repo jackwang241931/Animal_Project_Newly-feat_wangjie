@@ -5,10 +5,14 @@ from .compat_api import calculate_o2_compensated
 from .compat_api import create_o2_calibration_handler
 from .compat_api import get_o2_calibration_handler
 from .compat_api import get_o2_calibration_status
+from .compat_api import get_o2_post_compensation_settings
 from .compat_api import get_realtime_o2_compensator
 from .compat_api import has_valid_reference_dry_oxygen_sample
+from .compat_api import post_compensate_o2
 from .compat_api import reload_o2_compensation_config
+from .compat_api import reload_o2_post_compensation_config
 from .compat_api import start_new_o2_calibration
+from .compat_api import start_span_o2_calibration
 from .compat_api import validate_o2_supplier_contract
 from .reference_dry_oxygen import DEFAULT_REFERENCE_DRY_OXYGEN_PERCENT
 from .reference_dry_oxygen import get_reference_dry_oxygen_percent
@@ -25,10 +29,14 @@ __all__ = [
     "create_o2_calibration_handler",
     "get_o2_calibration_handler",
     "get_o2_calibration_status",
+    "get_o2_post_compensation_settings",
     "get_realtime_o2_compensator",
     "has_valid_reference_dry_oxygen_sample",
+    "post_compensate_o2",
     "reload_o2_compensation_config",
+    "reload_o2_post_compensation_config",
     "start_new_o2_calibration",
+    "start_span_o2_calibration",
     "validate_o2_supplier_contract",
     "DEFAULT_REFERENCE_DRY_OXYGEN_PERCENT",
     "get_reference_dry_oxygen_percent",
