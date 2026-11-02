@@ -1669,6 +1669,28 @@ class ZOS_gas_path_system_run_thread(MyQThread):
             channel_id,
             data_items,
         )
+
+        # M1-M8 have a strict dependency on this round's CO2 production value.
+        # Do not calculate, default, or reuse dry O2 before Delta CO2 exists;
+        # otherwise a row could look current while actually using an O2 result
+        # produced without the newly required model input.
+        if not is_reference_cage:
+            try:
+                delta_co2_ready = math.isfinite(float(delta_co2_pct))
+            except (TypeError, ValueError, OverflowError):
+                delta_co2_ready = False
+            if not delta_co2_ready:
+                cage_number = int(mouse_cage_number)
+                self._set_data_value(data_items, "干基氧浓度(%)", None)
+                if cage_number not in self.dry_oxygen_fallback_warning_channels:
+                    logger.warning(
+                        "O2 v6：{}号通道本轮CO2生产量尚未生成，"
+                        "跳过本轮干基氧浓度计算",
+                        cage_number,
+                    )
+                    self.dry_oxygen_fallback_warning_channels.add(cage_number)
+                return result_data
+
         inputs_complete = None not in (
             o2_partial_press,
             gas_total_press,
