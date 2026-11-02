@@ -404,7 +404,12 @@ class read_queue_data_Thread(MyQThread):
                                         for word in ("错误", "失败", "超时", "未确认")
                                     )
                                 if failed:
-                                    self.stop_backend_issue_signal.emit(stop_detail or message.title)
+                                    # Keep the source acknowledgement title in
+                                    # the signal so trajectory cleanup warnings
+                                    # can be separated from hardware failures.
+                                    self.stop_backend_issue_signal.emit(
+                                        f"{message.title}: {stop_detail or message.title}"
+                                    )
                             if self._required_stop_ack_titles.issubset(self._stop_ack_titles):
                                 self._stop_ack_titles.clear()
                                 self.stop_backend_completed_signal.emit()
@@ -1031,6 +1036,7 @@ class MainWindow_Index(ThemedWindow):
         self._stop_archive_ready = False
         self._stop_archive_started = False
         self._stop_trajectory_finalization_failed = False
+        self._stop_trajectory_issue_details = []
         self._stop_backend_issue_details = []
         # Calibration values can arrive faster than matplotlib can redraw.
         # Keep data ingestion immediate but coalesce chart repaints on the GUI
@@ -3891,6 +3897,7 @@ class MainWindow_Index(ThemedWindow):
         self._stop_archive_ready = False
         self._stop_archive_started = False
         self._stop_trajectory_finalization_failed = False
+        self._stop_trajectory_issue_details = []
         self._stop_backend_issue_details = []
         read_queue_data_thread._stop_ack_titles.clear()
         self.pending_stop_export_success_path = None
@@ -3908,7 +3915,6 @@ class MainWindow_Index(ThemedWindow):
         if page is not None:
             page.set_operation_progress(0, "正在停止实验")
             page.operation_hint.setText("停止请求已发送，正在等待后台模块停止并保存实验数据。")
-            page.refresh()
         self.status_bar.update_tip(f"正在关闭实验监测...")
         # self.stop_experiment_thread = Stop_experiment_thread(name="stop_experiment_thread",window=self)
         # self.stop_experiment_thread.start()
@@ -3974,8 +3980,6 @@ class MainWindow_Index(ThemedWindow):
         self._stop_progress_timer = QTimer(self)
         self._stop_progress_timer.timeout.connect(self._advance_stop_progress)
         self._stop_progress_timer.start(100)
-        if page is not None:
-            page.refresh()
         if self._stop_timeout_timer is not None:
             self._stop_timeout_timer.stop()
         self._stop_timeout_timer = QTimer(self)
@@ -4008,8 +4012,34 @@ class MainWindow_Index(ThemedWindow):
         self._maybe_finalize_stop()
 
     def _on_stop_backend_issue(self, detail):
-        logger.warning(f"backend stop warning: {detail}")
         detail_text = str(detail or "后台模块关闭未确认")
+        normalized_detail = detail_text.lower()
+        is_trajectory_warning = (
+            "stop_deep_camera_" in normalized_detail
+            or "轨迹相机" in detail_text
+            or "轨迹模块" in detail_text
+            or "轨迹收尾" in detail_text
+            or "mouse trajectory" in normalized_detail
+            or "trajectory" in normalized_detail
+            or "未释放的线程" in detail_text
+        )
+
+        if is_trajectory_warning:
+            # A delayed trajectory renderer/output thread is not evidence that
+            # UFC/UGC/ZOS or the pump is still on. Keep it visible as a warning
+            # while allowing the core data archive and normal application close
+            # to complete.
+            self._stop_trajectory_finalization_failed = True
+            if detail_text not in self._stop_trajectory_issue_details:
+                self._stop_trajectory_issue_details.append(detail_text)
+            logger.warning(f"trajectory cleanup warning: {detail_text}")
+            self._append_workflow_runtime_log(
+                f"轨迹模块收尾警告：{detail_text}",
+                "停止",
+            )
+            return
+
+        logger.warning(f"backend stop warning: {detail_text}")
         self._stop_operation_failed = True
         if detail_text not in self._stop_backend_issue_details:
             self._stop_backend_issue_details.append(detail_text)
