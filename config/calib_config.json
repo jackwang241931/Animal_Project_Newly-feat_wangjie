@@ -1,99 +1,85 @@
 {
-  "version": "3.1",
-  "algorithm": "span_offset_g1_air_lock",
-  "calibration_time": "2026-10-14T21:35:17.335213",
-  "target_o2": 20.9,
-  "target_span": 20.56,
-  "air_lock": 20.95,
-  "air_measured": 21.095265859937186,
-  "air_cal_count": 16,
+  "version": "6.0",
+  "air_o2_pct": 20.93,
+  "span_o2_pct": 20.45,
+  "calibration_method": "historical_provisional",
+  "calibration_time": null,
   "target_points": 25,
-  "post_compensation": {
-    "enabled": true,
-    "min_do2": 0.03,
-    "gain": {
-      "M1": 0.5,
-      "M2": 0.25,
-      "M3": 0.6,
-      "M4": 0.58,
-      "M5": 0.971,
-      "M6": 0.7,
-      "M7": 0.7,
-      "M8": 0.55
+  "channels": {
+    "REF": {
+      "air_dry_pct": 19.581791953,
+      "span_dry_pct": 19.201679456,
+      "gain": 1.07095978,
+      "basis": "historical_provisional"
     },
-    "bias": {
+    "M1": {
+      "air_dry_pct": 19.275047686,
+      "span_dry_pct": 18.960808752,
+      "gain": 1.0410089,
+      "basis": "historical_provisional"
+    },
+    "M2": {
+      "air_dry_pct": 19.486173996,
+      "span_dry_pct": 19.125111215,
+      "gain": 0.99510422,
+      "basis": "historical_provisional"
+    },
+    "M3": {
+      "air_dry_pct": 19.626283101,
+      "span_dry_pct": 19.311606866,
+      "gain": 1.061171168,
+      "basis": "historical_provisional"
+    },
+    "M4": {
+      "air_dry_pct": 19.381551274,
+      "span_dry_pct": 19.086139885,
+      "gain": 1.037557393,
+      "basis": "historical_provisional"
+    },
+    "M5": {
+      "air_dry_pct": 19.466729572,
+      "span_dry_pct": 19.113190834,
+      "gain": 0.943018107,
+      "basis": "historical_provisional"
+    },
+    "M6": {
+      "air_dry_pct": 19.218528323,
+      "span_dry_pct": 18.852356124,
+      "gain": 1.025896815,
+      "basis": "historical_provisional"
+    },
+    "M7": {
+      "air_dry_pct": 19.279829369,
+      "span_dry_pct": 18.92670062,
+      "gain": 1.089052057,
+      "basis": "historical_provisional"
+    },
+    "M8": {
+      "air_dry_pct": 19.416074327,
+      "span_dry_pct": 19.074554775,
+      "gain": 1.004729414,
+      "basis": "historical_provisional"
+    }
+  },
+  "air_valid_min_pct": 20.86,
+  "air_valid_max_pct": 20.95,
+  "air_alignment_tolerance_pct": 0.08,
+  "air_stability_max_mad_pct": 0.018,
+  "air_calibrated": false,
+  "air_validation_status": "historical_provisional",
+  "pending_span_validation": false,
+  "common_mode": {
+    "enabled": false,
+    "coefficients": {
       "M1": 0.0,
       "M2": 0.0,
       "M3": 0.0,
-      "M4": 0.01,
-      "M5": -0.005,
+      "M4": 0.0,
+      "M5": 0.0,
       "M6": 0.0,
       "M7": 0.0,
       "M8": 0.0
-    }
-  },
-  "offsets": {
-    "REF": 0.0,
-    "M1": 0.0,
-    "M2": 0.0,
-    "M3": 0.0,
-    "M4": 0.0,
-    "M5": 0.0,
-    "M6": 0.0,
-    "M7": 0.0,
-    "M8": 0.0
-  },
-  "gains": {
-    "REF": 1.0,
-    "M1": 1.0,
-    "M2": 1.0,
-    "M3": 1.0,
-    "M4": 1.0,
-    "M5": 1.0,
-    "M6": 1.0,
-    "M7": 1.0,
-    "M8": 1.0
-  },
-  "blk_u": {
-    "REF": 21.095265859937186,
-    "M1": 21.293154369355822,
-    "M2": 21.279571521636885,
-    "M3": 21.405165699758076,
-    "M4": 21.303845978838893,
-    "M5": 19.74791680169659,
-    "M6": 19.89345728553888,
-    "M7": 20.271676867513705,
-    "M8": 20.548469290887763
-  },
-  "blk_v": {
-    "REF": 19.730114675029807,
-    "M1": 19.53146732755397,
-    "M2": 19.727860914321063,
-    "M3": 19.88908528668179,
-    "M4": 19.69474105983692,
-    "M5": 19.69909821741353,
-    "M6": 19.425031945987563,
-    "M7": 19.4905948039393,
-    "M8": 19.658589283043533
-  },
-  "match_gain": {
-    "M1": 1.3046,
-    "M2": 1.4213,
-    "M3": 1.0641,
-    "M4": 1.0788,
-    "M5": 0.9731,
-    "M6": 0.9187,
-    "M7": 0.9358,
-    "M8": 1.2302
-  },
-  "match_bias": {
-    "M1": 0.3894,
-    "M2": 0.0699,
-    "M3": -0.0868,
-    "M4": 0.1585,
-    "M5": 0.1007,
-    "M6": 0.2549,
-    "M7": 0.202,
-    "M8": 0.1368
+    },
+    "validation_status": "unverified"
   }
 }

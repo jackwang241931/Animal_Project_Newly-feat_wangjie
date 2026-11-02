@@ -180,7 +180,6 @@ def has_valid_reference_dry_oxygen_sample() -> bool:
 
 def reload_o2_compensation_config():
     _core.reload_o2_compensation_config()
-    _post.reload_o2_post_compensation_config()
     return True
 
 
@@ -284,35 +283,77 @@ def validate_o2_supplier_contract() -> dict[str, Any]:
 def calculate_o2_compensated(
     channel_id,
     o2_partial_press,
-    zos_temp,
+    delta_co2_pct,
     gas_total_press,
     o2_raw_pct,
-    zos_rh,
+    sht_temp,
+    sht_rh=None,
 ):
-    """Call the replaceable implementation behind the stable host contract."""
+    """Calculate final dry O2 using Delta CO2 as the v6 model input.
+
+    ``delta_co2_pct`` is a concentration difference in percentage points, so
+    0.10 means 0.10%.  The optional six-argument compatibility path is kept for
+    older callers while the host migrates to the explicit seven-argument API.
+    """
     if channel_id not in _valid_channels():
         return -1
 
+    # Independent Air calibration may intentionally use a dedicated handler,
+    # while the combined path uses the shared compatibility handler.  The
+    # process-wide flag covers both routes; the handler check remains as a
+    # second guard for callers that start calibration directly.
+    try:
+        from public.config_class.global_setting import global_setting
+
+        if bool(global_setting.get_setting("is_calibrating", False)):
+            return -1
+    except (ImportError, AttributeError, TypeError):
+        pass
+
+    if bool(getattr(get_o2_calibration_handler(), "is_active", False)):
+        return -1
+
+    if sht_rh is None:
+        # Legacy host contract: the third argument was the temperature and the
+        # sixth argument was humidity.  Preserve safe operation, but mark cage
+        # Delta CO2 unavailable so the v6 implementation uses measured O2 only.
+        sht_rh = sht_temp
+        sht_temp = delta_co2_pct
+        delta_co2_pct = 0.0 if channel_id == "REF" else None
+
     try:
         parameters = inspect.signature(_core.calculate_o2_compensated).parameters
-        if "sht_temp" in parameters or len(parameters) >= 7:
+        if "delta_co2_pct" in parameters:
             result = _core.calculate_o2_compensated(
                 channel_id,
                 o2_partial_press,
-                zos_temp,
+                0.0 if channel_id == "REF" else delta_co2_pct,
                 gas_total_press,
                 o2_raw_pct,
-                None,
-                zos_rh,
+                sht_temp,
+                sht_rh,
+            )
+        elif "sht_temp" in parameters or len(parameters) >= 7:
+            # The supplier's compact v6 file retains the historical parameter
+            # name ``zos_temp`` for its third argument, but the implementation
+            # now interprets that position as Delta CO2.
+            result = _core.calculate_o2_compensated(
+                channel_id,
+                o2_partial_press,
+                0.0 if channel_id == "REF" else delta_co2_pct,
+                gas_total_press,
+                o2_raw_pct,
+                sht_temp,
+                sht_rh,
             )
         else:
             result = _core.calculate_o2_compensated(
                 channel_id,
                 o2_partial_press,
-                zos_temp,
+                sht_temp,
                 gas_total_press,
                 o2_raw_pct,
-                zos_rh,
+                sht_rh,
             )
         numeric_result = float(result)
         if not math.isfinite(numeric_result):

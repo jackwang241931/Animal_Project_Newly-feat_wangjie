@@ -13,13 +13,13 @@ from blinker.base import _PNamespaceSignal
 from loguru import logger
 
 
+from Service.UFC_UGC_ZOS_Service.function.co2_compensation import (
+    CO2RealtimeCompensator,
+)
 from Service.UFC_UGC_ZOS_Service.function.o2_compensation import (
     calculate_o2_compensated,
-    get_o2_post_compensation_settings,
-    get_realtime_o2_compensator,
     get_reference_dry_oxygen_percent,
     has_valid_reference_dry_oxygen_sample,
-    post_compensate_o2,
 )
 from Service.UFC_UGC_ZOS_Service.function.o2_compensation.host_wet_o2_guard import (
     WetOxygenAnomalyGuard,
@@ -1328,6 +1328,7 @@ class ZOS_gas_path_system_run_thread(MyQThread):
         self.dry_oxygen_history_checked_channels = set()
         self.dry_oxygen_fallback_warning_channels = set()
         self.last_zos_channel_read_time = 0.0
+        self.co2_realtime_compensator = CO2RealtimeCompensator()
         o2_config = global_setting.get_setting("UFC_UGC_ZOS_config", {})
         self.wet_o2_guard = WetOxygenAnomalyGuard.from_config(
             o2_config,
@@ -1545,6 +1546,103 @@ class ZOS_gas_path_system_run_thread(MyQThread):
 
         return result_data
 
+    @staticmethod
+    def _reference_co2_subtract_value():
+        value = global_setting.get_setting("reference_co2_subtract_value", None)
+        if value is None:
+            config = global_setting.get_setting("UFC_UGC_ZOS_config", {}) or {}
+            value = (config.get("Calibration", {}) or {}).get(
+                "reference_co2_subtract_value",
+                0.0125,
+            )
+        try:
+            value = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return 0.0125
+        return value if math.isfinite(value) else 0.0125
+
+    def _get_delta_co2_percent(self, mouse_cage_number, channel_id, data_items):
+        """Return the host's CO2 production value in percentage points.
+
+        This deliberately mirrors the epoch calculation in main_monitor_data:
+        fitted current-cage CO2 minus the corrected reference-cage CO2.
+        """
+        if channel_id == "REF":
+            return 0.0
+        if self.data_handle is None:
+            self.data_handle = Monitor_Datas_Handle()
+
+        try:
+            current_ugc = self.data_handle.query_current_one_data(
+                f"UGC_monitor_data_cage_{int(mouse_cage_number)}"
+            )
+            if not current_ugc:
+                return None
+            raw_co2 = float(current_ugc.get("CO2_num"))
+            gas_pressure = float(
+                self._get_data_value(data_items, "气体压力(hPa)")
+            )
+            if not (
+                math.isfinite(raw_co2)
+                and math.isfinite(gas_pressure)
+                and gas_pressure > 0.0
+            ):
+                return None
+
+            config = global_setting.get_setting("UFC_UGC_ZOS_config", {}) or {}
+            standard_pressure = float(
+                (config.get("PARAM", {}) or {}).get(
+                    "standard_atmospheric_pressure",
+                    101.325,
+                )
+            )
+            pressure_compensated_co2 = (
+                raw_co2 * standard_pressure / gas_pressure
+            )
+            fitted_co2_ppm = self.co2_realtime_compensator.compensate(
+                channel_id,
+                pressure_compensated_co2 * 10000.0,
+            )
+            fitted_co2 = float(fitted_co2_ppm) / 10000.0
+            if not math.isfinite(fitted_co2):
+                return None
+
+            reference_cage_number = int(
+                global_setting.get_setting("configer")["mouse_cage"]["reference"]
+            )
+            reference_data = self.data_handle.query_current_one_data(
+                f"Epoch_data_cage_{reference_cage_number}"
+            )
+            if not reference_data:
+                return None
+            reference_co2 = float(reference_data.get("UGC_CO2_num"))
+            if not math.isfinite(reference_co2):
+                return None
+            adjusted_reference_co2 = (
+                reference_co2 - self._reference_co2_subtract_value()
+            )
+            delta_co2 = fitted_co2 - adjusted_reference_co2
+            if not math.isfinite(delta_co2):
+                return None
+
+            logger.debug(
+                "O2 v6 Delta CO2 input: channel={}, fitted_cage={:.6f}%, "
+                "adjusted_ref={:.6f}%, delta={:.6f}%",
+                channel_id,
+                fitted_co2,
+                adjusted_reference_co2,
+                delta_co2,
+            )
+            return delta_co2
+        except (TypeError, ValueError, OverflowError, KeyError) as exc:
+            logger.warning(
+                "O2 v6 Delta CO2 unavailable: channel={}, cage={}, error={}",
+                channel_id,
+                mouse_cage_number,
+                exc,
+            )
+            return None
+
     def _append_o2_compensation(self, result_data):
         mouse_cage_number = result_data.get("mouse_cage_number")
         if mouse_cage_number is None:
@@ -1564,14 +1662,19 @@ class ZOS_gas_path_system_run_thread(MyQThread):
         gas_total_press = self._get_data_value(data_items, "气体压力(hPa)")
         o2_raw_pct = self._get_data_value(data_items, "氧浓度(%)")
 
-        zos_temp = self._get_data_value(data_items, "ZOS温度2测量值(°C)")
-        zos_rh = self._get_data_value(data_items, "ZOS湿度测量值(%RH)")
+        sht_temp = self._get_data_value(data_items, "ZOS温度2测量值(°C)")
+        sht_rh = self._get_data_value(data_items, "ZOS湿度测量值(%RH)")
+        delta_co2_pct = self._get_delta_co2_percent(
+            mouse_cage_number,
+            channel_id,
+            data_items,
+        )
         inputs_complete = None not in (
             o2_partial_press,
-            zos_temp,
             gas_total_press,
             o2_raw_pct,
-            zos_rh,
+            sht_temp,
+            sht_rh,
         )
 
         compensation_value = -1
@@ -1579,10 +1682,11 @@ class ZOS_gas_path_system_run_thread(MyQThread):
             compensation_value = calculate_o2_compensated(
                 channel_id,
                 o2_partial_press,
-                zos_temp,
+                0.0 if is_reference_cage else delta_co2_pct,
                 gas_total_press,
                 o2_raw_pct,
-                zos_rh,
+                sht_temp,
+                sht_rh,
             )
 
         # 只有REF已经建立真实基线后，普通通道的异常结果才允许使用
@@ -1595,59 +1699,17 @@ class ZOS_gas_path_system_run_thread(MyQThread):
         )
 
         if is_reference_cage:
-            reference_value = get_reference_dry_oxygen_percent()
-            post_settings = get_o2_post_compensation_settings()
-            if (
-                post_settings.get("enabled", False)
-                and self._is_valid_dry_oxygen_value(compensation_value)
-                and has_valid_reference_dry_oxygen_sample()
-            ):
-                # The second-stage formula uses air_lock as FiO2.  Persist the
-                # same value for REF so downstream DO2/VO2 calculations do not
-                # mix the legacy 20.930 reference with a 20.950 air lock.
-                reference_value = float(compensation_value)
+            reference_value = (
+                float(compensation_value)
+                if self._is_valid_dry_oxygen_value(compensation_value)
+                else get_reference_dry_oxygen_percent()
+            )
             self._set_data_value(
                 data_items,
                 "干基氧浓度(%)",
                 reference_value,
             )
             return result_data
-
-        # The supplier's channel coefficients are a second stage applied only
-        # after a real REF sample exists.  Keeping this here guarantees that a
-        # value is never post-compensated twice elsewhere in the pipeline.
-        if (
-            self._is_valid_dry_oxygen_value(compensation_value)
-            and has_valid_reference_dry_oxygen_sample()
-        ):
-            primary_value = float(compensation_value)
-            reference_value = float(get_realtime_o2_compensator().air_lock)
-            compensation_value = post_compensate_o2(
-                channel_id,
-                primary_value,
-                reference_value,
-            )
-            if not self._is_valid_dry_oxygen_value(compensation_value):
-                compensation_value = primary_value
-            elif not math.isclose(
-                float(compensation_value),
-                primary_value,
-                rel_tol=0.0,
-                abs_tol=1e-12,
-            ):
-                settings = get_o2_post_compensation_settings(channel_id)
-                logger.debug(
-                    "O2二次补偿：channel={}, 一次补偿值={:.6f}, "
-                    "REF/air_lock={:.6f}, gain={:.6f}, bias={:.6f}, "
-                    "min_do2={:.6f}, 最终值={:.6f}",
-                    channel_id,
-                    primary_value,
-                    reference_value,
-                    float(settings["gain"]),
-                    float(settings["bias"]),
-                    float(settings["min_do2"]),
-                    float(compensation_value),
-                )
 
         self._set_or_reuse_dry_oxygen_value(
             data_items,

@@ -1,157 +1,312 @@
-
 from __future__ import annotations
 
 import json
 import math
+import statistics
 import threading
+import time
+from collections import deque
 from pathlib import Path
 
-import numpy as np
-import pandas as pd
 from loguru import logger
 
+
 VALID_CHANNELS = ["REF"] + [f"M{i}" for i in range(1, 9)]
-AIR_NOMINAL = 20.90
-AIR_LOCK_MIN = 20.86
-AIR_LOCK_MAX = 20.95
-_k17 = 1.0
+AIR_NOMINAL = 20.93
 
 _COMPENSATOR_LOCK = threading.Lock()
 _COMPENSATOR = None
 _CALIBRATION_HANDLER_LOCK = threading.Lock()
 _CALIBRATION_HANDLER = None
 
-
-def get_default_config_path():
-    here = Path(__file__).resolve()
-    for parents in (4, 3, 2, 1):
-        try:
-            p = here.parents[parents] / "config" / "calib_config.json"
-            if p.parent.exists() or parents == 1:
-                return p
-        except IndexError:
-            break
-    return here.parent / "calib_config.json"
+# Supplier model: convert Delta CO2 (percentage points) into an estimated Delta O2.
+_MODEL_SLOPE = 1.042868
+_MODEL_INTERCEPT = 0.008752
+_MODEL_WEIGHT = 0.60
+_ZERO_END = 0.001
+_ZERO_FULL = 0.010
+_DCO2_MAX = 0.40
 
 
-def pressure_kpa(p):
-    p = float(p)
-    return p / 10.0 if p > 200.0 else p
+def get_default_config_path() -> Path:
+    """Return the project-level v6 oxygen calibration configuration."""
+    return Path(__file__).resolve().parents[4] / "config" / "calib_config.json"
+
+
+def pressure_kpa(value):
+    pressure = float(value)
+    if not math.isfinite(pressure) or pressure <= 0:
+        raise ValueError("invalid pressure")
+    pressure = pressure / 10.0 if pressure > 200.0 else pressure
+    if not 50.0 <= pressure <= 120.0:
+        raise ValueError("pressure expected kPa or hPa")
+    return pressure
 
 
 def calc_dry_o2(moist_o2, gas_pressure, temp_value, rh_value):
-    if pd.isna(gas_pressure) or gas_pressure <= 0 or pd.isna(temp_value) or pd.isna(rh_value):
-        return np.nan
-    pk = pressure_kpa(gas_pressure)
-    sat = 0.61094 * np.exp(17.625 * temp_value / (temp_value + 243.04))
-    pw = min((rh_value / 100.0) * sat, pk * 0.20)
-    if pk <= pw:
-        return np.nan
-    return moist_o2 * (pk / (pk - pw))
+    try:
+        wet_o2 = float(moist_o2)
+        temperature = float(temp_value)
+        relative_humidity = float(rh_value)
+        pressure = pressure_kpa(gas_pressure)
+        if not all(
+            math.isfinite(value)
+            for value in (wet_o2, temperature, relative_humidity)
+        ):
+            return float("nan")
+        if not (
+            0.0 <= wet_o2 <= 25.0
+            and -20.0 <= temperature <= 75.0
+            and 0.0 <= relative_humidity <= 100.0
+        ):
+            return float("nan")
+        saturated_pressure = 0.61094 * math.exp(
+            17.625 * temperature / (temperature + 243.04)
+        )
+        water_pressure = relative_humidity / 100.0 * saturated_pressure
+        if water_pressure >= pressure:
+            return float("nan")
+        return wet_o2 * pressure / (pressure - water_pressure)
+    except (ValueError, TypeError, ZeroDivisionError, OverflowError):
+        return float("nan")
 
 
-def arrhenius_placeholder(t_c, ea=42.0):
-    tk = float(t_c) + 273.15
-    return math.exp(-ea * 1000.0 / (8.314 * tk))
+def _model_do2(delta_co2_pct):
+    delta_co2 = float(delta_co2_pct)
+    if delta_co2 <= _ZERO_END:
+        return 0.0
+    if delta_co2 >= _ZERO_FULL:
+        return _MODEL_SLOPE * delta_co2 + _MODEL_INTERCEPT
+
+    interpolation = (delta_co2 - _ZERO_END) / (_ZERO_FULL - _ZERO_END)
+    width = _ZERO_FULL - _ZERO_END
+    upper_value = _MODEL_SLOPE * _ZERO_FULL + _MODEL_INTERCEPT
+    return (
+        (-2 * interpolation**3 + 3 * interpolation**2) * upper_value
+        + (interpolation**3 - interpolation**2) * width * _MODEL_SLOPE
+    )
 
 
-def mixing_ratio_stub(o2, co2=0.0):
-    return max(0.0, 100.0 - float(o2) - float(co2))
+class _ReferenceFilter:
+    def __init__(self):
+        self.recent = deque(maxlen=5)
+        self.filtered = None
+        self.last_time = None
+        self.last_input = None
+        self.last_rejected = False
 
+    def update(self, value, now=None):
+        now = time.monotonic() if now is None else float(now)
+        value = float(value)
+        self.last_input = value
+        if not math.isfinite(value):
+            return self.filtered
 
-def butterworth_gain_stub(freq=0.05):
-    return 1.0 / math.sqrt(1.0 + (freq / 0.08) ** 4)
+        history = list(self.recent)
+        if len(history) >= 3:
+            median = statistics.median(history)
+            mad = statistics.median(abs(item - median) for item in history)
+            jump_limit = max(0.025, 6 * 1.4826 * mad)
+            if abs(value - median) > jump_limit and not self.last_rejected:
+                self.last_rejected = True
+                return self.filtered
+
+        self.last_rejected = False
+        self.recent.append(value)
+        median = statistics.median(self.recent)
+        if self.filtered is None:
+            self.filtered = median
+        else:
+            elapsed = (
+                1.0
+                if self.last_time is None
+                else max(0.01, min(300.0, now - self.last_time))
+            )
+            alpha = 1.0 - math.exp(-elapsed / 30.0)
+            self.filtered += alpha * (median - self.filtered)
+        self.last_time = now
+        return self.filtered
 
 
 class RealtimeO2Compensator:
     def __init__(self, config_path=None):
         self.config_path = Path(config_path or get_default_config_path())
-        self.offsets = {ch: 0.0 for ch in VALID_CHANNELS}
-        self.gains = {ch: 1.0 for ch in VALID_CHANNELS}
-        self.match_gain = {ch: _k17 for ch in VALID_CHANNELS if ch != "REF"}
-        self.match_bias = {ch: 0.0 for ch in VALID_CHANNELS if ch != "REF"}
-        self.air_lock = AIR_NOMINAL
-        self.air_corr_last = {ch: None for ch in VALID_CHANNELS}
-        self.ref_corr = None
+        self.lock = threading.RLock()
+        self.cfg = None
         self._config_mtime_ns = None
+        self._reference_filter = _ReferenceFilter()
+        self.last_observations = {}
         self.reload_config(force=True)
 
-    def _get_config_mtime_ns(self):
-        try:
-            return self.config_path.stat().st_mtime_ns
-        except OSError:
-            return None
+    @property
+    def air_lock(self):
+        """Compatibility value used by the existing host UI and logs."""
+        with self.lock:
+            if self.cfg is None:
+                return AIR_NOMINAL
+            return float(self.cfg.get("air_o2_pct", AIR_NOMINAL))
+
+    def has_valid_reference_sample(self):
+        with self.lock:
+            reference = self._reference_filter.filtered
+            return reference is not None and math.isfinite(float(reference))
+
+    def reload_config(self, force=False):
+        with self.lock:
+            try:
+                config_mtime_ns = self.config_path.stat().st_mtime_ns
+                if not force and config_mtime_ns == self._config_mtime_ns:
+                    return False
+
+                with self.config_path.open(encoding="utf-8") as stream:
+                    config = json.load(stream)
+                if str(config.get("version")) != "6.0":
+                    raise ValueError("requires v6 config")
+                if set(config["channels"]) != set(VALID_CHANNELS):
+                    raise ValueError("requires nine channels")
+
+                air_o2 = float(config["air_o2_pct"])
+                lower = float(config["air_valid_min_pct"])
+                upper = float(config["air_valid_max_pct"])
+                if not lower <= air_o2 <= upper:
+                    raise ValueError("locked air out of range")
+
+                for channel in VALID_CHANNELS:
+                    channel_config = config["channels"][channel]
+                    gain = float(channel_config["gain"])
+                    air_dry = float(channel_config["air_dry_pct"])
+                    if not (0.5 <= gain <= 1.5 and 10.0 <= air_dry <= 25.0):
+                        raise ValueError(f"bad calibration {channel}")
+
+                common_mode = config.get("common_mode", {})
+                if (
+                    common_mode.get("enabled", False)
+                    and common_mode.get("validation_status")
+                    != "independently_validated"
+                ):
+                    raise ValueError(
+                        "common-mode disabled until independently validated"
+                    )
+
+                self.cfg = config
+                self._config_mtime_ns = config_mtime_ns
+                self._reference_filter = _ReferenceFilter()
+                logger.info(
+                    "O2 v6 config reloaded: path={}, air_o2_pct={:.4f}",
+                    self.config_path,
+                    air_o2,
+                )
+                return True
+            except Exception as exc:
+                logger.error(
+                    "O2 v6 config reload refused: path={}, error={}",
+                    self.config_path,
+                    exc,
+                )
+                return False
 
     def ensure_latest(self):
         self.reload_config(force=False)
 
-    def reload_config(self, force=False):
-        current = self._get_config_mtime_ns()
-        if not force and current == self._config_mtime_ns:
-            return False
-        try:
-            with self.config_path.open("r", encoding="utf-8") as f:
-                cfg = json.load(f)
-        except Exception:
-            self._config_mtime_ns = current
-            return False
-        offs = cfg.get("offsets") or {}
-        for ch in VALID_CHANNELS:
-            if ch in offs:
-                self.offsets[ch] = float(offs[ch])
-            self.gains[ch] = 1.0
-        lock = cfg.get("air_lock", AIR_NOMINAL)
-        self.air_lock = float(lock) if lock is not None else AIR_NOMINAL
-        self.air_lock = min(AIR_LOCK_MAX, max(AIR_LOCK_MIN, self.air_lock))
-        last = cfg.get("blk_u") or {}
-        for ch in VALID_CHANNELS:
-            if ch in last and last[ch] is not None:
-                self.air_corr_last[ch] = float(last[ch])
-        match_gain = cfg.get("match_gain") or {}
-        match_bias = cfg.get("match_bias") or {}
-        for ch in VALID_CHANNELS:
-            if ch == "REF":
-                continue
-            self.match_gain[ch] = float(match_gain.get(ch, _k17))
-            self.match_bias[ch] = float(match_bias.get(ch, 0.0))
-        self._config_mtime_ns = current
-        logger.info("reload calib air_lock=%.4f", self.air_lock)
-        return True
-
-    def has_valid_reference_sample(self):
-        try:
-            reference = float(self.ref_corr)
-        except (TypeError, ValueError, OverflowError):
-            return False
-        return math.isfinite(reference) and 0.0 <= reference <= 100.0
-
-    def compensate(self, channel, o2_partial, zos_temp, gas_pressure, o2_percent, zos_rh):
+    def compensate(
+        self,
+        channel,
+        o2_partial,
+        delta_co2_pct,
+        gas_pressure,
+        o2_percent,
+        relative_humidity,
+        *,
+        sht_temp,
+    ):
         del o2_partial
-        self.ensure_latest()
-        if channel not in VALID_CHANNELS:
-            return None
-        dry = calc_dry_o2(o2_percent, gas_pressure, zos_temp, zos_rh)
-        if pd.isna(dry):
-            return None
-        corr = float(dry) + float(self.offsets.get(channel, 0.0))
-        if channel == "REF":
-            self.ref_corr = corr
-            return float(self.air_lock)
-        if self.ref_corr is None:
-            return float(self.air_lock + self.match_bias.get(channel, 0.0))
-        gain = float(self.match_gain.get(channel, _k17))
-        bias = float(self.match_bias.get(channel, 0.0))
-        value = float(self.air_lock + bias + gain * (corr - self.ref_corr))
-        error = value - self.air_lock
-        if abs(error) < 0.01:
-            return value
-        if 0.01 <= abs(error) <= 0.02:
-            return float(self.air_lock + (0.01 if error > 0 else -0.01))
-        if error > 0.02:
-            import random
+        with self.lock:
+            self.ensure_latest()
+            if channel not in VALID_CHANNELS or self.cfg is None:
+                return None
+            if self.cfg.get("pending_span_validation", False):
+                return None
 
-            return float(self.air_lock + random.uniform(0.01, 0.02))
-        return value
+            dry_o2 = calc_dry_o2(
+                o2_percent,
+                gas_pressure,
+                sht_temp,
+                relative_humidity,
+            )
+            if not math.isfinite(dry_o2):
+                return None
+
+            air_o2 = float(self.cfg["air_o2_pct"])
+            channel_config = self.cfg["channels"][channel]
+            independent_o2 = air_o2 + float(channel_config["gain"]) * (
+                dry_o2 - float(channel_config["air_dry_pct"])
+            )
+            if not 15.0 <= independent_o2 <= 22.0:
+                return None
+
+            diagnostics = {
+                "raw_dry_pct": dry_o2,
+                "independent_o2_pct": independent_o2,
+                "air_locked_pct": air_o2,
+            }
+            if channel == "REF":
+                filtered_reference = self._reference_filter.update(independent_o2)
+                diagnostics.update(
+                    ref_filtered_pct=filtered_reference,
+                    ref_drift_pct=filtered_reference - air_o2,
+                    dco2_pct=0.0,
+                )
+                self.last_observations[channel] = diagnostics
+                return air_o2
+
+            filtered_reference = self._reference_filter.filtered
+            common_mode = self.cfg.get("common_mode", {})
+            common_mode_gain = (
+                float(common_mode.get("coefficients", {}).get(channel, 0.0))
+                if common_mode.get("enabled", False)
+                else 0.0
+            )
+            reference_drift = (
+                filtered_reference - air_o2
+                if filtered_reference is not None
+                else 0.0
+            )
+            measured_o2 = independent_o2 - common_mode_gain * reference_drift
+            measured_do2 = air_o2 - measured_o2
+            diagnostics.update(
+                ref_filtered_pct=filtered_reference,
+                ref_drift_pct=reference_drift,
+                common_mode_gain=common_mode_gain,
+                common_mode_o2_pct=measured_o2,
+                do2_measured_pct=measured_do2,
+            )
+
+            try:
+                delta_co2 = float(delta_co2_pct)
+            except (TypeError, ValueError, OverflowError):
+                delta_co2 = float("nan")
+
+            if not math.isfinite(delta_co2) or not -0.005 <= delta_co2 <= _DCO2_MAX:
+                diagnostics["co2_quality"] = "INVALID_FALLBACK"
+                output_o2 = measured_o2
+            else:
+                delta_co2 = max(0.0, delta_co2)
+                predicted_do2 = _model_do2(delta_co2)
+                fused_do2 = (
+                    (1.0 - _MODEL_WEIGHT) * measured_do2
+                    + _MODEL_WEIGHT * predicted_do2
+                )
+                output_o2 = air_o2 - fused_do2
+                diagnostics.update(
+                    dco2_pct=delta_co2,
+                    co2_predicted_do2_pct=predicted_do2,
+                    fused_do2_pct=fused_do2,
+                    co2_quality="OK_MODEL_ESTIMATE",
+                )
+
+            diagnostics["output_o2_pct"] = output_o2
+            self.last_observations[channel] = diagnostics
+            return float(output_o2) if 15.0 <= output_o2 <= 22.0 else None
 
 
 def get_realtime_o2_compensator():
@@ -163,8 +318,7 @@ def get_realtime_o2_compensator():
 
 
 def reload_o2_compensation_config():
-    get_realtime_o2_compensator().reload_config(force=True)
-    return True
+    return get_realtime_o2_compensator().reload_config(force=True)
 
 
 def get_o2_calibration_handler(target_points=None):
@@ -187,7 +341,14 @@ def get_o2_calibration_handler(target_points=None):
 def start_new_o2_calibration(target_points=None, span_value=None):
     return get_o2_calibration_handler(target_points).start_new_calibration(
         target_points,
-        span_value=span_value,
+        span_value,
+    )
+
+
+def start_span_o2_calibration(target_points=None, span_value=None):
+    return get_o2_calibration_handler(target_points).start_span_o2(
+        target_points,
+        span_value,
     )
 
 
@@ -195,38 +356,56 @@ def start_air_o2_calibration(target_points=None):
     return get_o2_calibration_handler(target_points).start_air_touchup(target_points)
 
 
-def append_o2_calibration_data(channel, o2_partial, zos_temp, gas_pressure, o2_percent, sht_temp, sht_rh):
-    handler = get_o2_calibration_handler()
-    done = handler.add_data(
+def append_o2_calibration_data(
+    channel,
+    o2_partial,
+    zos_temp,
+    gas_pressure,
+    o2_percent,
+    sht_temp,
+    sht_rh,
+):
+    completed = get_o2_calibration_handler().add_data(
         channel=channel,
         o2_partial=o2_partial,
         zos_temp=zos_temp,
         gas_pressure=gas_pressure,
         o2_percent=o2_percent,
+        zos_rh=sht_rh,
         sht_temp=sht_temp,
         sht_rh=sht_rh,
     )
-    if done:
+    if completed:
         reload_o2_compensation_config()
-    return done
+    return completed
 
 
 def get_o2_calibration_status():
     return get_o2_calibration_handler().get_status()
 
 
-def calculate_o2_compensated(channel_id, o2_partial_press, zos_temp, gas_total_press, o2_raw_pct, sht_temp, sht_rh):
+def calculate_o2_compensated(
+    channel_id,
+    o2_partial_press,
+    delta_co2_pct,
+    gas_total_press,
+    o2_raw_pct,
+    sht_temp,
+    sht_rh,
+):
     handler = get_o2_calibration_handler()
     if handler.is_active:
         return None
     if channel_id not in VALID_CHANNELS:
         return -1
-    t_use = sht_temp if sht_temp is not None and sht_temp > 5 else zos_temp
+    if sht_temp is None or sht_rh is None:
+        return None
     return get_realtime_o2_compensator().compensate(
-        channel=channel_id,
-        o2_partial=o2_partial_press,
-        zos_temp=t_use,
-        gas_pressure=gas_total_press,
-        o2_percent=o2_raw_pct,
-        zos_rh=sht_rh,
+        channel_id,
+        o2_partial_press,
+        0.0 if channel_id == "REF" else delta_co2_pct,
+        gas_total_press,
+        o2_raw_pct,
+        sht_rh,
+        sht_temp=sht_temp,
     )

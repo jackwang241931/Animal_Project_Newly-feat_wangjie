@@ -615,13 +615,17 @@ class Startup_Air_Calibration:
                     )
 
                 o2_calibrated = o2_status.get("calibrated", getattr(self.o2_calibration_handler, "calibrated", False))
+                o2_pending_air = bool(
+                    o2_status.get("completed")
+                    and o2_status.get("validation_status") == "PENDING_AIR"
+                )
                 co2_calibrated = co2_status.get("calibrated", getattr(self.co2_calibration_handler, "calibrated", False))
                 o2_failed_nonblocking = bool(
                     o2_status.get("failed") or self.o2_failure_reason
                 )
                 co2_failed_nonblocking = bool(co2_status.get("failed"))
                 co2_fit_failed_after_collection = co2_failed_nonblocking and co2_ready
-                if (o2_calibrated or o2_failed_nonblocking) and (
+                if (o2_calibrated or o2_pending_air or o2_failed_nonblocking) and (
                     co2_calibrated or co2_failed_nonblocking
                 ):
                     if o2_failed_nonblocking and co2_failed_nonblocking:
@@ -633,6 +637,23 @@ class Startup_Air_Calibration:
                         self._send_text(
                             f"{self.name}采集完成：O2 校准失败，CO2 校准成功；"
                             "保留原有 O2 配置，继续后续流程"
+                        )
+                    elif o2_pending_air and co2_fit_failed_after_collection:
+                        self._send_text(
+                            f"{self.name}采集完成：O2 两点参数已生成，状态为PENDING_AIR；"
+                            f"CO2 已收满 {target_points} 点但拟合失败。"
+                            "O2 新参数需再执行一次独立Air空气复核后启用"
+                        )
+                    elif o2_pending_air and co2_failed_nonblocking:
+                        self._send_text(
+                            f"{self.name}采集完成：O2 两点参数已生成，状态为PENDING_AIR；"
+                            "CO2 处理异常且未更新。"
+                            "O2 新参数需再执行一次独立Air空气复核后启用"
+                        )
+                    elif o2_pending_air:
+                        self._send_text(
+                            f"{self.name}采集完成：O2 两点参数已生成，状态为PENDING_AIR，"
+                            "CO2 校准成功；请再执行一次独立Air空气复核以启用O2新参数"
                         )
                     elif co2_fit_failed_after_collection:
                         self._send_text(

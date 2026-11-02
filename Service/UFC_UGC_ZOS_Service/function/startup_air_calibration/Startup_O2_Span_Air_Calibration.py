@@ -362,7 +362,8 @@ class Startup_O2_Span_Air_Calibration:
                 handler.finish_span_only()
                 reload_o2_compensation_config()
                 self._send_text(
-                    "O2 Span独立校准完成；已更新Span偏移，保留原有Air基准"
+                    "O2 Span独立校准采样完成，状态为PENDING_AIR；"
+                    "必须继续执行一次独立Air空气复核，通过后新参数才会生效"
                 )
             except Exception as exc:
                 failure = exc
@@ -504,9 +505,16 @@ class Startup_O2_Span_Air_Calibration:
             if not status.get("completed"):
                 raise RuntimeError("完整Air空气校准结束，但O2校准配置未完成")
             reload_o2_compensation_config()
-            self._send_text(
-                f"O2 Span+完整Air空气校准完成，干基空气锁定值 {status.get('air_lock')}%"
-            )
+            if status.get("validation_status") == "PENDING_AIR":
+                self._send_text(
+                    "O2 Span+Air两点参数已生成，状态为PENDING_AIR；"
+                    "请再执行一次独立Air空气复核后启用新参数"
+                )
+            else:
+                self._send_text(
+                    f"O2 Span+完整Air空气校准完成，干基空气锁定值 "
+                    f"{status.get('air_lock')}%"
+                )
         except Exception as exc:
             failure = exc
             logger.exception(f"{self.name}: 完整Air空气校准收尾失败")
@@ -588,9 +596,16 @@ class Startup_O2_Span_Air_Calibration:
                 raise RuntimeError("O2校准未完成，配置文件未更新")
             reload_o2_compensation_config()
             self._emit_calibration_time("set_stop_air_calibration_time")
-            self._send_text(
-                f"Span+空气校准完成，干基空气锁定值 {status.get('air_lock')}%"
-            )
+            if status.get("validation_status") == "PENDING_AIR":
+                self._send_text(
+                    "Span+空气两点参数已生成，状态为PENDING_AIR；"
+                    "请再执行一次独立Air空气复核后启用新参数"
+                )
+            else:
+                self._send_text(
+                    f"Span+空气校准完成，干基空气锁定值 "
+                    f"{status.get('air_lock')}%"
+                )
         except Exception as exc:
             failure = exc
             logger.exception(f"{self.name}失败")
