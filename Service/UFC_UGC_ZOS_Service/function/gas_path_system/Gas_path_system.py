@@ -1005,12 +1005,16 @@ class UGC_gas_path_system_run_thread(MyQThread):
             return value == 0
 
     def _wait_ugc_channel_read_interval(self):
-        min_read_interval = 1.0
         try:
             ugc_config = global_setting.get_setting('UFC_UGC_ZOS_config')['UGC']
-            min_read_interval = max(1.0, float(ugc_config.get('min_channel_read_interval', 1)))
+            min_read_interval = float(ugc_config.get('min_channel_read_interval', 1.0))
         except Exception:
-            pass
+            min_read_interval = 1.0
+        if not math.isfinite(min_read_interval) or min_read_interval <= 0:
+            logger.warning(
+                f"UGC通道读取间隔配置无效：{min_read_interval}，回退到1秒"
+            )
+            min_read_interval = 1.0
 
         elapsed = time.time() - self.last_ugc_channel_read_time
         if elapsed < min_read_interval:
@@ -1499,12 +1503,16 @@ class ZOS_gas_path_system_run_thread(MyQThread):
         return True
 
     def _wait_zos_channel_read_interval(self):
-        min_read_interval = 1.0
         try:
             zos_config = global_setting.get_setting('UFC_UGC_ZOS_config')['ZOS']
-            min_read_interval = max(1.0, float(zos_config.get('min_channel_read_interval', 1)))
+            min_read_interval = float(zos_config.get('min_channel_read_interval', 1.0))
         except Exception:
-            pass
+            min_read_interval = 1.0
+        if not math.isfinite(min_read_interval) or min_read_interval <= 0:
+            logger.warning(
+                f"ZOS通道读取间隔配置无效：{min_read_interval}，回退到1秒"
+            )
+            min_read_interval = 1.0
 
         elapsed = time.time() - self.last_zos_channel_read_time
         if elapsed < min_read_interval:
