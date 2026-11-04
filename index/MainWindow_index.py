@@ -796,11 +796,6 @@ class MainWindow_Index(ThemedWindow):
             ExperimentRunState.STOP_FAILED,
         }:
             return
-        if self._stop_operation_failed:
-            # Keep the hardware warning visible instead of exiting as if the
-            # pump were confirmed off. An explicit close remains available.
-            self._close_after_stop = False
-            return
         self._close_after_stop = False
         self._close_without_confirmation = True
         for window in list(self.open_windows):
@@ -1169,6 +1164,7 @@ class MainWindow_Index(ThemedWindow):
         self.stop_export_succeeded = True
         self.stop_export_error = None
         self.stop_export_source_path = None
+        self._stop_hardware_warning_path = None
         self.stop_dialog_close_pending = False
         self.pending_stop_export_success_path = None
         self._close_after_stop = False
@@ -3913,6 +3909,7 @@ class MainWindow_Index(ThemedWindow):
         self.stop_export_succeeded = False
         self.stop_export_error = None
         self.stop_export_source_path = None
+        self._stop_hardware_warning_path = None
         self.stop_dialog_close_pending = False
         self._stop_backend_complete = False
         self._stop_backend_grace_complete = False
@@ -4104,7 +4101,7 @@ class MainWindow_Index(ThemedWindow):
             self._stop_timeout_timer.stop()
         self.stop_update_gui_sync()
         if self._stop_operation_failed:
-            self._show_stop_hardware_failure_message()
+            self._write_stop_hardware_warning_file()
         if self.stop_export_succeeded:
             self._show_pending_stop_export_success_message()
         else:
@@ -4316,10 +4313,9 @@ class MainWindow_Index(ThemedWindow):
         export_path = self.pending_stop_export_success_path
         self.pending_stop_export_success_path = None
         if export_path:
-            workbook_path = f"{os.path.splitext(export_path)[0]}.xlsx"
-            custom_data_file_util.show_export_success_message(
-                export_path,
-                additional_file_paths=[workbook_path] if os.path.isfile(workbook_path) else None,
+            logger.info(
+                "stop experiment data export succeeded; success dialog suppressed: "
+                f"{export_path}"
             )
 
     def _show_stop_export_failure_message(self):
@@ -4334,15 +4330,43 @@ class MainWindow_Index(ThemedWindow):
             f"失败原因：{detail}",
         )
 
-    def _show_stop_hardware_failure_message(self):
+    def _write_stop_hardware_warning_file(self):
+        """Persist unconfirmed hardware shutdown details without a modal dialog."""
+        if self._stop_hardware_warning_path:
+            return self._stop_hardware_warning_path
+
         details = self._stop_backend_issue_details or ["后台/硬件关闭回执未确认"]
-        QMessageBox.critical(
-            self,
-            "硬件关闭状态未确认",
-            "实验采集流程已结束，但部分硬件没有返回可靠的关闭状态。\n"
-            "请立即检查UFC和气泵实体状态，确认关闭前不要开始下一次实验。\n\n"
-            + "\n".join(str(item) for item in details),
+        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        warning_dir = os.path.join(project_root, "data", "warnings")
+        timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+        timestamp_ms = int((time.time() % 1) * 1000)
+        warning_path = os.path.join(
+            warning_dir,
+            f"hardware_shutdown_unconfirmed_{timestamp}_{timestamp_ms:03d}_pid{os.getpid()}.json",
         )
+        report = {
+            "event": "hardware_shutdown_unconfirmed",
+            "recorded_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+            "experiment_path": self.stop_export_source_path or self._get_experiment_root_path(),
+            "workflow_state": getattr(self.workflow_run_state, "value", str(self.workflow_run_state)),
+            "data_archive_succeeded": bool(self.stop_export_succeeded),
+            "details": [str(item) for item in details],
+        }
+
+        try:
+            os.makedirs(warning_dir, exist_ok=True)
+            temp_path = f"{warning_path}.tmp"
+            with open(temp_path, "w", encoding="utf-8") as warning_file:
+                json.dump(report, warning_file, ensure_ascii=False, indent=2)
+                warning_file.flush()
+                os.fsync(warning_file.fileno())
+            os.replace(temp_path, warning_path)
+            self._stop_hardware_warning_path = warning_path
+            logger.error(f"硬件关闭状态未确认，警告记录已保存：{warning_path}")
+            return warning_path
+        except Exception:
+            logger.exception("硬件关闭状态未确认，写入警告文件失败")
+            return None
 
     def _finalize_mouse_trajectory_views(self) -> bool:
         trajectory_views = []
