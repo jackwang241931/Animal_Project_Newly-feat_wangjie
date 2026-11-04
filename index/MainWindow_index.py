@@ -51,6 +51,10 @@ from public.function.promise.AsyPromise import AsyPromise
 from public.system_health import ExperimentRunState, HealthPolicy, HealthState, HealthStore
 from public.util.custom_data_file_util import custom_data_file_util
 from public.util.native_crash_diagnostics import native_call
+from public.util.experiment_module_selection import (
+    any_selected_module_enabled,
+    gas_module_selection,
+)
 from public.util.time_util import time_util
 from theme.ThemeQt6 import ThemedWindow
 from ui.MainWindow import Ui_MainWindow
@@ -3201,27 +3205,7 @@ class MainWindow_Index(ThemedWindow):
         compatibility with old templates that predate the module switches.
         """
         setting = global_setting.get_setting("experiment_setting", None)
-        groups = [group for group in (getattr(setting, "groups", []) or [])
-                  if bool(getattr(group, "is_selected", False))]
-        if not groups:
-            return False
-        modules = getattr(setting, "channel_modules", {}) or {}
-        for group in groups:
-            key = str(getattr(group, "id", ""))
-            values = modules.get(key, {}) if isinstance(modules, dict) else {}
-            if not values and isinstance(modules, dict):
-                try:
-                    values = modules.get(int(getattr(group, "id", 0) or 0), {})
-                except (TypeError, ValueError):
-                    values = {}
-            if not values:
-                try:
-                    values = modules.get(str(int(getattr(group, "id", 0) or 0)), {})
-                except (TypeError, ValueError):
-                    values = {}
-            if not isinstance(values, dict) or bool(values.get(feature_key, True)):
-                return True
-        return False
+        return any_selected_module_enabled(setting, feature_key)
 
     def _confirm_workflow_device_config(self, port, queue):
         """Mirror the legacy confirmation messages before the start command."""
@@ -3287,11 +3271,35 @@ class MainWindow_Index(ThemedWindow):
         if not any(bool(getattr(group, "is_selected", False)) for group in (getattr(setting, "groups", []) or [])):
             self._reject_experiment_start("未选择实验笼位，请先在实验配置中选择并应用笼位。")
             return
+        environment_only = bool(
+            global_setting.get_setting("environment_module_only", False)
+        )
+        gas_selection = gas_module_selection(setting)
+        if not environment_only and not gas_selection["valid"]:
+            self._reject_experiment_start(gas_selection["message"])
+            return
+        gas_enabled = bool(not environment_only and gas_selection["enabled"])
+        behavior_enabled = bool(
+            not environment_only and self._experiment_feature_enabled("behavior")
+        )
+        infrared_enabled = bool(
+            not environment_only and self._experiment_feature_enabled("infrared")
+        )
+        # Freeze the runtime feature set for this experiment.  Stop must use
+        # the same set even if the configuration page is edited afterwards.
+        global_setting.set_setting("gas_path_enabled_for_experiment", gas_enabled)
+        global_setting.set_setting("behavior_enabled_for_experiment", behavior_enabled)
+        global_setting.set_setting("infrared_enabled_for_experiment", infrared_enabled)
         send_message_queue = global_setting.get_setting("send_message_queue", None)
         if send_message_queue is None:
             self._reject_experiment_start("后台采集服务未连接，请检查服务状态后重试。")
             return
         startup_calibration_mode = self._resolve_startup_calibration_mode_for_start()
+        if not gas_enabled and startup_calibration_mode != "none":
+            self._reject_experiment_start(
+                "当前实验已禁用UFC、UGC、ZOS，不能同时执行启动前气体校准；请关闭校准或重新启用完整气路。"
+            )
+            return
         calibration_was_selected = bool(
             global_setting.get_setting("device_config_calibration_selected", False)
         )
@@ -3301,10 +3309,8 @@ class MainWindow_Index(ThemedWindow):
             )
             return
         self._reset_calibration_detail_state(startup_calibration_mode)
-        behavior_enabled = self._experiment_feature_enabled("behavior")
-        infrared_enabled = self._experiment_feature_enabled("infrared")
         camera_queue = global_setting.get_setting("queue", None)
-        if not global_setting.get_setting("environment_module_only", False) and camera_queue is None:
+        if (behavior_enabled or infrared_enabled) and camera_queue is None:
             self._reject_experiment_start("相机控制服务未连接，请检查服务状态后重试。")
             return
 
@@ -3367,24 +3373,27 @@ class MainWindow_Index(ThemedWindow):
             self._mark_workflow_operation_failed("start", error)
             return
         message_structs = []
-        if not global_setting.get_setting("environment_module_only", False):
+        if behavior_enabled or infrared_enabled:
             camera_data = {
                 'start_experiment_time': global_setting.get_setting("start_experiment_time"),
                 'pause_experiment_time': global_setting.get_setting("pause_experiment_time"),
                 'relieve_pause_experiment_time': global_setting.get_setting("relieve_pause_experiment_time"),
+                'experiment_setting': setting,
             }
-            # Match the baseline: both camera services receive a start command.
-            # The feature flags still control optional recording and history.
-            message_structs.append(ObjectQueueItem(
-                origin='MainWindow_Index', to='main_infrared_camera', title='start',
-                data={**camera_data, 'infrared_enabled': infrared_enabled},
-                time=time_util.get_format_from_time(time.time()),
-            ))
-            message_structs.append(ObjectQueueItem(
-                origin='MainWindow_Index', to='main_deep_camera', title='start',
-                data={**camera_data, 'behavior_enabled': behavior_enabled},
-                time=time_util.get_format_from_time(time.time()),
-            ))
+            # Only enabled camera services receive a start command.  Each
+            # service filters its mapping again to the enabled cage subset.
+            if infrared_enabled:
+                message_structs.append(ObjectQueueItem(
+                    origin='MainWindow_Index', to='main_infrared_camera', title='start',
+                    data={**camera_data, 'infrared_enabled': True},
+                    time=time_util.get_format_from_time(time.time()),
+                ))
+            if behavior_enabled:
+                message_structs.append(ObjectQueueItem(
+                    origin='MainWindow_Index', to='main_deep_camera', title='start',
+                    data={**camera_data, 'behavior_enabled': True},
+                    time=time_util.get_format_from_time(time.time()),
+                ))
         for message_struct in message_structs:
             try:
                 camera_queue.put(message_struct)
@@ -3402,14 +3411,24 @@ class MainWindow_Index(ThemedWindow):
         pass
 
     def show_open_dialog(self, resolve, reject):
-        environment_only = bool(
-            global_setting.get_setting("environment_module_only", False)
+        environment_only = bool(global_setting.get_setting("environment_module_only", False))
+        gas_enabled = bool(
+            global_setting.get_setting(
+                "gas_path_enabled_for_experiment",
+                not environment_only,
+            )
         )
-        start_wait_times = float(global_setting.get_setting('configer')['dialog_timeout']['timeout']) + float(
-            global_setting.get_setting('UFC_UGC_ZOS_config')['UFC']['wait_time']) + float(
-            global_setting.get_setting('UFC_UGC_ZOS_config')['ZOS']['start_read_pressure_all_time']) / float(
-            global_setting.get_setting('UFC_UGC_ZOS_config')['ZOS']['start_read_pressure_delay']) * 2 * 8 + 20
-        if not environment_only:
+        start_wait_times = float(
+            global_setting.get_setting('configer')['dialog_timeout']['timeout']
+        )
+        if gas_enabled:
+            start_wait_times += float(
+                global_setting.get_setting('UFC_UGC_ZOS_config')['UFC']['wait_time']
+            ) + float(
+                global_setting.get_setting('UFC_UGC_ZOS_config')['ZOS']['start_read_pressure_all_time']
+            ) / float(
+                global_setting.get_setting('UFC_UGC_ZOS_config')['ZOS']['start_read_pressure_delay']
+            ) * 2 * 8 + 20
             try:
                 flow_delay = float(
                     global_setting.get_setting('UFC_UGC_ZOS_config')['UFC'].get('flow_setpoint_delay', 2)
@@ -3419,7 +3438,7 @@ class MainWindow_Index(ThemedWindow):
             except (KeyError, TypeError, ValueError):
                 flow_delay = 2
             start_wait_times += len(UFC_FLOW_SETPOINT_DEFAULTS) * (flow_delay + 1)
-        start_message = "正在启动环境模块..." if environment_only else "正在启动气路..."
+        start_message = "正在启动气路..." if gas_enabled else "正在启动已启用的采集模块..."
 
         if self.start_dialog is None:
             self.start_dialog = AnimatedLoadingDialog(countdown_seconds=start_wait_times, title="开始实验",
@@ -3442,7 +3461,7 @@ class MainWindow_Index(ThemedWindow):
             )
 
         startup_calibration_mode = global_setting.get_setting('startup_calibration_mode', None)
-        if environment_only:
+        if not gas_enabled:
             startup_calibration_mode = "none"
         if startup_calibration_mode == "air_co2":
             startup_calibration_mode = "air"
@@ -3511,6 +3530,10 @@ class MainWindow_Index(ThemedWindow):
         if environment_only:
             self.start_dialog.insert_data_signal.emit(
                 "仅环境模块模式：气路、相机、饮水、食物和称重模块已跳过"
+            )
+        elif not gas_enabled:
+            self.start_dialog.insert_data_signal.emit(
+                "当前实验未启用UFC、UGC、ZOS：已跳过整套气路启动"
             )
         # Startup progress is rendered in the workflow control page.  Keep the
         # legacy dialog object only as an internal message sink; never open a
@@ -3928,40 +3951,56 @@ class MainWindow_Index(ThemedWindow):
         except Exception as error:
             self._mark_workflow_operation_failed("stop", error)
             return
-        if camera_queue is None:
+        behavior_enabled = bool(
+            global_setting.get_setting("behavior_enabled_for_experiment", False)
+        )
+        infrared_enabled = bool(
+            global_setting.get_setting("infrared_enabled_for_experiment", False)
+        )
+        if camera_queue is None and (behavior_enabled or infrared_enabled):
             self._mark_workflow_operation_failed("stop", "相机/状态回执队列不可用；采集服务停止指令已发出，结果未确认。")
             return
         message_structs = []
-        if global_setting.get_setting("environment_module_only", False):
-            for title, data in (
-                ("stop_deep_camera_complete", {"success": True, "detail": "仅环境模块模式：轨迹相机未启动"}),
-                ("stop_infrared_camera_complete", {"success": True, "detail": "仅环境模块模式：红外相机未启动"}),
-            ):
+        camera_stop_plan = (
+            (
+                behavior_enabled,
+                "main_deep_camera",
+                "stop_deep_camera_complete",
+                "轨迹相机未启用，无需停止",
+            ),
+            (
+                infrared_enabled,
+                "main_infrared_camera",
+                "stop_infrared_camera_complete",
+                "热红外模块未启用，无需停止",
+            ),
+        )
+        for enabled, target, skipped_title, skipped_detail in camera_stop_plan:
+            if enabled:
+                message_structs.append(ObjectQueueItem(
+                    origin='MainWindow_Index', to=target, title='stop', data={
+                        'stop_experiment_time': global_setting.get_setting("stop_experiment_time"),
+                    },
+                    time=time_util.get_format_from_time(time.time()),
+                ))
+            else:
+                if camera_queue is None:
+                    read_queue_data_thread._stop_ack_titles.add(skipped_title)
+                    self._append_workflow_runtime_log(skipped_detail, "停止")
+                    continue
                 try:
                     camera_queue.put(
                         ObjectQueueItem(
                             origin="MainWindow_Index",
                             to="MainWindow_index",
-                            title=title,
-                            data=data,
+                            title=skipped_title,
+                            data={"success": True, "detail": skipped_detail},
                             time=time_util.get_format_from_time(time.time()),
                         )
                     )
                 except Exception as error:
                     self._mark_workflow_operation_failed("stop", error)
                     return
-        else:
-            message_structs = [
-            ObjectQueueItem(origin='MainWindow_Index', to='main_deep_camera', title='stop', data={
-                'stop_experiment_time': global_setting.get_setting("stop_experiment_time"),
-            },
-                            time=time_util.get_format_from_time(time.time())),
-            ObjectQueueItem(origin='MainWindow_Index', to='main_infrared_camera', title='stop', data={
-                'stop_experiment_time': global_setting.get_setting("stop_experiment_time"),
-            },
-                            time=time_util.get_format_from_time(time.time())),
-
-            ]
         for message_struct in message_structs:
             try:
                 camera_queue.put(message_struct)

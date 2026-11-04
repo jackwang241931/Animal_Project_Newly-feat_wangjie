@@ -27,6 +27,10 @@ from public.system_health import HealthPolicy, HealthReporter
 from public.util.folder_util import folder_util
 from public.util.json_util import json_util
 from public.util.native_crash_diagnostics import native_call
+from public.util.experiment_module_selection import (
+    any_selected_module_enabled,
+    filter_camera_mappings,
+)
 from public.util.time_util import time_util
 import argparse
 import time
@@ -219,6 +223,10 @@ class read_queue_data_Thread(MyQThread):
                     case 'start':
                         data = message.data
                         if data is not None:
+                            if data.get("experiment_setting") is not None:
+                                global_setting.set_setting(
+                                    "experiment_setting", data.get("experiment_setting")
+                                )
                             global_setting.set_setting(
                                 "infrared_feature_enabled",
                                 bool(data.get("infrared_enabled", False)),
@@ -1280,6 +1288,8 @@ def _stop_infrared_camera_threads(camera_structs, wait_ms=5000):
 def init_camera_and_image_handle_thread(serials):
     global camera_list, read_queue_data_thread, is_used_ports
     serials = [item for item in (serials or []) if isinstance(item, dict)]
+    setting = global_setting.get_setting("experiment_setting", None)
+    serials = filter_camera_mappings(serials, setting, "infrared")
     if not serials:
         reporter = _health_reporter("infrared_camera", "global")
         if reporter is not None:
@@ -1367,6 +1377,16 @@ def main(q, health_snapshot_queue=None):
     # global camera_list
     # return camera_list, read_queue_data_thread, delete_file_thread,
 def start():
+    setting = global_setting.get_setting("experiment_setting", None)
+    enabled = bool(
+        global_setting.get_setting(
+            "infrared_feature_enabled",
+            any_selected_module_enabled(setting, "infrared"),
+        )
+    )
+    if not enabled:
+        logger.info("infrared camera disabled by experiment module selection; startup skipped")
+        return
     logger.info(f"{'-' * 30}infrared_camera_run{'-' * 30}")
     # 初始化保存路径
     camera_config = global_setting.get_setting("camera_config")

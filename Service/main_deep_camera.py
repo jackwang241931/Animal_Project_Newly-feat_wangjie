@@ -26,6 +26,10 @@ from public.util.ffmpeg_video_recorder import (
 )
 from public.util.json_util import json_util
 from public.util.native_crash_diagnostics import native_call
+from public.util.experiment_module_selection import (
+    any_selected_module_enabled,
+    filter_camera_mappings,
+)
 from public.util.project_paths import resolve_project_path
 from public.util.shared_video_frames import shared_video_frame_store
 from public.util.time_util import time_util
@@ -305,6 +309,10 @@ class read_queue_data_Thread(MyQThread):
                 _stop_camera_threads(self.camera_list or [])
             case "start":
                 data = message.data or {}
+                if data.get("experiment_setting") is not None:
+                    global_setting.set_setting(
+                        "experiment_setting", data.get("experiment_setting")
+                    )
                 global_setting.set_setting(
                     "behavior_feature_enabled", bool(data.get("behavior_enabled", False))
                 )
@@ -1139,6 +1147,8 @@ def init_camera_and_image_handle_thread(serials):
         return
 
     serials = serials if isinstance(serials, list) else []
+    setting = global_setting.get_setting("experiment_setting", None)
+    serials = filter_camera_mappings(serials, setting, "behavior")
     camera_nums = len(serials)
     camera_config_temp = _camera_config()
     camera_config_temp["DEEP_CAMERA"]["nums"] = camera_nums
@@ -1256,6 +1266,17 @@ def main(
 
 def start():
     global delete_file_thread, save_frame_thread, video_recorder_thread
+
+    setting = global_setting.get_setting("experiment_setting", None)
+    enabled = bool(
+        global_setting.get_setting(
+            "behavior_feature_enabled",
+            any_selected_module_enabled(setting, "behavior"),
+        )
+    )
+    if not enabled:
+        logger.info("deep camera disabled by experiment module selection; startup skipped")
+        return
 
     if camera_instance_lock is None or not camera_instance_lock.acquired:
         logger.warning("deep camera start deferred: standalone video program is running")

@@ -516,8 +516,29 @@ class ExperimentConfigPage(QWidget):
             return None
         cage_modules = record.get("cage_modules", {})
         air_modules = record.get("air_modules", {})
-        required_cage = {"ENM"} if global_setting.get_setting("environment_module_only", False) else {"WM", "EM", "DWM", "ENM"}
-        required_air = set() if global_setting.get_setting("environment_module_only", False) else {"UFC", "UGC", "ZOS"}
+        values = self._channel_module_values.get(str(channel), {})
+        cage_switches = {
+            "WM": "weight",
+            "EM": "water",
+            "DWM": "food",
+            "ENM": "environment",
+        }
+        if global_setting.get_setting("environment_module_only", False):
+            required_cage = {"ENM"} if bool(values.get("environment", True)) else set()
+            required_air = set()
+        else:
+            required_cage = {
+                device_key
+                for device_key, module_key in cage_switches.items()
+                if bool(values.get(module_key, True))
+            }
+            required_air = {
+                module_key
+                for module_key in ("UFC", "UGC", "ZOS")
+                if bool(values.get(module_key, True))
+            }
+        if not required_cage and not required_air:
+            return "normal"
         if any(name in cage_modules and not cage_modules[name] for name in required_cage):
             return "fault"
         if any(name in air_modules and not air_modules[name] for name in required_air):
@@ -1063,7 +1084,7 @@ class ExperimentConfigPage(QWidget):
         columns = QHBoxLayout(); columns.setSpacing(12)
         module_box = QFrame(); module_box.setObjectName("configCard"); module_layout = QVBoxLayout(module_box)
         head = QLabel("测量模块（自检 + 启用）"); head.setObjectName("sectionTitle"); module_layout.addWidget(head)
-        module_note = QLabel("勾选后纳入本笼配置；状态来自最近一次真实自检。行为识别控制轨迹相机及图片/视频保存，热红外控制热成像及红外文件保存。")
+        module_note = QLabel("勾选后纳入本笼配置；未勾选模块不会在实验中启动或采集。UFC、UGC、ZOS属于同一测量链，所有已选笼位须统一全选或全不选。行为识别控制轨迹相机，热红外控制热成像。")
         module_note.setObjectName("fieldLabel"); module_note.setWordWrap(True); module_layout.addWidget(module_note)
         self._measurement_checks = []
         self._measurement_status_labels = {}
@@ -1184,6 +1205,13 @@ class ExperimentConfigPage(QWidget):
         confirmed = bool(self._confirmed_serial_port())
         severity = {"unknown": 0, "unavailable": 1, "normal": 2, "warning": 3, "fault": 4}
         for module, label in self._measurement_status_labels.items():
+            values = self._channel_module_values.get(str(self._selected_channel), {})
+            if not bool(values.get(module, True)):
+                label.setText("自检：已禁用")
+                label.setProperty("moduleTone", "unknown")
+                label.style().unpolish(label)
+                label.style().polish(label)
+                continue
             camera_result = self._camera_mapping_self_check(module, self._selected_channel)
             if camera_result is not None:
                 state_text, state = camera_result

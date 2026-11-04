@@ -194,17 +194,17 @@ class StartupCompletionContractTests(unittest.TestCase):
         self.assertIn("_gas_path_timeout_timer.start", source)
         self.assertNotIn("force_entered", source)
 
-    def test_start_sends_both_baseline_camera_commands(self):
+    def test_start_sends_commands_only_to_enabled_camera_services(self):
         path = PROJECT_ROOT / "index" / "MainWindow_index.py"
         method = _class_method(path, "MainWindow_Index", "start_experiment")
         source = ast.get_source_segment(path.read_text(encoding="utf-8-sig"), method)
 
         self.assertIn("to='main_infrared_camera', title='start'", source)
         self.assertIn("to='main_deep_camera', title='start'", source)
-        self.assertIn("'infrared_enabled': infrared_enabled", source)
-        self.assertIn("'behavior_enabled': behavior_enabled", source)
-        self.assertNotIn("if infrared_enabled:", source)
-        self.assertNotIn("if behavior_enabled:", source)
+        self.assertIn("'infrared_enabled': True", source)
+        self.assertIn("'behavior_enabled': True", source)
+        self.assertIn("if infrared_enabled:", source)
+        self.assertIn("if behavior_enabled:", source)
 
     def test_calibration_messages_do_not_fake_startup_completion_percent(self):
         from index.MainWindow_index import MainWindow_Index

@@ -56,6 +56,11 @@ from public.util.cage_light_state_util import (
     force_save_cage_lights_off,
     save_cage_light_state,
 )
+from public.util.experiment_module_selection import (
+    channel_module_enabled,
+    enabled_cages_for_module,
+    gas_module_selection,
+)
 from public.util.custom_data_file_util import custom_data_file_util
 from public.util.number_util import number_util
 from public.util.string_util import String_util
@@ -781,27 +786,7 @@ def _channel_module_enabled(cage_number, data_type):
     if not module_key:
         return True
     setting = global_setting.get_setting("experiment_setting", None)
-    modules = getattr(setting, "channel_modules", None) if setting is not None else None
-    if not isinstance(modules, dict):
-        return True
-    candidates = [str(cage_number)]
-    try:
-        candidates.append(str(int(cage_number)))
-    except (TypeError, ValueError):
-        pass
-    values = None
-    for key in candidates:
-        if key in modules:
-            values = modules[key]
-            break
-    if values is None:
-        try:
-            values = modules.get(int(cage_number))
-        except (TypeError, ValueError):
-            values = None
-    if not isinstance(values, dict):
-        return True
-    return bool(values.get(module_key, True))
+    return channel_module_enabled(setting, cage_number, module_key)
 
 
 def _cage_control_allowed(cage_number, control):
@@ -3356,6 +3341,24 @@ def start():
     ufc_ugc_zos_thread = None
     ufc_ugc_zos = None
 
+    environment_only = _environment_module_only_enabled()
+    gas_selection = gas_module_selection(experiment_settings)
+    if not environment_only and not gas_selection["valid"]:
+        message = gas_selection["message"]
+        logger.error(f"气路模块配置无效：{message}")
+        _send_main_window_status("start_experiment_failed", message)
+        return
+    gas_enabled = bool(not environment_only and gas_selection["enabled"])
+    global_setting.set_setting("gas_path_enabled_for_experiment", gas_enabled)
+    startup_calibration_mode = str(
+        global_setting.get_setting("startup_calibration_mode", "none") or "none"
+    )
+    if not gas_enabled and startup_calibration_mode not in {"", "none"}:
+        message = "气路模块未启用，不能执行启动前气体校准"
+        logger.error(message)
+        _send_main_window_status("start_experiment_failed", message)
+        return
+
     # 实验开始时，按实际启用的笼子逐个关闭食槽门驱动电流。
     _queue_food_trough_current_off_commands(
         cages=gids,
@@ -3365,9 +3368,9 @@ def start():
     try:
         # ufc_ugc_zos = UFC_UGC_ZOS_index()
         # ufc_ugc_zos.auto_btn_handle()
-        if _environment_module_only_enabled():
+        if not gas_enabled:
             logger.warning(
-                "Environment-only mode enabled: skip UFC/UGC/ZOS gas path startup"
+                "Gas path disabled by experiment module selection: skip UFC/UGC/ZOS startup"
             )
         else:
             ufc_ugc_zos_thread= UFC_UGC_ZOS_index()
@@ -3411,21 +3414,30 @@ def start():
     if lighting_schedule_thread is not None and lighting_schedule_thread.isRunning():
         lighting_schedule_thread.stop()
         lighting_schedule_thread.deleteLater()
-    lighting_schedule_thread = LightingScheduleThread(schedule, gids, send_thread)
-    lighting_schedule_thread.start()
+    lighting_cages = enabled_cages_for_module(experiment_settings, "environment")
+    if lighting_cages:
+        lighting_schedule_thread = LightingScheduleThread(
+            schedule,
+            lighting_cages,
+            send_thread,
+        )
+        lighting_schedule_thread.start()
+    else:
+        lighting_schedule_thread = None
+        logger.info("环境模块未启用：跳过灯光定时调度")
 
-    if _environment_module_only_enabled():
+    if not gas_enabled:
         _send_main_window_status(
             "gap_system_running_state",
-            "仅环境模块模式：UFC、UGC、ZOS及其他笼内模块已禁用",
+            "UFC、UGC、ZOS未启用：已跳过整套气路启动",
         )
 
     # 将实验配置存储到该实验的文件夹中去
     copy_experiment_setting_file()
-    if _environment_module_only_enabled():
+    if not gas_enabled:
         _send_main_window_status(
             "close_start_experiment_dialog",
-            "环境模块采集已启动",
+            "已启用的数据采集模块已启动",
         )
 def start_zero_calibration():
     if _environment_module_only_enabled():
