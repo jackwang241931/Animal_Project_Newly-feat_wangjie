@@ -1556,6 +1556,19 @@ class MainWindow_Index(ThemedWindow):
         if isinstance(response, dict):
             phase = str(response.get("phase") or "")
             message = str(response.get("message") or "").strip()
+            kind = str(response.get("kind") or "")
+            if kind == "air_o2_co2" and phase in {
+                "finished", "stopped", "failed", "rejected"
+            }:
+                if phase == "finished" and response.get("success", False):
+                    detail_status = "Air空气校准完成"
+                elif phase == "stopped" and response.get("success", False):
+                    detail_status = "Air空气校准已停止"
+                else:
+                    detail_status = "Air空气校准失败"
+                self.calibration_detail_status_text = detail_status
+                if self.calibration_details_windows is not None:
+                    self.calibration_details_windows.updateStatus(detail_status)
             if phase in {"finished", "failed", "rejected"} and message:
                 self.cache_calibration_detail_log(message, has_time=True)
 

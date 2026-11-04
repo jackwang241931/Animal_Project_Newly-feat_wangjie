@@ -161,16 +161,22 @@ class CalibrationHandler:
         sht_temp=None,
         sht_rh=None,
     ):
-        del o2_partial, zos_temp
+        del o2_partial
         channel = str(channel).upper()
         if channel not in self.channels:
             return False
 
+        # The ZOS response exposes the humidity-sensor readings as
+        # ``ZOS温度2/湿度``.  Some firmware/parser versions additionally expose
+        # explicit SHT fields, while others do not.  Use the explicit SHT
+        # readings when present and otherwise follow the normal experiment
+        # compensation path, which uses ZOS温度2/湿度 as the SHT inputs.
+        temperature = sht_temp if sht_temp is not None else zos_temp
         relative_humidity = sht_rh if sht_rh is not None else zos_rh
         dry_o2 = calc_dry_o2(
             o2_percent,
             gas_pressure,
-            sht_temp,
+            temperature,
             relative_humidity,
         )
         if not math.isfinite(dry_o2):
