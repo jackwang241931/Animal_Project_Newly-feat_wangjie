@@ -50,6 +50,11 @@ class Startup_Air_Calibration:
         self.o2_failure_reason = None
         self._pending_full_o2_handler = None
         self._external_stop_checker = None
+        self.calibration_outcome = {
+            "status": "not_started",
+            "display_status": "Air空气校准未开始",
+            "message": "",
+        }
 
     def update(self):
         self.send_thread.update_status_main_signal_gui_update = self.update_status_main_signal_gui_update
@@ -112,6 +117,16 @@ class Startup_Air_Calibration:
                 {"type": state_type, "value": value},
                 title=self.title,
             )
+
+    def _set_calibration_outcome(self, status, display_status, message):
+        self.calibration_outcome = {
+            "status": str(status),
+            "display_status": str(display_status),
+            "message": str(message),
+        }
+
+    def get_calibration_outcome(self):
+        return copy.deepcopy(self.calibration_outcome)
 
     def push_calibration_values_to_ui(self, oxygen_value=None, carbon_value=None, oxygen_pressure_value=None):
         if oxygen_value is not None:
@@ -428,6 +443,11 @@ class Startup_Air_Calibration:
             reject("未选择串口，无法执行运行前 Air 空气校准")
             return
 
+        self._set_calibration_outcome(
+            "running",
+            "Air空气校准进行中",
+            "Air空气校准尚未完成",
+        )
         start_time_text = time_util.get_format_from_time(time.time())
         self._send_state("set_start_air_calibration_time", start_time_text)
         self._send_text(f"{self.name}开始：发送 ZOS Air 校准开始指令")
@@ -629,44 +649,94 @@ class Startup_Air_Calibration:
                     co2_calibrated or co2_failed_nonblocking
                 ):
                     if o2_failed_nonblocking and co2_failed_nonblocking:
-                        self._send_text(
-                            f"{self.name}采集完成：O2 校准失败，CO2 也未更新系数；"
-                            "保留原有 O2 / CO2 配置，继续后续流程"
+                        outcome_message = (
+                            f"{self.name}采集结束：O2 校准失败，CO2 也未更新系数；"
+                            "保留原有 O2 / CO2 配置"
                         )
+                        self._set_calibration_outcome(
+                            "o2_co2_failed",
+                            "Air空气校准结束（O2/CO2失败）",
+                            outcome_message,
+                        )
+                        self._send_text(outcome_message)
                     elif o2_failed_nonblocking:
-                        self._send_text(
-                            f"{self.name}采集完成：O2 校准失败，CO2 校准成功；"
-                            "保留原有 O2 配置，继续后续流程"
+                        outcome_message = (
+                            f"{self.name}采集结束：O2 校准失败，CO2 校准成功；"
+                            "保留原有 O2 配置"
                         )
+                        self._set_calibration_outcome(
+                            "o2_failed",
+                            "Air空气校准结束（O2失败）",
+                            outcome_message,
+                        )
+                        self._send_text(outcome_message)
                     elif o2_pending_air and co2_fit_failed_after_collection:
-                        self._send_text(
-                            f"{self.name}采集完成：O2 两点参数已生成，状态为PENDING_AIR；"
+                        outcome_message = (
+                            f"{self.name}采集结束：O2 两点参数已生成，状态为PENDING_AIR；"
                             f"CO2 已收满 {target_points} 点但拟合失败。"
                             "O2 新参数需再执行一次独立Air空气复核后启用"
                         )
+                        self._set_calibration_outcome(
+                            "pending_air_co2_failed",
+                            "Air空气校准待复核（CO2失败）",
+                            outcome_message,
+                        )
+                        self._send_text(outcome_message)
                     elif o2_pending_air and co2_failed_nonblocking:
-                        self._send_text(
-                            f"{self.name}采集完成：O2 两点参数已生成，状态为PENDING_AIR；"
+                        outcome_message = (
+                            f"{self.name}采集结束：O2 两点参数已生成，状态为PENDING_AIR；"
                             "CO2 处理异常且未更新。"
                             "O2 新参数需再执行一次独立Air空气复核后启用"
                         )
+                        self._set_calibration_outcome(
+                            "pending_air_co2_failed",
+                            "Air空气校准待复核（CO2失败）",
+                            outcome_message,
+                        )
+                        self._send_text(outcome_message)
                     elif o2_pending_air:
-                        self._send_text(
-                            f"{self.name}采集完成：O2 两点参数已生成，状态为PENDING_AIR，"
+                        outcome_message = (
+                            f"{self.name}采集结束：O2 两点参数已生成，状态为PENDING_AIR，"
                             "CO2 校准成功；请再执行一次独立Air空气复核以启用O2新参数"
                         )
+                        self._set_calibration_outcome(
+                            "pending_air",
+                            "Air空气校准待独立Air复核",
+                            outcome_message,
+                        )
+                        self._send_text(outcome_message)
                     elif co2_fit_failed_after_collection:
-                        self._send_text(
-                            f"{self.name}采集完成：O2 校准成功，CO2 已收满 {target_points} 点但拟合失败；"
+                        outcome_message = (
+                            f"{self.name}采集结束：O2 校准成功，CO2 已收满 {target_points} 点但拟合失败；"
                             "本轮不更新 CO2 配置，继续后续流程"
                         )
+                        self._set_calibration_outcome(
+                            "co2_failed",
+                            "Air空气校准结束（CO2失败）",
+                            outcome_message,
+                        )
+                        self._send_text(outcome_message)
                     elif co2_failed_nonblocking:
-                        self._send_text(
-                            f"{self.name}采集完成：O2 校准成功，CO2 处理异常且未完成 {target_points} 点；"
+                        outcome_message = (
+                            f"{self.name}采集结束：O2 校准成功，CO2 处理异常且未完成 {target_points} 点；"
                             "本轮不更新 CO2 配置，继续后续流程"
                         )
+                        self._set_calibration_outcome(
+                            "co2_failed",
+                            "Air空气校准结束（CO2失败）",
+                            outcome_message,
+                        )
+                        self._send_text(outcome_message)
                     else:
-                        self._send_text(f"{self.name}判定完成，O2 / CO2 校准配置已输出")
+                        outcome_message = (
+                            f"{self.name}判定完成，O2 / CO2 校准配置已输出"
+                        )
+                        self._set_calibration_outcome(
+                            "passed",
+                            "Air空气校准完成",
+                            outcome_message,
+                        )
+                        self._send_text(outcome_message)
                     resolve()
                     return
 
@@ -713,6 +783,12 @@ class Startup_Air_Calibration:
 
     def _finish_stop(self, resolve):
         stop_time_text = time_util.get_format_from_time(time.time())
-        self._send_state("set_stop_air_calibration_time", stop_time_text)
+        self._send_state(
+            "set_stop_air_calibration_time",
+            {
+                "time": stop_time_text,
+                "outcome": self.get_calibration_outcome(),
+            },
+        )
         self._external_stop_checker = None
         resolve()

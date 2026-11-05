@@ -1047,6 +1047,12 @@ class ExperimentControlPage(_BaseWorkflowPage):
         kind = str(payload.get("kind") or self._standalone_calibration_kind or "")
         label = str(payload.get("label") or kind or "独立校准")
         message = str(payload.get("message") or "")
+        calibration_outcome = payload.get("calibration_outcome") or {}
+        outcome_status = str(calibration_outcome.get("status") or "")
+        outcome_display = str(
+            calibration_outcome.get("display_status") or ""
+        )
+        outcome_message = str(calibration_outcome.get("message") or "")
 
         if phase == "accepted" and payload.get("success", False):
             global_setting.set_setting("standalone_calibration_ui_active", True)
@@ -1075,7 +1081,19 @@ class ExperimentControlPage(_BaseWorkflowPage):
             self._standalone_calibration_stopping = False
             self._active_calibrations.clear()
             self._stopping_calibrations.clear()
-            if phase == "finished" and payload.get("success", False):
+            if phase == "finished" and outcome_status.startswith("pending_air"):
+                status_text = outcome_display or "Air空气校准待独立Air复核"
+                self.calibration_status.setText(status_text)
+                self.set_operation_progress(100, status_text)
+                message = outcome_message or message
+            elif phase == "finished" and outcome_status in {
+                "o2_failed", "co2_failed", "o2_co2_failed"
+            }:
+                status_text = outcome_display or "Air空气校准结束（存在失败项）"
+                self.calibration_status.setText(status_text)
+                self.set_operation_progress(100, status_text)
+                message = outcome_message or message
+            elif phase == "finished" and payload.get("success", False):
                 self.calibration_status.setText(f"{label}完成")
                 self.set_operation_progress(100, f"{label}完成")
             elif phase == "stopped" and payload.get("success", False):
@@ -1228,7 +1246,7 @@ class ExperimentControlPage(_BaseWorkflowPage):
             if channel == "air":
                 self.calibration_status.setText("空气校准中")
                 self.operation_hint.setText("正在执行单独的空气校准流程，请等待完成。")
-        elif phase in {"finished", "failed"}:
+        elif phase in {"finished", "failed", "pending"}:
             self._active_calibrations.discard(channel)
             self._stopping_calibrations.discard(channel)
             if not self._active_calibrations:
@@ -1237,9 +1255,16 @@ class ExperimentControlPage(_BaseWorkflowPage):
                 if phase == "finished":
                     self.calibration_status.setText("空气校准完成")
                     self.operation_hint.setText("单独空气校准流程已完成。")
+                elif phase == "pending":
+                    self.calibration_status.setText("空气校准待独立Air复核")
+                    self.operation_hint.setText(
+                        "O2新参数尚未启用，请再执行一次独立Air空气复核。"
+                    )
                 else:
-                    self.calibration_status.setText("空气校准启动失败")
-                    self.operation_hint.setText("空气校准未能启动，请查看运行日志中的具体原因。")
+                    self.calibration_status.setText("空气校准结束（存在失败项）")
+                    self.operation_hint.setText(
+                        "本次校准存在失败项，请查看运行日志中的具体原因。"
+                    )
         self._update_calibration_buttons()
 
     def _start_air_calibration(self) -> None:

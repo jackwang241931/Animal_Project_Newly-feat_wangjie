@@ -1065,11 +1065,21 @@ class UFC_UGC_ZOS_index(MyQThread):
                 self._standalone_shutdown_in_progress = False
                 self._standalone_user_stop_requested = False
                 self._standalone_air_calibration_started = False
+            calibration_outcome = None
+            if kind == "air_o2_co2":
+                get_outcome = getattr(
+                    self.Startup_air_calibration_obj,
+                    "get_calibration_outcome",
+                    None,
+                )
+                if callable(get_outcome):
+                    calibration_outcome = get_outcome()
             self._publish_standalone_calibration_result(
                 success=success,
                 kind=kind,
                 message=message,
                 phase=phase,
+                calibration_outcome=calibration_outcome,
             )
 
         def stop_gas_paths():
@@ -1104,7 +1114,8 @@ class UFC_UGC_ZOS_index(MyQThread):
             stop_gas_paths()
 
     def _publish_standalone_calibration_result(
-            self, success, kind, message, phase=None
+            self, success, kind, message, phase=None,
+            calibration_outcome=None,
     ):
         queue = global_setting.get_setting("queue", None)
         if queue:
@@ -1118,6 +1129,7 @@ class UFC_UGC_ZOS_index(MyQThread):
                     "kind": kind,
                     "label": self.STANDALONE_CALIBRATION_LABELS.get(kind, kind),
                     "message": str(message),
+                    "calibration_outcome": calibration_outcome or {},
                 },
                 time=time_util.get_format_from_time(time.time()),
             ))

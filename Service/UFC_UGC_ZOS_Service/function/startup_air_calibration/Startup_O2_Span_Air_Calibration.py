@@ -205,10 +205,16 @@ class Startup_O2_Span_Air_Calibration:
         value = "FF00" if enabled else "0000"
         self._send_command(slave_id, "5", f"{address:04X}{value}", description)
 
-    def _emit_calibration_time(self, event_type):
+    def _emit_calibration_time(self, event_type, outcome=None):
         if self.update_status_main_signal_gui_update is not None:
+            event_time = time_util.get_format_from_time(time.time())
+            value = (
+                {"time": event_time, "outcome": outcome}
+                if outcome is not None
+                else event_time
+            )
             self.update_status_main_signal_gui_update.send(
-                {"type": event_type, "value": time_util.get_format_from_time(time.time())},
+                {"type": event_type, "value": value},
                 title=self.title,
             )
 
@@ -505,15 +511,26 @@ class Startup_O2_Span_Air_Calibration:
             if not status.get("completed"):
                 raise RuntimeError("完整Air空气校准结束，但O2校准配置未完成")
             reload_o2_compensation_config()
-            if status.get("validation_status") == "PENDING_AIR":
+            if status.get("failed"):
+                self._send_text(
+                    "O2 Span+Air流程结束，但O2校准失败；"
+                    f"原因：{status.get('failure_reason') or '未知'}；"
+                    "不得显示为完整校准完成"
+                )
+            elif status.get("validation_status") == "PENDING_AIR":
                 self._send_text(
                     "O2 Span+Air两点参数已生成，状态为PENDING_AIR；"
                     "请再执行一次独立Air空气复核后启用新参数"
                 )
-            else:
+            elif status.get("calibrated"):
                 self._send_text(
                     f"O2 Span+完整Air空气校准完成，干基空气锁定值 "
                     f"{status.get('air_lock')}%"
+                )
+            else:
+                self._send_text(
+                    "O2 Span+Air流程结束，但O2最终状态未确认；"
+                    "不得显示为完整校准完成"
                 )
         except Exception as exc:
             failure = exc
@@ -595,16 +612,53 @@ class Startup_O2_Span_Air_Calibration:
             if not status.get("completed"):
                 raise RuntimeError("O2校准未完成，配置文件未更新")
             reload_o2_compensation_config()
-            self._emit_calibration_time("set_stop_air_calibration_time")
+            if status.get("failed"):
+                outcome = {
+                    "status": "o2_failed",
+                    "display_status": "Air空气校准结束（O2失败）",
+                    "message": (
+                        "O2 Span+Air流程结束，但O2校准失败："
+                        f"{status.get('failure_reason') or '未知'}"
+                    ),
+                }
+            elif status.get("validation_status") == "PENDING_AIR":
+                outcome = {
+                    "status": "pending_air",
+                    "display_status": "Air空气校准待独立Air复核",
+                    "message": (
+                        "O2 Span+Air两点参数已生成，状态为PENDING_AIR；"
+                        "请再执行一次独立Air空气复核后启用新参数"
+                    ),
+                }
+            elif status.get("calibrated"):
+                outcome = {
+                    "status": "passed",
+                    "display_status": "Air空气校准完成",
+                    "message": "O2 Span+Air校准已通过",
+                }
+            else:
+                outcome = {
+                    "status": "o2_failed",
+                    "display_status": "Air空气校准结束（O2状态未确认）",
+                    "message": "O2 Span+Air流程结束，但O2最终状态未确认",
+                }
+            self._emit_calibration_time(
+                "set_stop_air_calibration_time",
+                outcome=outcome,
+            )
             if status.get("validation_status") == "PENDING_AIR":
                 self._send_text(
                     "Span+空气两点参数已生成，状态为PENDING_AIR；"
                     "请再执行一次独立Air空气复核后启用新参数"
                 )
-            else:
+            elif status.get("calibrated"):
                 self._send_text(
                     f"Span+空气校准完成，干基空气锁定值 "
                     f"{status.get('air_lock')}%"
+                )
+            else:
+                self._send_text(
+                    "Span+空气流程结束，但O2校准失败或状态未确认"
                 )
         except Exception as exc:
             failure = exc

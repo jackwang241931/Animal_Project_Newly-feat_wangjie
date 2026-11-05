@@ -491,11 +491,30 @@ class read_queue_data_Thread(MyQThread):
                             })
                     case 'set_stop_air_calibration_time':
                         if self.window is not None:
-                            self.operation_progress_signal.emit(100, "空气校准完成")
-                            self.calibration_event_signal.emit("air_finished")
+                            payload = message.data if isinstance(message.data, dict) else {}
+                            event_time = payload.get("time", message.data)
+                            outcome = payload.get("outcome", {})
+                            outcome_status = str(outcome.get("status") or "passed")
+                            status_text = str(
+                                outcome.get("display_status") or "Air空气校准完成"
+                            )
+                            result_message = str(outcome.get("message") or "")
+                            if outcome_status.startswith("pending_air"):
+                                event_name = "air_pending"
+                            elif outcome_status in {
+                                "o2_failed", "co2_failed", "o2_co2_failed"
+                            }:
+                                event_name = "air_failed"
+                            else:
+                                event_name = "air_finished"
+                            self.operation_progress_signal.emit(100, status_text)
+                            self.calibration_event_signal.emit(event_name)
                             self.calibration_detail_update_signal.emit({
                                 "kind": "air_end",
-                                "time": message.data,
+                                "time": event_time,
+                                "status_text": status_text,
+                                "outcome_status": outcome_status,
+                                "message": result_message,
                             })
                     case 'runtime_air_calibration_response':
                         if self.window is not None:
@@ -1539,7 +1558,7 @@ class MainWindow_Index(ThemedWindow):
         if channel in {"zero", "span", "air"}:
             if phase == "started":
                 self._active_calibration_channels.add(channel)
-            elif phase in {"finished", "failed"}:
+            elif phase in {"finished", "failed", "pending"}:
                 self._active_calibration_channels.discard(channel)
         page = getattr(self, "experiment_control_page", None)
         if page is not None and self.workflow_run_state not in {
@@ -1557,11 +1576,28 @@ class MainWindow_Index(ThemedWindow):
             phase = str(response.get("phase") or "")
             message = str(response.get("message") or "").strip()
             kind = str(response.get("kind") or "")
+            outcome = response.get("calibration_outcome") or {}
+            outcome_status = str(outcome.get("status") or "")
             if kind == "air_o2_co2" and phase in {
                 "finished", "stopped", "failed", "rejected"
             }:
-                if phase == "finished" and response.get("success", False):
-                    detail_status = "Air空气校准完成"
+                if phase == "finished" and outcome_status.startswith("pending_air"):
+                    detail_status = str(
+                        outcome.get("display_status")
+                        or "Air空气校准待独立Air复核"
+                    )
+                elif phase == "finished" and outcome_status in {
+                    "o2_failed", "co2_failed", "o2_co2_failed"
+                }:
+                    detail_status = str(
+                        outcome.get("display_status")
+                        or "Air空气校准结束（校准失败）"
+                    )
+                elif phase == "finished" and response.get("success", False):
+                    detail_status = str(
+                        outcome.get("display_status")
+                        or "Air空气校准完成"
+                    )
                 elif phase == "stopped" and response.get("success", False):
                     detail_status = "Air空气校准已停止"
                 else:
@@ -1678,14 +1714,24 @@ class MainWindow_Index(ThemedWindow):
             return
         if kind == "air_end":
             self.calibration_detail_zero_end_time = event_time
-            self.calibration_detail_status_text = "Air空气校准完成"
+            status_text = str(
+                update.get("status_text") or "Air空气校准完成"
+            )
+            result_message = str(update.get("message") or "").strip()
+            self.calibration_detail_status_text = status_text
             if self.calibration_details_windows is not None:
                 self.calibration_details_windows.updateAirEndTime(
-                    event_time, event_time=event_time
+                    event_time,
+                    event_time=event_time,
+                    log_event=status_text == "Air空气校准完成",
                 )
                 self.calibration_details_windows.updateStatus(
-                    "Air空气校准完成", event_time=event_time
+                    status_text, event_time=event_time
                 )
+                if result_message:
+                    self.calibration_details_windows.addLog(
+                        result_message, "CALIBRATION"
+                    )
             return
         if kind != "values":
             return
