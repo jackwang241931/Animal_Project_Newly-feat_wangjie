@@ -12,6 +12,7 @@ from Service.UFC_UGC_ZOS_Service.function.calibration_channels import (
 from public.config_class.global_setting import global_setting
 from public.entity.enum.Public_Enum import GapSystem_Running_Type
 from public.function.promise.AsyPromise import AsyPromise
+from public.util.calibration_config_backup import snapshot_calibration_config
 from public.util.number_util import number_util
 from public.util.time_util import time_util
 from Service.UFC_UGC_ZOS_Service.function.o2_compensation.host_wet_o2_guard import (
@@ -288,6 +289,32 @@ class Startup_Air_Calibration:
         other_channels = [channel for channel in channels if int(channel) != 8]
         return reference_channels + other_channels
 
+    def _backup_calibration_config(self, handler, module, snapshot_label):
+        """Best-effort workflow-level snapshot; calibration must not depend on it."""
+        config_path = getattr(handler, "config_path", None)
+        if not config_path:
+            logger.warning(
+                f"{self.name}: {module.upper()}校准处理器未提供config_path，跳过配置备份"
+            )
+            return None
+        try:
+            backup_path = snapshot_calibration_config(
+                config_path,
+                "air",
+                module,
+                snapshot_label,
+            )
+            if backup_path is not None:
+                logger.info(
+                    f"{self.name}: {module.upper()} Air配置快照已保存: {backup_path}"
+                )
+            return backup_path
+        except Exception:
+            logger.exception(
+                f"{self.name}: {module.upper()} Air配置快照保存失败，不中断校准"
+            )
+            return None
+
     def _build_calibration_handlers(
         self,
         sample_interval=None,
@@ -352,6 +379,16 @@ class Startup_Air_Calibration:
             self.o2_calibration_handler.start_air_touchup()
         self.o2_calibration_filter = WetOxygenReferenceFilter()
         self.co2_calibration_handler.start_new_calibration()
+        self._backup_calibration_config(
+            self.o2_calibration_handler,
+            "o2",
+            "before_overwrite",
+        )
+        self._backup_calibration_config(
+            self.co2_calibration_handler,
+            "co2",
+            "before_overwrite",
+        )
         self.previous_valid_snapshots = {}
         self.calculation_started_logged = False
         self.o2_failure_notified = False
@@ -648,6 +685,24 @@ class Startup_Air_Calibration:
                 if (o2_calibrated or o2_pending_air or o2_failed_nonblocking) and (
                     co2_calibrated or co2_failed_nonblocking
                 ):
+                    if o2_calibrated:
+                        self._backup_calibration_config(
+                            self.o2_calibration_handler,
+                            "o2",
+                            "result_success",
+                        )
+                    elif o2_pending_air:
+                        self._backup_calibration_config(
+                            self.o2_calibration_handler,
+                            "o2",
+                            "result_pending_air",
+                        )
+                    if co2_calibrated:
+                        self._backup_calibration_config(
+                            self.co2_calibration_handler,
+                            "co2",
+                            "result_success",
+                        )
                     if o2_failed_nonblocking and co2_failed_nonblocking:
                         outcome_message = (
                             f"{self.name}采集结束：O2 校准失败，CO2 也未更新系数；"

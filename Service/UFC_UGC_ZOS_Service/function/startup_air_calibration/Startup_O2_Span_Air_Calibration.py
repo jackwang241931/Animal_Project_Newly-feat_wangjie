@@ -15,6 +15,7 @@ from Service.UFC_UGC_ZOS_Service.function.o2_compensation import (
 )
 from public.config_class.global_setting import global_setting
 from public.entity.enum.Public_Enum import GapSystem_Running_Type
+from public.util.calibration_config_backup import snapshot_calibration_config
 from public.util.number_util import number_util
 from public.util.time_util import time_util
 
@@ -335,6 +336,26 @@ class Startup_O2_Span_Air_Calibration:
             self._running = False
         self._finished_event.set()
 
+    def _backup_o2_config(self, handler, calibration_type, snapshot_label):
+        """Create a best-effort O2 snapshot outside the calibration handler."""
+        config_path = getattr(handler, "config_path", None)
+        if not config_path:
+            logger.warning(f"{self.name}: O2校准处理器未提供config_path，跳过配置备份")
+            return None
+        try:
+            backup_path = snapshot_calibration_config(
+                config_path,
+                calibration_type,
+                "o2",
+                snapshot_label,
+            )
+            if backup_path is not None:
+                logger.info(f"{self.name}: O2配置快照已保存: {backup_path}")
+            return backup_path
+        except Exception:
+            logger.exception(f"{self.name}: O2配置快照保存失败，不中断校准")
+            return None
+
     def abort_pending_calibration(self):
         """Release an unfinished Span→Air calibration after a downstream failure."""
         self._stop_event.set()
@@ -365,7 +386,13 @@ class Startup_O2_Span_Air_Calibration:
         def finish_span(handler):
             failure = None
             try:
+                self._backup_o2_config(handler, "span", "before_overwrite")
                 handler.finish_span_only()
+                self._backup_o2_config(
+                    handler,
+                    "span",
+                    "result_success_pending_air",
+                )
                 reload_o2_compensation_config()
                 self._send_text(
                     "O2 Span独立校准采样完成，状态为PENDING_AIR；"
@@ -581,6 +608,11 @@ class Startup_O2_Span_Air_Calibration:
                 target_points=target_points,
                 channels=handler_channels,
             )
+            self._backup_o2_config(
+                self._handler,
+                "air",
+                "before_overwrite",
+            )
 
             global_setting.set_setting("is_calibrating", True)
             global_setting.set_setting("current_calibration_type", self.name)
@@ -622,6 +654,11 @@ class Startup_O2_Span_Air_Calibration:
                     ),
                 }
             elif status.get("validation_status") == "PENDING_AIR":
+                self._backup_o2_config(
+                    self._handler,
+                    "air",
+                    "result_pending_air",
+                )
                 outcome = {
                     "status": "pending_air",
                     "display_status": "Air空气校准待独立Air复核",
@@ -631,6 +668,11 @@ class Startup_O2_Span_Air_Calibration:
                     ),
                 }
             elif status.get("calibrated"):
+                self._backup_o2_config(
+                    self._handler,
+                    "air",
+                    "result_success",
+                )
                 outcome = {
                     "status": "passed",
                     "display_status": "Air空气校准完成",

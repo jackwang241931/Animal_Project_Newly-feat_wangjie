@@ -15,6 +15,7 @@ from Service.UFC_UGC_ZOS_Service.function.co2_compensation.co2_calibration_handl
 from public.config_class.global_setting import global_setting
 from public.entity.enum.Public_Enum import GapSystem_Running_Type
 from public.function.promise.AsyPromise import AsyPromise
+from public.util.calibration_config_backup import snapshot_calibration_config
 from public.util.number_util import number_util
 from public.util.time_util import time_util
 
@@ -147,6 +148,26 @@ class Startup_CO2_Air_Calibration:
         )
         self.calibration_handler.start_new_calibration()
 
+    def _backup_co2_config(self, snapshot_label):
+        """Create a best-effort CO2 Air snapshot outside the handler."""
+        config_path = getattr(self.calibration_handler, "config_path", None)
+        if not config_path:
+            logger.warning(f"{self.name}: CO2校准处理器未提供config_path，跳过配置备份")
+            return None
+        try:
+            backup_path = snapshot_calibration_config(
+                config_path,
+                "air",
+                "co2",
+                snapshot_label,
+            )
+            if backup_path is not None:
+                logger.info(f"{self.name}: CO2 Air配置快照已保存: {backup_path}")
+            return backup_path
+        except Exception:
+            logger.exception(f"{self.name}: CO2 Air配置快照保存失败，不中断校准")
+            return None
+
     def _read_ugc_channel_snapshot(self, channel):
         port = self._get_port()
         self.send_message = {
@@ -246,6 +267,7 @@ class Startup_CO2_Air_Calibration:
 
         try:
             self._build_calibration_handler(active_channels)
+            self._backup_co2_config("before_overwrite")
         except Exception as e:
             reject(str(e))
             return
@@ -307,6 +329,7 @@ class Startup_CO2_Air_Calibration:
                     finished = False
 
                 if finished:
+                    self._backup_co2_config("result_success")
                     self._send_text(f"{self.name}判定完成，CO2 拟合系数已输出")
                     resolve()
                     return
