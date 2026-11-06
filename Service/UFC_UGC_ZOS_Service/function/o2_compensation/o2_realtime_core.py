@@ -23,13 +23,11 @@ _CALIBRATION_HANDLER = None
 _MODEL_SLOPE = 1.042868
 _MODEL_INTERCEPT = 0.008752
 _MODEL_WEIGHT = 0.60
-_ZERO_END = 0.001
-_ZERO_FULL = 0.010
 _DCO2_MAX = 0.40
 
 
 def get_default_config_path() -> Path:
-    """Return the project-level v6 oxygen calibration configuration."""
+    """Return the project-level v5 oxygen calibration configuration."""
     return Path(__file__).resolve().parents[4] / "config" / "calib_config.json"
 
 
@@ -72,19 +70,8 @@ def calc_dry_o2(moist_o2, gas_pressure, temp_value, rh_value):
 
 
 def _model_do2(delta_co2_pct):
-    delta_co2 = float(delta_co2_pct)
-    if delta_co2 <= _ZERO_END:
-        return 0.0
-    if delta_co2 >= _ZERO_FULL:
-        return _MODEL_SLOPE * delta_co2 + _MODEL_INTERCEPT
-
-    interpolation = (delta_co2 - _ZERO_END) / (_ZERO_FULL - _ZERO_END)
-    width = _ZERO_FULL - _ZERO_END
-    upper_value = _MODEL_SLOPE * _ZERO_FULL + _MODEL_INTERCEPT
-    return (
-        (-2 * interpolation**3 + 3 * interpolation**2) * upper_value
-        + (interpolation**3 - interpolation**2) * width * _MODEL_SLOPE
-    )
+    """Supplier V5 direct Delta-CO2 to Delta-O2 model."""
+    return _MODEL_SLOPE * float(delta_co2_pct) + _MODEL_INTERCEPT
 
 
 class _ReferenceFilter:
@@ -160,16 +147,18 @@ class RealtimeO2Compensator:
 
                 with self.config_path.open(encoding="utf-8") as stream:
                     config = json.load(stream)
-                if str(config.get("version")) != "6.0":
-                    raise ValueError("requires v6 config")
+                if str(config.get("version")) != "5.0":
+                    raise ValueError("requires v5 config")
                 if set(config["channels"]) != set(VALID_CHANNELS):
                     raise ValueError("requires nine channels")
 
                 air_o2 = float(config["air_o2_pct"])
-                lower = float(config["air_valid_min_pct"])
-                upper = float(config["air_valid_max_pct"])
-                if not lower <= air_o2 <= upper:
-                    raise ValueError("locked air out of range")
+                fixed_air = float(config.get("air_fixed_pct", AIR_NOMINAL))
+                if abs(air_o2 - AIR_NOMINAL) > 1e-9 or abs(fixed_air - AIR_NOMINAL) > 1e-9:
+                    raise ValueError("v5 air reference must be fixed at 20.93%")
+                span_o2 = float(config["span_o2_pct"])
+                if not 15.0 <= span_o2 < air_o2:
+                    raise ValueError("invalid Span gas value")
 
                 for channel in VALID_CHANNELS:
                     channel_config = config["channels"][channel]
@@ -178,28 +167,18 @@ class RealtimeO2Compensator:
                     if not (0.5 <= gain <= 1.5 and 10.0 <= air_dry <= 25.0):
                         raise ValueError(f"bad calibration {channel}")
 
-                common_mode = config.get("common_mode", {})
-                if (
-                    common_mode.get("enabled", False)
-                    and common_mode.get("validation_status")
-                    != "independently_validated"
-                ):
-                    raise ValueError(
-                        "common-mode disabled until independently validated"
-                    )
-
                 self.cfg = config
                 self._config_mtime_ns = config_mtime_ns
                 self._reference_filter = _ReferenceFilter()
                 logger.info(
-                    "O2 v6 config reloaded: path={}, air_o2_pct={:.4f}",
+                    "O2 v5 config reloaded: path={}, fixed_air_o2_pct={:.4f}",
                     self.config_path,
                     air_o2,
                 )
                 return True
             except Exception as exc:
                 logger.error(
-                    "O2 v6 config reload refused: path={}, error={}",
+                    "O2 v5 config reload refused: path={}, error={}",
                     self.config_path,
                     exc,
                 )
@@ -224,9 +203,6 @@ class RealtimeO2Compensator:
             self.ensure_latest()
             if channel not in VALID_CHANNELS or self.cfg is None:
                 return None
-            if self.cfg.get("pending_span_validation", False):
-                return None
-
             dry_o2 = calc_dry_o2(
                 o2_percent,
                 gas_pressure,
@@ -260,24 +236,20 @@ class RealtimeO2Compensator:
                 return air_o2
 
             filtered_reference = self._reference_filter.filtered
-            common_mode = self.cfg.get("common_mode", {})
-            common_mode_gain = (
-                float(common_mode.get("coefficients", {}).get(channel, 0.0))
-                if common_mode.get("enabled", False)
-                else 0.0
-            )
             reference_drift = (
                 filtered_reference - air_o2
                 if filtered_reference is not None
                 else 0.0
             )
-            measured_o2 = independent_o2 - common_mode_gain * reference_drift
+            # V5 keeps the measured channel physically independent.  REF is
+            # still observed for health diagnostics, but is not subtracted as
+            # an unvalidated common-mode correction.
+            measured_o2 = independent_o2
             measured_do2 = air_o2 - measured_o2
             diagnostics.update(
                 ref_filtered_pct=filtered_reference,
                 ref_drift_pct=reference_drift,
-                common_mode_gain=common_mode_gain,
-                common_mode_o2_pct=measured_o2,
+                physical_o2_pct=measured_o2,
                 do2_measured_pct=measured_do2,
             )
 

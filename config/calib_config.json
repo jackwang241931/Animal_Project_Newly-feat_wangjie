@@ -1,5 +1,5 @@
 {
-  "version": "6.0",
+  "version": "5.0",
   "air_o2_pct": 20.93,
   "span_o2_pct": 20.45,
   "calibration_method": "historical_provisional",
@@ -61,25 +61,12 @@
       "basis": "historical_provisional"
     }
   },
-  "air_valid_min_pct": 20.86,
-  "air_valid_max_pct": 20.95,
-  "air_alignment_tolerance_pct": 0.08,
-  "air_stability_max_mad_pct": 0.018,
-  "air_calibrated": false,
-  "air_validation_status": "historical_provisional",
-  "pending_span_validation": false,
-  "common_mode": {
-    "enabled": false,
-    "coefficients": {
-      "M1": 0.0,
-      "M2": 0.0,
-      "M3": 0.0,
-      "M4": 0.0,
-      "M5": 0.0,
-      "M6": 0.0,
-      "M7": 0.0,
-      "M8": 0.0
-    },
-    "validation_status": "unverified"
-  }
+  "air_fixed_pct": 20.93,
+  "air_lock_mode": "fixed",
+  "air_stability_max_mad_pct": 0.02,
+  "span_air_pair_max_hours": 8,
+  "pair_gain_max_relative_change": 0.5,
+  "span_max_offset_change_pct": 0.6,
+  "air_max_anchor_shift_pct": 0.6,
+  "pending_span_pairs": {}
 }

@@ -676,6 +676,7 @@ class Startup_Air_Calibration:
                     o2_status.get("completed")
                     and o2_status.get("validation_status") == "PENDING_AIR"
                 )
+                o2_partial_success = bool(o2_status.get("partial_success"))
                 co2_calibrated = co2_status.get("calibrated", getattr(self.co2_calibration_handler, "calibrated", False))
                 o2_failed_nonblocking = bool(
                     o2_status.get("failed") or self.o2_failure_reason
@@ -685,7 +686,13 @@ class Startup_Air_Calibration:
                 if (o2_calibrated or o2_pending_air or o2_failed_nonblocking) and (
                     co2_calibrated or co2_failed_nonblocking
                 ):
-                    if o2_calibrated:
+                    if o2_partial_success:
+                        self._backup_calibration_config(
+                            self.o2_calibration_handler,
+                            "o2",
+                            "result_partial",
+                        )
+                    elif o2_calibrated:
                         self._backup_calibration_config(
                             self.o2_calibration_handler,
                             "o2",
@@ -757,6 +764,32 @@ class Startup_Air_Calibration:
                         self._set_calibration_outcome(
                             "pending_air",
                             "Air空气校准待独立Air复核",
+                            outcome_message,
+                        )
+                        self._send_text(outcome_message)
+                    elif o2_partial_success and co2_failed_nonblocking:
+                        outcome_message = (
+                            f"{self.name}采集结束：O2 仅部分通道校准成功，"
+                            f"成功={o2_status.get('passed_channels', [])}，"
+                            f"失败={o2_status.get('failed_channels', {})}；"
+                            "CO2 未更新，O2失败通道保留原配置"
+                        )
+                        self._set_calibration_outcome(
+                            "o2_partial_co2_failed",
+                            "Air空气校准部分成功（CO2失败）",
+                            outcome_message,
+                        )
+                        self._send_text(outcome_message)
+                    elif o2_partial_success:
+                        outcome_message = (
+                            f"{self.name}采集结束：O2 仅部分通道校准成功，"
+                            f"成功={o2_status.get('passed_channels', [])}，"
+                            f"失败={o2_status.get('failed_channels', {})}；"
+                            "CO2 校准成功，O2失败通道保留原配置"
+                        )
+                        self._set_calibration_outcome(
+                            "o2_partial",
+                            "Air空气校准部分成功",
                             outcome_message,
                         )
                         self._send_text(outcome_message)

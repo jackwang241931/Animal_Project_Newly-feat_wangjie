@@ -502,7 +502,9 @@ class read_queue_data_Thread(MyQThread):
                             if outcome_status.startswith("pending_air"):
                                 event_name = "air_pending"
                             elif outcome_status in {
-                                "o2_failed", "co2_failed", "o2_co2_failed"
+                                "o2_failed", "co2_failed", "o2_co2_failed",
+                                "partial_success", "o2_partial",
+                                "o2_partial_co2_failed",
                             }:
                                 event_name = "air_failed"
                             else:
@@ -1587,7 +1589,9 @@ class MainWindow_Index(ThemedWindow):
                         or "Air空气校准待独立Air复核"
                     )
                 elif phase == "finished" and outcome_status in {
-                    "o2_failed", "co2_failed", "o2_co2_failed"
+                    "o2_failed", "co2_failed", "o2_co2_failed",
+                    "partial_success", "o2_partial",
+                    "o2_partial_co2_failed",
                 }:
                     detail_status = str(
                         outcome.get("display_status")

@@ -289,7 +289,7 @@ def calculate_o2_compensated(
     sht_temp,
     sht_rh=None,
 ):
-    """Calculate final dry O2 using Delta CO2 as the v6 model input.
+    """Calculate final dry O2 using Delta CO2 as the supplier model input.
 
     ``delta_co2_pct`` is a concentration difference in percentage points, so
     0.10 means 0.10%.  The optional six-argument compatibility path is kept for
@@ -316,7 +316,7 @@ def calculate_o2_compensated(
     if sht_rh is None:
         # Legacy host contract: the third argument was the temperature and the
         # sixth argument was humidity.  Preserve safe operation, but mark cage
-        # Delta CO2 unavailable so the v6 implementation uses measured O2 only.
+        # Delta CO2 unavailable so the implementation uses measured O2 only.
         sht_rh = sht_temp
         sht_temp = delta_co2_pct
         delta_co2_pct = 0.0 if channel_id == "REF" else None
@@ -334,7 +334,7 @@ def calculate_o2_compensated(
                 sht_rh,
             )
         elif "sht_temp" in parameters or len(parameters) >= 7:
-            # The supplier's compact v6 file retains the historical parameter
+            # The supplier's compact file retains the historical parameter
             # name ``zos_temp`` for its third argument, but the implementation
             # now interprets that position as Delta CO2.
             result = _core.calculate_o2_compensated(

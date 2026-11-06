@@ -388,16 +388,34 @@ class Startup_O2_Span_Air_Calibration:
             try:
                 self._backup_o2_config(handler, "span", "before_overwrite")
                 handler.finish_span_only()
+                status = handler.get_status()
+                if status.get("failed"):
+                    raise RuntimeError(
+                        "O2 Span独立校准全部通道失败："
+                        f"{status.get('failure_reason') or '未知原因'}"
+                    )
                 self._backup_o2_config(
                     handler,
                     "span",
-                    "result_success_pending_air",
+                    (
+                        "result_partial_pending_air"
+                        if status.get("partial_success")
+                        else "result_success_pending_air"
+                    ),
                 )
                 reload_o2_compensation_config()
-                self._send_text(
-                    "O2 Span独立校准采样完成，状态为PENDING_AIR；"
-                    "必须继续执行一次独立Air空气复核，通过后新参数才会生效"
-                )
+                if status.get("partial_success"):
+                    self._send_text(
+                        "O2 Span独立校准部分通道成功；"
+                        f"成功={status.get('passed_channels', [])}，"
+                        f"失败={status.get('failed_channels', {})}。"
+                        "成功通道进入待Air配对状态，失败通道保留原配置"
+                    )
+                else:
+                    self._send_text(
+                        "O2 Span独立校准采样完成，状态为PENDING_AIR；"
+                        "必须在配对时限内继续执行一次独立Air空气校准"
+                    )
             except Exception as exc:
                 failure = exc
                 logger.exception(f"{self.name}: 保存独立O2 Span结果失败")
@@ -544,6 +562,13 @@ class Startup_O2_Span_Air_Calibration:
                     f"原因：{status.get('failure_reason') or '未知'}；"
                     "不得显示为完整校准完成"
                 )
+            elif status.get("partial_success"):
+                self._send_text(
+                    "O2 Span+Air仅部分通道校准成功；"
+                    f"成功={status.get('passed_channels', [])}，"
+                    f"失败={status.get('failed_channels', {})}；"
+                    "失败通道保留原配置"
+                )
             elif status.get("validation_status") == "PENDING_AIR":
                 self._send_text(
                     "O2 Span+Air两点参数已生成，状态为PENDING_AIR；"
@@ -653,6 +678,22 @@ class Startup_O2_Span_Air_Calibration:
                         f"{status.get('failure_reason') or '未知'}"
                     ),
                 }
+            elif status.get("partial_success"):
+                self._backup_o2_config(
+                    self._handler,
+                    "air",
+                    "result_partial",
+                )
+                outcome = {
+                    "status": "partial_success",
+                    "display_status": "Air空气校准部分成功",
+                    "message": (
+                        "O2 Span+Air仅部分通道校准成功："
+                        f"成功={status.get('passed_channels', [])}，"
+                        f"失败={status.get('failed_channels', {})}；"
+                        "失败通道保留原配置"
+                    ),
+                }
             elif status.get("validation_status") == "PENDING_AIR":
                 self._backup_o2_config(
                     self._handler,
@@ -692,6 +733,13 @@ class Startup_O2_Span_Air_Calibration:
                 self._send_text(
                     "Span+空气两点参数已生成，状态为PENDING_AIR；"
                     "请再执行一次独立Air空气复核后启用新参数"
+                )
+            elif status.get("partial_success"):
+                self._send_text(
+                    "Span+空气校准部分成功；"
+                    f"成功={status.get('passed_channels', [])}，"
+                    f"失败={status.get('failed_channels', {})}；"
+                    "失败通道保留原配置"
                 )
             elif status.get("calibrated"):
                 self._send_text(
