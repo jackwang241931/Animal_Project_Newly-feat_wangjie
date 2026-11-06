@@ -2,65 +2,9 @@
   "version": "5.0",
   "air_o2_pct": 20.93,
   "span_o2_pct": 20.45,
-  "calibration_method": "historical_provisional",
+  "calibration_method": "supplier_v5_cal1106",
   "calibration_time": null,
   "target_points": 25,
-  "channels": {
-    "REF": {
-      "air_dry_pct": 19.581791953,
-      "span_dry_pct": 19.201679456,
-      "gain": 1.07095978,
-      "basis": "historical_provisional"
-    },
-    "M1": {
-      "air_dry_pct": 19.275047686,
-      "span_dry_pct": 18.960808752,
-      "gain": 1.0410089,
-      "basis": "historical_provisional"
-    },
-    "M2": {
-      "air_dry_pct": 19.486173996,
-      "span_dry_pct": 19.125111215,
-      "gain": 0.99510422,
-      "basis": "historical_provisional"
-    },
-    "M3": {
-      "air_dry_pct": 19.626283101,
-      "span_dry_pct": 19.311606866,
-      "gain": 1.061171168,
-      "basis": "historical_provisional"
-    },
-    "M4": {
-      "air_dry_pct": 19.381551274,
-      "span_dry_pct": 19.086139885,
-      "gain": 1.037557393,
-      "basis": "historical_provisional"
-    },
-    "M5": {
-      "air_dry_pct": 19.466729572,
-      "span_dry_pct": 19.113190834,
-      "gain": 0.943018107,
-      "basis": "historical_provisional"
-    },
-    "M6": {
-      "air_dry_pct": 19.218528323,
-      "span_dry_pct": 18.852356124,
-      "gain": 1.025896815,
-      "basis": "historical_provisional"
-    },
-    "M7": {
-      "air_dry_pct": 19.279829369,
-      "span_dry_pct": 18.92670062,
-      "gain": 1.089052057,
-      "basis": "historical_provisional"
-    },
-    "M8": {
-      "air_dry_pct": 19.416074327,
-      "span_dry_pct": 19.074554775,
-      "gain": 1.004729414,
-      "basis": "historical_provisional"
-    }
-  },
   "air_fixed_pct": 20.93,
   "air_lock_mode": "fixed",
   "air_stability_max_mad_pct": 0.02,
@@ -68,5 +12,83 @@
   "pair_gain_max_relative_change": 0.5,
   "span_max_offset_change_pct": 0.6,
   "air_max_anchor_shift_pct": 0.6,
+  "co2_o2_fusion_weight": 0.95,
+  "ref_common_mode_enabled": true,
+  "ref_common_mode_coefficient": 1.0,
+  "ref_common_mode_max_age_s": 120,
+  "channels": {
+    "REF": {
+      "air_dry_pct": 19.68173928581798,
+      "span_dry_pct": 19.29781802936453,
+      "gain": 1.2502563792223957,
+      "offset": -3.677220096285968,
+      "ref_common_mode_coefficient": 0.0,
+      "basis": "supplier_v5_cal1106"
+    },
+    "M1": {
+      "air_dry_pct": 19.556547274395896,
+      "span_dry_pct": 19.12550405171121,
+      "gain": 1.113577420404374,
+      "offset": -0.8477294658379755,
+      "ref_common_mode_coefficient": 1.0,
+      "basis": "supplier_v5_cal1106"
+    },
+    "M2": {
+      "air_dry_pct": 19.784023999956972,
+      "span_dry_pct": 19.324685494077727,
+      "gain": 1.044980975590553,
+      "offset": 0.2560712994180463,
+      "ref_common_mode_coefficient": 1.0,
+      "basis": "supplier_v5_cal1106"
+    },
+    "M3": {
+      "air_dry_pct": 19.89117111565869,
+      "span_dry_pct": 19.311606866,
+      "gain": 1.061171168,
+      "offset": -0.17793728569139589,
+      "ref_common_mode_coefficient": 1.0,
+      "basis": "supplier_v5_cal1106"
+    },
+    "M4": {
+      "air_dry_pct": 19.641613789728318,
+      "span_dry_pct": 19.279632704045113,
+      "gain": 1.3260361355457189,
+      "offset": -5.11548964561284,
+      "ref_common_mode_coefficient": 1.0,
+      "basis": "supplier_v5_cal1106"
+    },
+    "M5": {
+      "air_dry_pct": 19.760073932366296,
+      "span_dry_pct": 19.326852585860696,
+      "gain": 1.1079786438773624,
+      "offset": -0.9637399184996305,
+      "ref_common_mode_coefficient": 1.0,
+      "basis": "supplier_v5_cal1106"
+    },
+    "M6": {
+      "air_dry_pct": 19.38535709751939,
+      "span_dry_pct": 19.02521819163314,
+      "gain": 1.3328190655180427,
+      "offset": -4.907173531449349,
+      "ref_common_mode_coefficient": 1.0,
+      "basis": "supplier_v5_cal1106"
+    },
+    "M7": {
+      "air_dry_pct": 19.42130990373476,
+      "span_dry_pct": 19.046110498047266,
+      "gain": 1.2793197236559513,
+      "offset": -3.9160648190825427,
+      "ref_common_mode_coefficient": 1.0,
+      "basis": "supplier_v5_cal1106"
+    },
+    "M8": {
+      "air_dry_pct": 19.597726567887513,
+      "span_dry_pct": 19.191607288060816,
+      "gain": 1.1819187707730354,
+      "offset": -2.2329208950636676,
+      "ref_common_mode_coefficient": 1.0,
+      "basis": "supplier_v5_cal1106"
+    }
+  },
   "pending_span_pairs": {}
 }

@@ -22,7 +22,7 @@ _CALIBRATION_HANDLER = None
 # Supplier model: convert Delta CO2 (percentage points) into an estimated Delta O2.
 _MODEL_SLOPE = 1.042868
 _MODEL_INTERCEPT = 0.008752
-_MODEL_WEIGHT = 0.60
+_MODEL_WEIGHT = 0.95
 _DCO2_MAX = 0.40
 
 
@@ -122,6 +122,7 @@ class RealtimeO2Compensator:
         self.cfg = None
         self._config_mtime_ns = None
         self._reference_filter = _ReferenceFilter()
+        self._reference_raw_sample = None
         self.last_observations = {}
         self.reload_config(force=True)
 
@@ -135,8 +136,15 @@ class RealtimeO2Compensator:
 
     def has_valid_reference_sample(self):
         with self.lock:
-            reference = self._reference_filter.filtered
-            return reference is not None and math.isfinite(float(reference))
+            if self._reference_raw_sample is None or self.cfg is None:
+                return False
+            reference, sample_time = self._reference_raw_sample
+            try:
+                max_age = float(self.cfg.get("ref_common_mode_max_age_s", 120.0))
+                age = time.monotonic() - float(sample_time)
+                return math.isfinite(float(reference)) and 0.0 <= age <= max_age
+            except (TypeError, ValueError, OverflowError):
+                return False
 
     def reload_config(self, force=False):
         with self.lock:
@@ -167,9 +175,30 @@ class RealtimeO2Compensator:
                     if not (0.5 <= gain <= 1.5 and 10.0 <= air_dry <= 25.0):
                         raise ValueError(f"bad calibration {channel}")
 
+                    coefficient = float(
+                        channel_config.get(
+                            "ref_common_mode_coefficient",
+                            config.get("ref_common_mode_coefficient", 1.0),
+                        )
+                    )
+                    if not math.isfinite(coefficient) or not 0.0 <= coefficient <= 2.0:
+                        raise ValueError(f"bad REF common-mode coefficient {channel}")
+
+                fusion_weight = float(
+                    config.get("co2_o2_fusion_weight", _MODEL_WEIGHT)
+                )
+                reference_max_age = float(
+                    config.get("ref_common_mode_max_age_s", 120.0)
+                )
+                if not 0.0 <= fusion_weight <= 1.0:
+                    raise ValueError("co2_o2_fusion_weight must be in 0..1")
+                if not 0.0 < reference_max_age <= 3600.0:
+                    raise ValueError("ref_common_mode_max_age_s must be in (0, 3600]")
+
                 self.cfg = config
                 self._config_mtime_ns = config_mtime_ns
                 self._reference_filter = _ReferenceFilter()
+                self._reference_raw_sample = None
                 logger.info(
                     "O2 v5 config reloaded: path={}, fixed_air_o2_pct={:.4f}",
                     self.config_path,
@@ -227,28 +256,56 @@ class RealtimeO2Compensator:
             }
             if channel == "REF":
                 filtered_reference = self._reference_filter.update(independent_o2)
+                self._reference_raw_sample = (dry_o2, time.monotonic())
                 diagnostics.update(
                     ref_filtered_pct=filtered_reference,
                     ref_drift_pct=filtered_reference - air_o2,
+                    ref_raw_dry_pct=dry_o2,
                     dco2_pct=0.0,
+                    ref_common_mode_status="REF_UPDATED",
                 )
                 self.last_observations[channel] = diagnostics
                 return air_o2
 
-            filtered_reference = self._reference_filter.filtered
-            reference_drift = (
-                filtered_reference - air_o2
-                if filtered_reference is not None
-                else 0.0
-            )
-            # V5 keeps the measured channel physically independent.  REF is
-            # still observed for health diagnostics, but is not subtracted as
-            # an unvalidated common-mode correction.
-            measured_o2 = independent_o2
-            measured_do2 = air_o2 - measured_o2
+            measured_do2 = air_o2 - independent_o2
+            reference_correction = 0.0
+            reference_status = "DISABLED"
+            reference_age = None
+            reference_delta = None
+            if bool(self.cfg.get("ref_common_mode_enabled", False)):
+                reference_status = "REF_UNAVAILABLE"
+                if self._reference_raw_sample is not None:
+                    reference_dry, reference_time = self._reference_raw_sample
+                    reference_age = time.monotonic() - reference_time
+                    max_age = float(self.cfg.get("ref_common_mode_max_age_s", 120.0))
+                    if 0.0 <= reference_age <= max_age:
+                        reference_anchor = float(
+                            self.cfg["channels"]["REF"]["air_dry_pct"]
+                        )
+                        reference_delta = reference_dry - reference_anchor
+                        coefficient = float(
+                            channel_config.get(
+                                "ref_common_mode_coefficient",
+                                self.cfg.get("ref_common_mode_coefficient", 1.0),
+                            )
+                        )
+                        reference_correction = (
+                            float(channel_config["gain"])
+                            * coefficient
+                            * reference_delta
+                        )
+                        measured_do2 += reference_correction
+                        reference_status = "APPLIED"
+                    else:
+                        reference_status = "REF_STALE"
+
+            measured_o2 = air_o2 - measured_do2
             diagnostics.update(
-                ref_filtered_pct=filtered_reference,
-                ref_drift_pct=reference_drift,
+                ref_filtered_pct=self._reference_filter.filtered,
+                ref_delta_dry_pct=reference_delta,
+                ref_age_s=reference_age,
+                ref_common_mode_status=reference_status,
+                ref_common_mode_correction_pct=reference_correction,
                 physical_o2_pct=measured_o2,
                 do2_measured_pct=measured_do2,
             )
@@ -258,21 +315,24 @@ class RealtimeO2Compensator:
             except (TypeError, ValueError, OverflowError):
                 delta_co2 = float("nan")
 
-            if not math.isfinite(delta_co2) or not -0.005 <= delta_co2 <= _DCO2_MAX:
+            if not math.isfinite(delta_co2) or not 0.0 <= delta_co2 <= _DCO2_MAX:
                 diagnostics["co2_quality"] = "INVALID_FALLBACK"
                 output_o2 = measured_o2
             else:
-                delta_co2 = max(0.0, delta_co2)
                 predicted_do2 = _model_do2(delta_co2)
+                model_weight = float(
+                    self.cfg.get("co2_o2_fusion_weight", _MODEL_WEIGHT)
+                )
                 fused_do2 = (
-                    (1.0 - _MODEL_WEIGHT) * measured_do2
-                    + _MODEL_WEIGHT * predicted_do2
+                    (1.0 - model_weight) * measured_do2
+                    + model_weight * predicted_do2
                 )
                 output_o2 = air_o2 - fused_do2
                 diagnostics.update(
                     dco2_pct=delta_co2,
                     co2_predicted_do2_pct=predicted_do2,
                     fused_do2_pct=fused_do2,
+                    fusion_weight=model_weight,
                     co2_quality="OK_MODEL_ESTIMATE",
                 )
 

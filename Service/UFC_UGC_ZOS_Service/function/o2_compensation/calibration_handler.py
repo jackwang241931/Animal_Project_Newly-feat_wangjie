@@ -113,6 +113,9 @@ class CalibrationHandler:
         pending = config.get("pending_span_pairs", {})
         if not isinstance(pending, dict):
             raise ValueError("pending_span_pairs must be a dictionary")
+        fusion_weight = float(config.get("co2_o2_fusion_weight", 0.95))
+        if not 0.0 <= fusion_weight <= 1.0:
+            raise ValueError("co2_o2_fusion_weight must be in 0..1")
         return config
 
     def _begin(self, mode, target_points=None, span_value=None):
@@ -237,6 +240,15 @@ class CalibrationHandler:
         return value
 
     @staticmethod
+    def _update_offset(channel_config):
+        channel_config["offset"] = (
+            AIR_NOMINAL
+            - float(channel_config["gain"])
+            * float(channel_config["air_dry_pct"])
+        )
+        return channel_config
+
+    @staticmethod
     def _parse_utc(value):
         parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
         if parsed.tzinfo is None:
@@ -314,6 +326,7 @@ class CalibrationHandler:
                     air_dry_pct=new_air,
                     basis="independent_span_offset_pending_pair",
                 )
+                self._update_offset(updated)
                 config["channels"][channel] = updated
                 pending[channel] = {
                     "span_dry_pct": span_dry,
@@ -401,6 +414,7 @@ class CalibrationHandler:
                     self.validation_warnings.append(warning)
                     detail.setdefault("warning", warning)
                 updated["air_dry_pct"] = air_dry
+                self._update_offset(updated)
                 config["channels"][channel] = updated
                 pending.pop(channel, None)
                 self.validation_details[channel] = detail
@@ -456,6 +470,7 @@ class CalibrationHandler:
                     gain=proposed_gain,
                     basis="combined_span_air_paired",
                 )
+                self._update_offset(updated)
                 config["channels"][channel] = updated
                 pending.pop(channel, None)
                 self.validation_details[channel] = {
